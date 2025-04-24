@@ -1,3 +1,4 @@
+mod color;
 mod color_picker;
 
 use color_picker::color_picker;
@@ -75,13 +76,15 @@ impl ColorPickerExample {
             Message::SubmitColor,
         );
 
+        let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
+
         let row = Row::new()
             .align_y(Alignment::Center)
             .spacing(10)
             .push(color_picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, row,].spacing(20);
+        let col = column![theme_picker, color, row].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
