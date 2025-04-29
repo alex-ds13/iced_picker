@@ -1,31 +1,22 @@
+use std::collections::HashMap;
+
 use iced::{
-    Color, Element, Event, Length, Point, Rectangle, Renderer, Vector,
+    Alignment, Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Renderer,
+    Shadow, Size, Vector,
     advanced::{
         Clipboard, Layout, Shell, Widget,
         layout::{Limits, Node},
         overlay, renderer,
         widget::tree::{self, Tag, Tree},
     },
-    event,
-    mouse::{self, Cursor},
-    widget::row,
-};
-
-// use crate::{
-//     core::{
-//         color::{HexString, Hsv},
-//         overlay::Position,
-//     },
-//     style::{self, color_picker::Style, style_state::StyleState, Status},
-// };
-//
-use iced::{
-    Alignment, Border, Padding, Pixels, Shadow, Size,
     advanced::{
         Overlay, Renderer as _, Text, graphics::geometry::Renderer as _, text::Renderer as _,
     },
     alignment::{Horizontal, Vertical},
-    keyboard, touch,
+    event, keyboard,
+    mouse::{self, Cursor},
+    touch,
+    widget::row,
     widget::{
         Button, Column, Row,
         canvas::{self, LineCap, Path, Stroke},
@@ -33,11 +24,6 @@ use iced::{
         text::Wrapping,
     },
 };
-// use iced_fonts::{
-//     required::{icon_to_string, RequiredIcons},
-//     REQUIRED_FONT,
-// };
-use std::collections::HashMap;
 
 /// An input element for picking colors.
 ///
@@ -82,8 +68,6 @@ where
     class: <Theme as Catalog>::Class<'a>,
     /// Overlay element to be used for the layout calculation only
     overlay_el: Element<'a, Message, Theme, Renderer>,
-    // /// The buttons of the overlay.
-    // overlay_state: Element<'a, Message, Theme, Renderer>,
     /// The cancel button of the [`ColorPickerOverlay`].
     cancel_button: Element<'a, Message, Theme, Renderer>,
     /// The submit button of the [`ColorPickerOverlay`].
@@ -142,13 +126,11 @@ where
             show_picker,
             color,
             underlay: underlay.into(),
-            // on_cancel,
             on_submit: Box::new(on_submit),
             class: <Theme as Catalog>::default(),
             overlay_el,
             cancel_button,
             submit_button,
-            // overlay_state: ColorPickerOverlayButtons::default().into(),
         }
     }
 
@@ -202,7 +184,6 @@ where
     Message: 'a + Clone,
     Theme: 'a
         + Catalog
-        + crate::color::Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
         + container::Catalog,
@@ -332,14 +313,11 @@ where
             ColorPickerOverlay::new(
                 &mut picker_state.overlay_state,
                 picker_tree,
-                // self.on_cancel.clone(),
                 &self.on_submit,
                 position,
                 &self.class,
                 &mut self.cancel_button,
                 &mut self.submit_button,
-                // &mut self.overlay_el,
-                // &mut state.children[1],
             )
             .overlay(),
         )
@@ -352,7 +330,6 @@ where
     Message: 'a + Clone,
     Theme: 'a
         + Catalog
-        + crate::color::Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
         + container::Catalog,
@@ -386,20 +363,17 @@ where
 {
     /// The state of the [`ColorPickerOverlay`].
     state: &'a mut OverlayState,
-    // /// The cancel and submit buttons
-    // buttons: ColorPickerOverlayButtons<'a, Message, Theme>,
     /// The cancel button of the [`ColorPickerOverlay`].
     cancel_button: &'a mut Element<'b, Message, Theme, Renderer>,
     /// The submit button of the [`ColorPickerOverlay`].
     submit_button: &'a mut Element<'b, Message, Theme, Renderer>,
-    // picker: &'a mut Element<'b, Message, Theme>,
     /// The function that produces a message when the submit button of the [`ColorPickerOverlay`].
     on_submit: &'a dyn Fn(Color) -> Message,
     /// The position of the [`ColorPickerOverlay`].
     position: Point,
     /// The style of the [`ColorPickerOverlay`].
     class: &'a <Theme as Catalog>::Class<'b>,
-    // /// The reference to the tree holding the state of this overlay.
+    /// The reference to the tree holding the state of this overlay.
     tree: &'a mut Tree,
 }
 
@@ -417,145 +391,16 @@ where
     pub fn new(
         state: &'a mut OverlayState,
         tree: &'a mut Tree,
-        // on_cancel: Message,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
         class: &'a <Theme as Catalog>::Class<'b>,
-        // picker: &'a mut Element<'b, Message, Theme, Renderer>,
         cancel_button: &'a mut Element<'b, Message, Theme>,
         submit_button: &'a mut Element<'b, Message, Theme>,
-        // tree: &'a mut Tree,
     ) -> Self {
-        //state.color_hex = OverlayState::color_as_string(state.color);
-        // let State { overlay_state } = state;
-
-        // let cancel_button: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::X))
-        //     text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .on_press(on_cancel.clone())
-        // .into();
-        // let submit_button: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::Check))
-        //     text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .on_press(on_cancel.clone()) // Sending a fake message
-        // .into();
-        //
-        // let cancel_button1: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::X))
-        //     text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .on_press(on_cancel.clone())
-        // .into();
-        // let submit_button1: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::Check))
-        //     text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .on_press(on_cancel.clone()) // Sending a fake message
-        // .into();
-        //
-        // // let buttons = ColorPickerOverlayButtons::new(cancel_button, submit_button);
-        // // overlay_state.tree.diff(&buttons as &dyn Widget<_, _, _>);
-        // // overlay_state.buttons_tree.diff_children(&[buttons.cancel(), buttons.submit()]);
-        // // overlay_state.tree[0].diff(&cancel_button as &dyn Widget<_, _, _>);
-        // // overlay_state.tree[1].diff(&submit_button as &dyn Widget<_, _, _>);
-        //
-        // let mut tree = vec![
-        //     Tree::new(&cancel_button1),
-        //     Tree::new(&submit_button1),
-        //     Tree::empty(),
-        // ];
-        // tree[0].diff(&cancel_button);
-        // tree[1].diff(&submit_button);
-        //
-        // // RGBA Colors
-        // let mut rgba_colors: Column<'_, Message, Theme, Renderer> =
-        //     Column::<Message, Theme, Renderer>::new();
-        //
-        // for _ in 0..4 {
-        //     rgba_colors = rgba_colors.push(
-        //         Row::new()
-        //             .align_y(Alignment::Center)
-        //             .spacing(SPACING)
-        //             .padding(PADDING)
-        //             .height(Length::Fill)
-        //             .push(
-        //                 text("X:")
-        //                     .align_x(Horizontal::Center)
-        //                     .align_y(Vertical::Center),
-        //             )
-        //             .push(
-        //                 Row::new()
-        //                     .width(Length::FillPortion(5))
-        //                     .height(Length::Fill),
-        //             )
-        //             .push(
-        //                 text("XXX")
-        //                     .align_x(Horizontal::Center)
-        //                     .align_y(Vertical::Center),
-        //             ),
-        //     );
-        // }
-        //
-        // let hex_text_layout = Row::<Message, Theme, Renderer>::new()
-        //     .width(Length::Fill)
-        //     .height(Length::Fixed(16.0 + PADDING.vertical()));
-        //
-        // let block2 = Column::new()
-        //     .spacing(PADDING.vertical() / 2.) // Average vertical padding
-        //     .push(rgba_colors)
-        //     .push(hex_text_layout)
-        //     .push(
-        //         Row::new()
-        //             .spacing(PADDING.vertical() / 2.)
-        //             .push(cancel_button1)
-        //             .push(submit_button1),
-        //     );
-        //
-        // let block1 = Column::<Message, Theme, Renderer>::new()
-        //     .spacing(PADDING.vertical() / 2.) // Average vertical padding
-        //     .push(
-        //         Row::new().push(
-        //             container("")
-        //                 .width(Length::Fill)
-        //                 .height(Length::FillPortion(7)),
-        //         ),
-        //     )
-        //     .push(
-        //         Row::new().push(
-        //             container("")
-        //                 .width(Length::Fill)
-        //                 .height(Length::FillPortion(1)),
-        //         ),
-        //     );
-        //
-        // let divider = Row::<Message, Theme, Renderer>::new()
-        //     .spacing(SPACING)
-        //     .push(Row::new().push(container(block1).width(Length::Fill).height(Length::Fill)))
-        //     .push(Row::new().push(container(block2).width(Length::Fill).height(Length::Fill)))
-        //     .width(600)
-        //     .height(300);
-        //
-        // let element: Element<Message, Theme, Renderer> = Element::new(divider);
-        //
-        // let child_tree = Tree::new(element.as_widget());
-        // tree[2] = child_tree;
-        // overlay_state.tree = tree;
-
-        // let picker = crate::color::color(overlay_state.color, on_cancel, on_submit).into();
-        // overlay_state.tree.diff(&picker);
-
         ColorPickerOverlay {
             state,
-            // buttons,
             cancel_button,
             submit_button,
-            // picker,
             on_submit,
             position,
             class,
@@ -1149,38 +994,6 @@ where
     'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
-        // let limits = Limits::new(Size::ZERO, Size::new(bounds.width, bounds.height));
-        //
-        // self.picker
-        //     .as_widget()
-        //     .layout(&mut self.state, renderer, &limits)
-
-        // let space_below =
-        //     bounds.height - (self.position.y + self.target_height);
-        // let space_above = self.position.y;
-        //
-        // let limits = layout::Limits::new(
-        //     Size::ZERO,
-        //     Size::new(
-        //         bounds.width - self.position.x,
-        //         if space_below > space_above {
-        //             space_below
-        //         } else {
-        //             space_above
-        //         },
-        //     ),
-        // )
-        // .width(self.width);
-        //
-        // let node = self.list.layout(self.state, renderer, &limits);
-        // let size = node.size();
-        //
-        // node.move_to(if space_below > space_above {
-        //     self.position + Vector::new(0.0, self.target_height)
-        // } else {
-        //     self.position - Vector::new(0.0, size.height)
-        // })
-
         let (max_width, max_height) = if bounds.width > bounds.height {
             (600.0, 300.0)
         } else {
@@ -1253,18 +1066,6 @@ where
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<Message>,
     ) {
-        // let viewport = layout.bounds();
-        // self.picker.as_widget_mut().update(
-        //     &mut self.state,
-        //     event,
-        //     layout,
-        //     cursor,
-        //     renderer,
-        //     clipboard,
-        //     shell,
-        //     &viewport,
-        // )
-
         if event::Status::Captured == self.on_event_keyboard(event) {
             self.state.sat_value_canvas_cache.clear();
             self.state.hue_canvas_cache.clear();
@@ -1361,13 +1162,6 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         self.state.mouse_interaction
-        // self.picker.as_widget().mouse_interaction(
-        //     &self.state,
-        //     _layout,
-        //     _cursor,
-        //     _viewport,
-        //     _renderer,
-        // )
     }
 
     fn draw(
@@ -1378,17 +1172,6 @@ where
         layout: Layout<'_>,
         cursor: Cursor,
     ) {
-        // let viewport = layout.bounds();
-        // self.picker.as_widget().draw(
-        //     &self.state,
-        //     renderer,
-        //     theme,
-        //     style,
-        //     layout,
-        //     cursor,
-        //     &viewport,
-        // )
-
         let bounds = layout.bounds();
         let mut children = layout.children();
 
@@ -1456,7 +1239,9 @@ where
     }
 }
 
-pub fn overlay_element<'a, Message, Theme>(on_cancel: Message) -> Element<'a, Message, Theme, Renderer>
+pub fn overlay_element<'a, Message, Theme>(
+    on_cancel: Message,
+) -> Element<'a, Message, Theme, Renderer>
 where
     Message: 'a + Clone,
     Theme: 'a
@@ -2362,115 +2147,14 @@ pub struct OverlayState {
     pub(crate) keyboard_modifiers: keyboard::Modifiers,
     /// The current mouse interaction
     pub(crate) mouse_interaction: mouse::Interaction,
-    // /// The state tree
-    // pub(crate) tree: Tree,
 }
 
 impl OverlayState {
     /// Creates a new State with the given color.
     #[must_use]
-    pub fn new(color: Color) -> Self
-// where
-    //     Message: Clone,
-    //     Theme: text::Catalog + iced::widget::container::Catalog + iced::widget::button::Catalog,
-    {
-        // let cancel_button: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::X))
-        //     text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .into();
-        // let submit_button: Element<Message, Theme> = Button::new(
-        //     // text(icon_to_string(RequiredIcons::Check))
-        //     text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        // )
-        // .width(Length::Fill)
-        // .into();
-        //
-        // let mut tree = vec![
-        //     Tree::new(&cancel_button),
-        //     Tree::new(&submit_button),
-        //     Tree::empty(),
-        // ];
-        // tree[0].diff(&cancel_button);
-        // tree[1].diff(&submit_button);
-        //
-        // // RGBA Colors
-        // let mut rgba_colors: Column<'_, Message, Theme, Renderer> =
-        //     Column::<Message, Theme, Renderer>::new();
-        //
-        // for _ in 0..4 {
-        //     rgba_colors = rgba_colors.push(
-        //         Row::new()
-        //             .align_y(Alignment::Center)
-        //             .spacing(SPACING)
-        //             .padding(PADDING)
-        //             .height(Length::Fill)
-        //             .push(
-        //                 text("X:")
-        //                     .align_x(Horizontal::Center)
-        //                     .align_y(Vertical::Center),
-        //             )
-        //             .push(
-        //                 Row::new()
-        //                     .width(Length::FillPortion(5))
-        //                     .height(Length::Fill),
-        //             )
-        //             .push(
-        //                 text("XXX")
-        //                     .align_x(Horizontal::Center)
-        //                     .align_y(Vertical::Center),
-        //             ),
-        //     );
-        // }
-        //
-        // let hex_text_layout = Row::<Message, Theme, Renderer>::new()
-        //     .width(Length::Fill)
-        //     .height(Length::Fixed(16.0 + PADDING.vertical()));
-        //
-        // let block2 = Column::new()
-        //     .spacing(PADDING.vertical() / 2.) // Average vertical padding
-        //     .push(rgba_colors)
-        //     .push(hex_text_layout)
-        //     .push(
-        //         Row::new()
-        //             .spacing(PADDING.vertical() / 2.)
-        //             .push(cancel_button)
-        //             .push(submit_button),
-        //     );
-        //
-        // let block1 = Column::<Message, Theme, Renderer>::new()
-        //     .spacing(PADDING.vertical() / 2.) // Average vertical padding
-        //     .push(
-        //         Row::new().push(
-        //             container("")
-        //                 .width(Length::Fill)
-        //                 .height(Length::FillPortion(7)),
-        //         ),
-        //     )
-        //     .push(
-        //         Row::new().push(
-        //             container("")
-        //                 .width(Length::Fill)
-        //                 .height(Length::FillPortion(1)),
-        //         ),
-        //     );
-        //
-        // let divider = Row::<Message, Theme, Renderer>::new()
-        //     .spacing(SPACING)
-        //     .push(Row::new().push(container(block1).width(Length::Fill).height(Length::Fill)))
-        //     .push(Row::new().push(container(block2).width(Length::Fill).height(Length::Fill)))
-        //     .width(600)
-        //     .height(300);
-        //
-        // let element: Element<Message, Theme, Renderer> = Element::new(divider);
-        //
-        // let child_tree = Tree::new(element.as_widget());
-        // tree[2] = child_tree;
-
+    pub fn new(color: Color) -> Self {
         Self {
             color,
-            // tree: Tree::empty(),
             ..Self::default()
         }
     }
@@ -2486,123 +2170,7 @@ impl Default for OverlayState {
             focus: Focus::default(),
             keyboard_modifiers: keyboard::Modifiers::default(),
             mouse_interaction: mouse::Interaction::default(),
-            // tree: Tree::empty(),
         }
-    }
-}
-
-/// Just a workaround to pass the button states from the tree to the overlay
-#[allow(missing_debug_implementations)]
-pub struct ColorPickerOverlayButtons<'a, Message, Theme>
-where
-    Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog,
-{
-    /// The cancel button of the [`ColorPickerOverlay`].
-    cancel_button: Element<'a, Message, Theme, Renderer>,
-    /// The submit button of the [`ColorPickerOverlay`].
-    submit_button: Element<'a, Message, Theme, Renderer>,
-}
-
-impl<'a, Message, Theme> Default for ColorPickerOverlayButtons<'a, Message, Theme>
-where
-    Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
-{
-    fn default() -> Self {
-        Self {
-            // cancel_button: Button::new(text(icon_to_string(RequiredIcons::X)).font(REQUIRED_FONT))
-            //     .into(),
-            // submit_button: Button::new(
-            //     text(icon_to_string(RequiredIcons::Check)).font(REQUIRED_FONT),
-            // )
-            // .into(),
-            cancel_button: Button::new(text("X")).into(),
-            submit_button: Button::new(text("V")).into(),
-        }
-    }
-}
-
-impl<'a, Message, Theme> ColorPickerOverlayButtons<'a, Message, Theme>
-where
-    Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
-{
-    pub fn new(
-        cancel_button: Element<'a, Message, Theme, Renderer>,
-        submit_button: Element<'a, Message, Theme, Renderer>,
-    ) -> Self {
-        Self {
-            cancel_button,
-            submit_button,
-        }
-    }
-
-    pub fn cancel(&self) -> &dyn Widget<Message, Theme, Renderer> {
-        self.cancel_button.as_widget()
-    }
-
-    pub fn cancel_mut(&mut self) -> &mut dyn Widget<Message, Theme, Renderer> {
-        self.cancel_button.as_widget_mut()
-    }
-
-    pub fn submit(&self) -> &dyn Widget<Message, Theme, Renderer> {
-        self.submit_button.as_widget()
-    }
-
-    pub fn submit_mut(&mut self) -> &mut dyn Widget<Message, Theme, Renderer> {
-        self.submit_button.as_widget_mut()
-    }
-}
-
-#[allow(clippy::unimplemented)]
-impl<Message, Theme> Widget<Message, Theme, Renderer>
-    for ColorPickerOverlayButtons<'_, Message, Theme>
-where
-    Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
-{
-    fn children(&self) -> Vec<Tree> {
-        vec![
-            Tree::new(&self.cancel_button),
-            Tree::new(&self.submit_button),
-        ]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(&[&self.cancel_button, &self.submit_button]);
-    }
-
-    fn size(&self) -> Size<Length> {
-        unimplemented!("This should never be reached!")
-    }
-
-    fn layout(&self, _tree: &mut Tree, _renderer: &Renderer, _limits: &Limits) -> Node {
-        unimplemented!("This should never be reached!")
-    }
-
-    fn draw(
-        &self,
-        _state: &Tree,
-        _renderer: &mut Renderer,
-        _theme: &Theme,
-        _style: &renderer::Style,
-        _layout: Layout<'_>,
-        _cursor: Cursor,
-        _viewport: &Rectangle,
-    ) {
-        unimplemented!("This should never be reached!")
-    }
-}
-
-impl<'a, Message, Theme> From<ColorPickerOverlayButtons<'a, Message, Theme>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
-{
-    fn from(overlay: ColorPickerOverlayButtons<'a, Message, Theme>) -> Self {
-        Self::new(overlay)
     }
 }
 
@@ -2970,7 +2538,6 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + crate::color::Catalog
         + container::Catalog,
     F: 'a + Fn(Color) -> Message + Clone,
 {
