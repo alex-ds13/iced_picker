@@ -909,10 +909,6 @@ where
 
     /// The even handling for the keyboard input.
     fn on_event_keyboard(&mut self, event: &Event) -> event::Status {
-        if self.state.focus == Focus::None {
-            return event::Status::Ignored;
-        }
-
         if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event {
             let mut status = event::Status::Ignored;
 
@@ -922,9 +918,7 @@ where
                 } else {
                     self.state.focus = self.state.focus.next();
                 }
-                // TODO: maybe place this better
-                self.state.sat_value_canvas_cache.clear();
-                self.state.hue_canvas_cache.clear();
+                status = event::Status::Captured;
             } else {
                 let sat_value_handle = |key_code: &keyboard::Key, color: &mut Color| {
                     let mut hsv_color: Hsv = (*color).into();
@@ -994,7 +988,7 @@ where
 
                 let rgba_bar_handle = |key_code: &keyboard::Key, value: &mut f32| {
                     let mut byte_value = (*value * 255.0) as i16;
-                    let mut status = event::Status::Captured;
+                    let mut status = event::Status::Ignored;
 
                     match key_code {
                         keyboard::Key::Named(
