@@ -281,22 +281,26 @@ where
             .push(hex_text_layout)
             .push(
                 Row::new()
-                .spacing(PADDING.vertical() / 2.)
-                .push(cancel_button)
-                .push(submit_button)
+                    .spacing(PADDING.vertical() / 2.)
+                    .push(cancel_button)
+                    .push(submit_button),
             );
 
-        let block1= Column::<Message, Theme, Renderer>::new()
+        let block1 = Column::<Message, Theme, Renderer>::new()
             .spacing(PADDING.vertical() / 2.) // Average vertical padding
             .push(
-                Row::new().push(container("")
-                    .width(Length::Fill)
-                    .height(Length::FillPortion(7))),
+                Row::new().push(
+                    container("")
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(7)),
+                ),
             )
             .push(
-                Row::new().push(container("")
-                    .width(Length::Fill)
-                    .height(Length::FillPortion(1))),
+                Row::new().push(
+                    container("")
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(1)),
+                ),
             );
 
         let divider = Row::<Message, Theme, Renderer>::new()
@@ -321,12 +325,7 @@ where
         .width(Length::Fill)
         .on_press(self.on_cancel.clone()); // Sending a fake message
 
-        let buttons_row = row![
-            cancel_button,
-            submit_button,
-            element,
-        ]
-        .into();
+        let buttons_row = row![cancel_button, submit_button, element,].into();
 
         tree.diff_children(&[&self.underlay, &buttons_row]); // &self.overlay_el]); //, &self.overlay_state]);
     }
