@@ -307,7 +307,8 @@ where
         let picker_tree = &mut state.children[1];
 
         let bounds = layout.bounds();
-        let position = Point::new(bounds.center_x(), bounds.center_y());
+        let position = bounds.position();
+        let underlay_height = bounds.height;
 
         Some(
             ColorPickerOverlay::new(
@@ -315,6 +316,7 @@ where
                 picker_tree,
                 &self.on_submit,
                 position,
+                underlay_height,
                 &self.class,
                 &mut self.cancel_button,
                 &mut self.submit_button,
@@ -371,6 +373,8 @@ where
     on_submit: &'a dyn Fn(Color) -> Message,
     /// The position of the [`ColorPickerOverlay`].
     position: Point,
+    /// The height of the underlay.
+    underlay_height: f32,
     /// The style of the [`ColorPickerOverlay`].
     class: &'a <Theme as Catalog>::Class<'b>,
     /// The reference to the tree holding the state of this overlay.
@@ -388,11 +392,13 @@ where
     'b: 'a,
 {
     /// Creates a new [`ColorPickerOverlay`] on the given position.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: &'a mut OverlayState,
         tree: &'a mut Tree,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
+        underlay_height: f32,
         class: &'a <Theme as Catalog>::Class<'b>,
         cancel_button: &'a mut Element<'b, Message, Theme>,
         submit_button: &'a mut Element<'b, Message, Theme>,
@@ -403,6 +409,7 @@ where
             submit_button,
             on_submit,
             position,
+            underlay_height,
             class,
             tree,
         }
@@ -994,6 +1001,26 @@ where
     'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
+        let space_below = bounds.height - (self.position.y + self.underlay_height);
+        let space_above = self.position.y;
+
+        let mut show_below = false;
+        let bounds = Size::new(
+            bounds.width,
+            if space_below > space_above {
+                show_below = true;
+                space_below
+            } else {
+                space_above
+            },
+        );
+
+        let position = if show_below {
+            self.position + Vector::new(0.0, self.underlay_height)
+        } else {
+            self.position
+        };
+
         let (max_width, max_height) = if bounds.width > bounds.height {
             (600.0, 300.0)
         } else {
@@ -1053,7 +1080,7 @@ where
         let mut node =
             Node::with_children(Size::new(width, height), vec![block1_node, block2_node]);
 
-        node.center_and_bounce(self.position, bounds);
+        node.center_and_bounce(position, bounds);
         node
     }
 
@@ -2496,14 +2523,7 @@ pub trait Position {
 
 impl Position for Node {
     fn center_and_bounce(&mut self, position: Point, bounds: Size) {
-        let size = self.size();
-
-        self.move_to_mut(Point::new(
-            // (position.x - (size.width / 2.0)).max(0.0),
-            // (position.y - (size.height / 2.0)).max(0.0),
-            (position.x - 20.0).max(0.0),
-            (position.y - size.height - 20.0).max(0.0),
-        ));
+        self.move_to_mut(Point::new(position.x.max(0.0), position.y.max(0.0)));
 
         let new_self_bounds = self.bounds();
 

@@ -26,6 +26,7 @@ fn main() -> iced::Result {
 #[allow(clippy::enum_variant_names)]
 enum Message {
     ChooseColor,
+    ChooseColor2,
     ShowTest,
     SubmitColor(Color),
     CancelColor,
@@ -36,6 +37,7 @@ enum Message {
 struct ColorPickerExample {
     color: Color,
     show_picker: bool,
+    show_picker2: bool,
     show_test: bool,
     theme: Theme,
 }
@@ -45,6 +47,7 @@ impl Default for ColorPickerExample {
         Self {
             color: Color::from_rgba8(0, 0, 0, 1.0),
             show_picker: false,
+            show_picker2: false,
             show_test: false,
             theme: Theme::TokyoNightStorm,
         }
@@ -59,12 +62,16 @@ impl ColorPickerExample {
             Message::ChooseColor => {
                 self.show_picker = true;
             }
+            Message::ChooseColor2 => {
+                self.show_picker2 = true;
+            }
             Message::SubmitColor(color) => {
                 self.color = color;
                 self.show_picker = false;
             }
             Message::CancelColor => {
                 self.show_picker = false;
+                self.show_picker2 = false;
                 self.show_test = false;
             }
             Message::Theme(theme) => {
@@ -77,8 +84,18 @@ impl ColorPickerExample {
         let theme_picker = pick_list(Theme::ALL, Some(&self.theme), Message::Theme);
         let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor);
 
-        let color_picker = color_picker(
+        let picker = color_picker(
             self.show_picker,
+            self.color,
+            but,
+            Message::CancelColor,
+            Message::SubmitColor,
+        );
+
+        let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor2);
+
+        let picker2 = color_picker(
+            self.show_picker2,
             self.color,
             but,
             Message::CancelColor,
@@ -88,18 +105,14 @@ impl ColorPickerExample {
         let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
 
         let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
-        let bar = test_overlay::Bar::new(
-            self.show_test,
-            but.into(),
-            Message::CancelColor,
-        );
+        let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
         let row = Row::new()
             .align_y(Alignment::Center)
             .spacing(10)
-            .push(color_picker)
+            .push(picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, bar, color, row].spacing(20);
+        let col = column![theme_picker, picker2, bar, color, row].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
