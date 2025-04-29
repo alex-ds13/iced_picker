@@ -79,6 +79,7 @@ where
     on_submit: Box<dyn Fn(Color) -> Message + 'a>,
     /// The style of the [`ColorPickerOverlay`].
     class: <Theme as Catalog>::Class<'a>,
+    overlay_el: Element<'a, Message, Theme, Renderer>,
     // /// The buttons of the overlay.
     // overlay_state: Element<'a, Message, Theme, Renderer>,
     // /// The cancel button of the [`ColorPickerOverlay`].
@@ -90,7 +91,12 @@ where
 impl<'a, Message, Theme> ColorPicker<'a, Message, Theme>
 where
     Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: 'a
+        + Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + crate::color::Catalog
+        + container::Catalog,
 {
     /// Creates a new [`ColorPicker`] wrapping around the given underlay.
     ///
@@ -112,7 +118,7 @@ where
     ) -> Self
     where
         U: Into<Element<'a, Message, Theme, Renderer>>,
-        F: 'a + Fn(Color) -> Message,
+        F: 'a + Fn(Color) -> Message + Clone,
     {
         // let cancel_button = Button::new(
         //         // text(icon_to_string(RequiredIcons::X))
@@ -126,6 +132,7 @@ where
         //     )
         //     .width(Length::Fill)
         //     .on_press(on_cancel.clone()); // Sending a fake message
+        let overlay_el = crate::color::color(color, on_cancel.clone(), on_submit.clone()).into();
 
         Self {
             show_picker,
@@ -134,6 +141,7 @@ where
             on_cancel,
             on_submit: Box::new(on_submit),
             class: <Theme as Catalog>::default(),
+            overlay_el,
             // cancel_button,
             // submit_button,
             // overlay_state: ColorPickerOverlayButtons::default().into(),
@@ -204,7 +212,7 @@ where
     }
 
     fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.underlay)] //, Tree::empty()]//new(&self.overlay_state)]
+        vec![Tree::new(&self.underlay), Tree::new(&self.overlay_el)] //, Tree::empty()]//new(&self.overlay_state)]
     }
 
     fn diff(&self, tree: &mut Tree) {
@@ -214,7 +222,7 @@ where
             color_picker_state.overlay_state.color = self.color;
         }
 
-        tree.diff_children(&[&self.underlay]); //, &self.overlay_state]);
+        tree.diff_children(&[&self.underlay, &self.overlay_el]); //, &self.overlay_state]);
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -295,8 +303,6 @@ where
         renderer: &Renderer,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let picker_state: &mut State = state.state.downcast_mut();
-
         if !self.show_picker {
             return self.underlay.as_widget_mut().overlay(
                 &mut state.children[0],
@@ -305,6 +311,8 @@ where
                 translation,
             );
         }
+
+        let picker_state = &mut state.children[1];
 
         let bounds = layout.bounds();
         let position = Point::new(bounds.center_x(), bounds.center_y());
@@ -316,6 +324,7 @@ where
                 &self.on_submit,
                 position,
                 &self.class,
+                &mut self.overlay_el,
                 // &mut state.children[1],
             )
             .overlay(),
@@ -362,14 +371,14 @@ where
     'b: 'a,
 {
     /// The state of the [`ColorPickerOverlay`].
-    state: &'a mut OverlayState,
+    state: &'a mut Tree,
     // /// The cancel and submit buttons
     // buttons: ColorPickerOverlayButtons<'a, Message, Theme>,
     // /// The cancel button of the [`ColorPickerOverlay`].
     // cancel_button: Element<'a, Message, Theme, Renderer>,
     // /// The submit button of the [`ColorPickerOverlay`].
     // submit_button: Element<'a, Message, Theme, Renderer>,
-    picker: Element<'a, Message, Theme>,
+    picker: &'a mut Element<'b, Message, Theme>,
     /// The function that produces a message when the submit button of the [`ColorPickerOverlay`].
     on_submit: &'a dyn Fn(Color) -> Message,
     /// The position of the [`ColorPickerOverlay`].
@@ -393,17 +402,18 @@ where
 {
     /// Creates a new [`ColorPickerOverlay`] on the given position.
     pub fn new(
-        state: &'a mut State,
+        state: &'a mut Tree,
         on_cancel: Message,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
         class: &'a <Theme as Catalog>::Class<'b>,
+        picker: &'a mut Element<'b, Message, Theme, Renderer>,
         // cancel_button: &'a mut Button<'a, Message, Theme>,
         // submit_button: &'a mut Button<'a, Message, Theme>,
         // tree: &'a mut Tree,
     ) -> Self {
         //state.color_hex = OverlayState::color_as_string(state.color);
-        let State { overlay_state } = state;
+        // let State { overlay_state } = state;
 
         // let cancel_button: Element<Message, Theme> = Button::new(
         //     // text(icon_to_string(RequiredIcons::X))
@@ -523,11 +533,11 @@ where
         // tree[2] = child_tree;
         // overlay_state.tree = tree;
 
-        let picker = crate::color::color(overlay_state.color, on_cancel, on_submit).into();
-        overlay_state.tree.diff(&picker);
+        // let picker = crate::color::color(overlay_state.color, on_cancel, on_submit).into();
+        // overlay_state.tree.diff(&picker);
 
         ColorPickerOverlay {
-            state: overlay_state,
+            state,
             // buttons,
             // cancel_button,
             // submit_button,
@@ -1075,15 +1085,11 @@ where
     'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
-        let limits = Limits::new(
-            Size::ZERO,
-            Size::new(
-                bounds.width,
-                bounds.height,
-            ),
-        );
+        let limits = Limits::new(Size::ZERO, Size::new(bounds.width, bounds.height));
 
-        self.picker.as_widget().layout(&mut self.state.tree, renderer, &limits)
+        self.picker
+            .as_widget()
+            .layout(&mut self.state, renderer, &limits)
 
         // let space_below =
         //     bounds.height - (self.position.y + self.target_height);
@@ -1110,7 +1116,6 @@ where
         // } else {
         //     self.position - Vector::new(0.0, size.height)
         // })
-
 
         // let (max_width, max_height) = if bounds.width > bounds.height {
         //     (600.0, 300.0)
@@ -1184,7 +1189,17 @@ where
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<Message>,
     ) {
-        self.picker.as_widget_mut().update(&mut self.state.tree, event, layout, cursor, renderer, clipboard, shell, &Rectangle::default())
+        let viewport = layout.bounds();
+        self.picker.as_widget_mut().update(
+            &mut self.state,
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            &viewport,
+        )
         // if event::Status::Captured == self.on_event_keyboard(event) {
         //     self.state.sat_value_canvas_cache.clear();
         //     self.state.hue_canvas_cache.clear();
@@ -1280,7 +1295,13 @@ where
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.state.mouse_interaction
+        self.picker.as_widget().mouse_interaction(
+            &self.state,
+            _layout,
+            _cursor,
+            _viewport,
+            _renderer,
+        )
     }
 
     fn draw(
@@ -1291,7 +1312,16 @@ where
         layout: Layout<'_>,
         cursor: Cursor,
     ) {
-        self.picker.as_widget().draw(&self.state.tree, renderer, theme, style, layout, cursor, &Rectangle::default())
+        let viewport = layout.bounds();
+        self.picker.as_widget().draw(
+            &self.state,
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            &viewport,
+        )
         // let bounds = layout.bounds();
         // let mut children = layout.children();
         //
@@ -2163,7 +2193,7 @@ impl OverlayState {
     /// Creates a new State with the given color.
     #[must_use]
     pub fn new(color: Color) -> Self
-    // where
+// where
     //     Message: Clone,
     //     Theme: text::Catalog + iced::widget::container::Catalog + iced::widget::button::Catalog,
     {
@@ -2759,8 +2789,13 @@ pub fn color_picker<'a, Message, Theme, F>(
 ) -> ColorPicker<'a, Message, Theme>
 where
     Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
-    F: 'a + Fn(Color) -> Message,
+    Theme: 'a
+        + Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + crate::color::Catalog
+        + container::Catalog,
+    F: 'a + Fn(Color) -> Message + Clone,
 {
     ColorPicker::new(show_picker, color, underlay, on_cancel, on_submit)
 }

@@ -1,5 +1,7 @@
 mod color;
 mod color_picker;
+mod custom_widget;
+mod test_overlay;
 
 use color_picker::color_picker;
 
@@ -24,6 +26,7 @@ fn main() -> iced::Result {
 #[allow(clippy::enum_variant_names)]
 enum Message {
     ChooseColor,
+    ShowTest,
     SubmitColor(Color),
     CancelColor,
     Theme(Theme),
@@ -33,6 +36,7 @@ enum Message {
 struct ColorPickerExample {
     color: Color,
     show_picker: bool,
+    show_test: bool,
     theme: Theme,
 }
 
@@ -41,6 +45,7 @@ impl Default for ColorPickerExample {
         Self {
             color: Color::from_rgba8(0, 0, 0, 1.0),
             show_picker: false,
+            show_test: false,
             theme: Theme::TokyoNightStorm,
         }
     }
@@ -48,6 +53,9 @@ impl Default for ColorPickerExample {
 impl ColorPickerExample {
     fn update(&mut self, message: Message) {
         match message {
+            Message::ShowTest => {
+                self.show_test = true;
+            }
             Message::ChooseColor => {
                 self.show_picker = true;
             }
@@ -57,6 +65,7 @@ impl ColorPickerExample {
             }
             Message::CancelColor => {
                 self.show_picker = false;
+                self.show_test = false;
             }
             Message::Theme(theme) => {
                 self.theme = theme;
@@ -78,13 +87,19 @@ impl ColorPickerExample {
 
         let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
 
+        let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
+        let bar = test_overlay::Bar::new(
+            self.show_test,
+            but.into(),
+            Message::CancelColor,
+        );
         let row = Row::new()
             .align_y(Alignment::Center)
             .spacing(10)
             .push(color_picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, color, row].spacing(20);
+        let col = column![theme_picker, bar, color, row].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
