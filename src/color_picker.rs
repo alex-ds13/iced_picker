@@ -902,7 +902,20 @@ where
                     r: cursor
                         .position_in(red_bar_bounds)
                         .map(|position| calc_percentage(red_bar_bounds, position))
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| {
+                            cursor
+                                .position()
+                                .map(|position| {
+                                    if position.x < red_bar_bounds.x {
+                                        0.0
+                                    } else if position.x > red_bar_bounds.x + red_bar_bounds.width {
+                                        1.0
+                                    } else {
+                                        self.state.color.r
+                                    }
+                                })
+                                .unwrap_or(self.state.color.r)
+                        }),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -912,7 +925,22 @@ where
                     g: cursor
                         .position_in(green_bar_bounds)
                         .map(|position| calc_percentage(green_bar_bounds, position))
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| {
+                            cursor
+                                .position()
+                                .map(|position| {
+                                    if position.x < green_bar_bounds.x {
+                                        0.0
+                                    } else if position.x
+                                        > green_bar_bounds.x + green_bar_bounds.width
+                                    {
+                                        1.0
+                                    } else {
+                                        self.state.color.g
+                                    }
+                                })
+                                .unwrap_or(self.state.color.g)
+                        }),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -922,7 +950,21 @@ where
                     b: cursor
                         .position_in(blue_bar_bounds)
                         .map(|position| calc_percentage(blue_bar_bounds, position))
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| {
+                            cursor
+                                .position()
+                                .map(|position| {
+                                    if position.x < blue_bar_bounds.x {
+                                        0.0
+                                    } else if position.x > blue_bar_bounds.x + blue_bar_bounds.width
+                                    {
+                                        1.0
+                                    } else {
+                                        self.state.color.b
+                                    }
+                                })
+                                .unwrap_or(self.state.color.b)
+                        }),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -932,7 +974,22 @@ where
                     a: cursor
                         .position_in(alpha_bar_bounds)
                         .map(|position| calc_percentage(alpha_bar_bounds, position))
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| {
+                            cursor
+                                .position()
+                                .map(|position| {
+                                    if position.x < alpha_bar_bounds.x {
+                                        0.0
+                                    } else if position.x
+                                        > alpha_bar_bounds.x + alpha_bar_bounds.width
+                                    {
+                                        1.0
+                                    } else {
+                                        self.state.color.a
+                                    }
+                                })
+                                .unwrap_or(self.state.color.a)
+                        }),
                     ..self.state.color
                 };
                 color_changed = true;
