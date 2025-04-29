@@ -74,13 +74,14 @@ where
     color: Color,
     /// The underlying element.
     underlay: Element<'a, Message, Theme, Renderer>,
-    /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed.
-    on_cancel: Message,
+    // /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed.
+    // on_cancel: Message,
     /// The function that produces a message when the submit button of the [`ColorPickerOverlay`] is pressed.
     on_submit: Box<dyn Fn(Color) -> Message + 'a>,
     /// The style of the [`ColorPickerOverlay`].
     class: <Theme as Catalog>::Class<'a>,
-    // overlay_el: Element<'a, Message, Theme, Renderer>,
+    /// Overlay element to be used for the layout calculation only
+    overlay_el: Element<'a, Message, Theme, Renderer>,
     // /// The buttons of the overlay.
     // overlay_state: Element<'a, Message, Theme, Renderer>,
     /// The cancel button of the [`ColorPickerOverlay`].
@@ -96,7 +97,6 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + crate::color::Catalog
         + container::Catalog,
 {
     /// Creates a new [`ColorPicker`] wrapping around the given underlay.
@@ -136,15 +136,16 @@ where
         .on_press(on_cancel.clone()) // Sending a fake message
         .into();
         // let overlay_el = crate::color::color(color, on_cancel.clone(), on_submit.clone()).into();
+        let overlay_el = overlay_element(on_cancel);
 
         Self {
             show_picker,
             color,
             underlay: underlay.into(),
-            on_cancel,
+            // on_cancel,
             on_submit: Box::new(on_submit),
             class: <Theme as Catalog>::default(),
-            // overlay_el,
+            overlay_el,
             cancel_button,
             submit_button,
             // overlay_state: ColorPickerOverlayButtons::default().into(),
@@ -179,7 +180,7 @@ pub struct State {
 impl State {
     /// Creates a new [`State`].
     #[must_use]
-    pub fn new<Message: Clone, Theme>(color: Color) -> Self
+    pub fn new(color: Color) -> Self
     where
         Theme: text::Catalog + container::Catalog + iced::widget::button::Catalog,
     {
@@ -211,7 +212,7 @@ where
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::new::<Message, Theme>(self.color))
+        tree::State::new(State::new(self.color))
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -221,7 +222,7 @@ where
             Tree::new(&self.submit_button),
             Tree::empty(),
         ];
-        vec![Tree::new(&self.underlay), buttons_tree] // Tree::new(&self.overlay_el)] //, Tree::empty()]//new(&self.overlay_state)]
+        vec![Tree::new(&self.underlay), buttons_tree]
     }
 
     fn diff(&self, tree: &mut Tree) {
@@ -231,103 +232,7 @@ where
             color_picker_state.overlay_state.color = self.color;
         }
 
-        // RGBA Colors
-        let mut rgba_colors: Column<'_, Message, Theme, Renderer> =
-            Column::<Message, Theme, Renderer>::new();
-
-        for _ in 0..4 {
-            rgba_colors = rgba_colors.push(
-                Row::new()
-                    .align_y(Alignment::Center)
-                    .spacing(SPACING)
-                    .padding(PADDING)
-                    .height(Length::Fill)
-                    .push(
-                        text("X: ")
-                            .align_x(Horizontal::Center)
-                            .align_y(Vertical::Center),
-                    )
-                    .push(
-                        Row::new()
-                            .width(Length::FillPortion(5))
-                            .height(Length::Fill),
-                    )
-                    .push(
-                        text("XXX")
-                            .align_x(Horizontal::Center)
-                            .align_y(Vertical::Center),
-                    ),
-            );
-        }
-
-        let hex_text_layout = Row::<Message, Theme, Renderer>::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(16.0 + PADDING.vertical()));
-
-        let cancel_button = Button::new(
-            // text(icon_to_string(RequiredIcons::X))
-            text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        )
-        .width(Length::Fill);
-        let submit_button = Button::new(
-            // text(icon_to_string(RequiredIcons::Check))
-            text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        )
-        .width(Length::Fill);
-
-        let block2 = Column::new()
-            .spacing(PADDING.vertical() / 2.) // Average vertical padding
-            .push(rgba_colors)
-            .push(hex_text_layout)
-            .push(
-                Row::new()
-                    .spacing(PADDING.vertical() / 2.)
-                    .push(cancel_button)
-                    .push(submit_button),
-            );
-
-        let block1 = Column::<Message, Theme, Renderer>::new()
-            .spacing(PADDING.vertical() / 2.) // Average vertical padding
-            .push(
-                Row::new().push(
-                    container("")
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(7)),
-                ),
-            )
-            .push(
-                Row::new().push(
-                    container("")
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(1)),
-                ),
-            );
-
-        let divider = Row::<Message, Theme, Renderer>::new()
-            .spacing(SPACING)
-            .push(Row::new().push(container(block1).width(Length::Fill).height(Length::Fill)))
-            .push(Row::new().push(container(block2).width(Length::Fill).height(Length::Fill)))
-            .width(600)
-            .height(300);
-
-        let element: Element<Message, Theme, Renderer> = Element::new(divider);
-
-        let cancel_button = Button::new(
-            // text(icon_to_string(RequiredIcons::X))
-            text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        )
-        .width(Length::Fill)
-        .on_press(self.on_cancel.clone());
-        let submit_button = Button::new(
-            // text(icon_to_string(RequiredIcons::Check))
-            text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
-        )
-        .width(Length::Fill)
-        .on_press(self.on_cancel.clone()); // Sending a fake message
-
-        let buttons_row = row![cancel_button, submit_button, element,].into();
-
-        tree.diff_children(&[&self.underlay, &buttons_row]); // &self.overlay_el]); //, &self.overlay_state]);
+        tree.diff_children(&[&self.underlay, &self.overlay_el]);
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -427,7 +332,7 @@ where
             ColorPickerOverlay::new(
                 &mut picker_state.overlay_state,
                 picker_tree,
-                self.on_cancel.clone(),
+                // self.on_cancel.clone(),
                 &self.on_submit,
                 position,
                 &self.class,
@@ -503,7 +408,6 @@ where
     Message: 'a + Clone,
     Theme: 'a
         + Catalog
-        + crate::color::Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
         + container::Catalog,
@@ -513,7 +417,7 @@ where
     pub fn new(
         state: &'a mut OverlayState,
         tree: &'a mut Tree,
-        on_cancel: Message,
+        // on_cancel: Message,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
         class: &'a <Theme as Catalog>::Class<'b>,
@@ -1245,7 +1149,6 @@ where
     Message: 'a + Clone,
     Theme: 'a
         + Catalog
-        + crate::color::Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
         + container::Catalog,
@@ -1557,6 +1460,112 @@ where
             &style_sheet,
         );
     }
+}
+
+pub fn overlay_element<'a, Message, Theme>(on_cancel: Message) -> Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a + Clone,
+    Theme: 'a
+        + Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + container::Catalog,
+{
+    // RGBA Colors
+    let mut rgba_colors: Column<'_, Message, Theme, Renderer> =
+        Column::<Message, Theme, Renderer>::new();
+
+    for _ in 0..4 {
+        rgba_colors = rgba_colors.push(
+            Row::new()
+                .align_y(Alignment::Center)
+                .spacing(SPACING)
+                .padding(PADDING)
+                .height(Length::Fill)
+                .push(
+                    text("X: ")
+                        .align_x(Horizontal::Center)
+                        .align_y(Vertical::Center),
+                )
+                .push(
+                    Row::new()
+                        .width(Length::FillPortion(5))
+                        .height(Length::Fill),
+                )
+                .push(
+                    text("XXX")
+                        .align_x(Horizontal::Center)
+                        .align_y(Vertical::Center),
+                ),
+        );
+    }
+
+    let hex_text_layout = Row::<Message, Theme, Renderer>::new()
+        .width(Length::Fill)
+        .height(Length::Fixed(16.0 + PADDING.vertical()));
+
+    let cancel_button = Button::new(
+        // text(icon_to_string(RequiredIcons::X))
+        text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+    )
+    .width(Length::Fill);
+    let submit_button = Button::new(
+        // text(icon_to_string(RequiredIcons::Check))
+        text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+    )
+    .width(Length::Fill);
+
+    let block2 = Column::new()
+        .spacing(PADDING.vertical() / 2.) // Average vertical padding
+        .push(rgba_colors)
+        .push(hex_text_layout)
+        .push(
+            Row::new()
+                .spacing(PADDING.vertical() / 2.)
+                .push(cancel_button)
+                .push(submit_button),
+        );
+
+    let block1 = Column::<Message, Theme, Renderer>::new()
+        .spacing(PADDING.vertical() / 2.) // Average vertical padding
+        .push(
+            Row::new().push(
+                container("")
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(7)),
+            ),
+        )
+        .push(
+            Row::new().push(
+                container("")
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(1)),
+            ),
+        );
+
+    let divider = Row::<Message, Theme, Renderer>::new()
+        .spacing(SPACING)
+        .push(Row::new().push(container(block1).width(Length::Fill).height(Length::Fill)))
+        .push(Row::new().push(container(block2).width(Length::Fill).height(Length::Fill)))
+        .width(600)
+        .height(300);
+
+    let element: Element<Message, Theme, Renderer> = Element::new(divider);
+
+    let cancel_button = Button::new(
+        // text(icon_to_string(RequiredIcons::X))
+        text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+    )
+    .width(Length::Fill)
+    .on_press(on_cancel.clone());
+    let submit_button = Button::new(
+        // text(icon_to_string(RequiredIcons::Check))
+        text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+    )
+    .width(Length::Fill)
+    .on_press(on_cancel); // Sending a fake message
+
+    row![cancel_button, submit_button, element].into()
 }
 
 /// Defines the layout of the 1. block of the color picker containing the HSV part.
@@ -2359,8 +2368,8 @@ pub struct OverlayState {
     pub(crate) keyboard_modifiers: keyboard::Modifiers,
     /// The current mouse interaction
     pub(crate) mouse_interaction: mouse::Interaction,
-    /// The state tree
-    pub(crate) tree: Tree,
+    // /// The state tree
+    // pub(crate) tree: Tree,
 }
 
 impl OverlayState {
@@ -2467,7 +2476,7 @@ impl OverlayState {
 
         Self {
             color,
-            tree: Tree::empty(),
+            // tree: Tree::empty(),
             ..Self::default()
         }
     }
@@ -2483,7 +2492,7 @@ impl Default for OverlayState {
             focus: Focus::default(),
             keyboard_modifiers: keyboard::Modifiers::default(),
             mouse_interaction: mouse::Interaction::default(),
-            tree: Tree::empty(),
+            // tree: Tree::empty(),
         }
     }
 }
