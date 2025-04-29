@@ -2499,8 +2499,10 @@ impl Position for Node {
         let size = self.size();
 
         self.move_to_mut(Point::new(
-            (position.x - (size.width / 2.0)).max(0.0),
-            (position.y - (size.height / 2.0)).max(0.0),
+            // (position.x - (size.width / 2.0)).max(0.0),
+            // (position.y - (size.height / 2.0)).max(0.0),
+            (position.x - 20.0).max(0.0),
+            (position.y - size.height - 20.0).max(0.0),
         ));
 
         let new_self_bounds = self.bounds();
