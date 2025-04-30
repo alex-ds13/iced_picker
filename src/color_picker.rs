@@ -354,6 +354,8 @@ const PADDING: Padding = Padding::new(10.0);
 const SPACING: Pixels = Pixels(15.0);
 /// The spacing between the buttons.
 const BUTTON_SPACING: Pixels = Pixels(5.0);
+/// The offset to move the overlay above/below the underlay element.
+const OFFSET: f32 = 10.0;
 
 /// The step value of the keyboard change of the sat/value color values.
 const SAT_VALUE_STEP: f32 = 0.005;
@@ -1008,8 +1010,8 @@ where
     'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
-        let space_below = bounds.height - (self.position.y + self.underlay_height);
-        let space_above = self.position.y;
+        let space_below = bounds.height - (self.position.y + self.underlay_height + OFFSET);
+        let space_above = self.position.y - OFFSET;
 
         let mut show_below = false;
         let bounds = Size::new(
@@ -1023,9 +1025,9 @@ where
         );
 
         let position = if show_below {
-            self.position + Vector::new(0.0, self.underlay_height)
+            self.position + Vector::new(0.0, self.underlay_height + OFFSET)
         } else {
-            self.position
+            self.position - Vector::new(0.0, OFFSET)
         };
 
         let (max_width, max_height) = if bounds.width > bounds.height {
