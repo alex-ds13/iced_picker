@@ -68,6 +68,7 @@ impl ColorPickerExample {
             Message::SubmitColor(color) => {
                 self.color = color;
                 self.show_picker = false;
+                self.show_picker2 = false;
             }
             Message::CancelColor => {
                 self.show_picker = false;

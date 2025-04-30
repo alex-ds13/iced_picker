@@ -106,15 +106,22 @@ where
         F: 'a + Fn(Color) -> Message + Clone,
     {
         let cancel_button = Button::new(
-            // text(icon_to_string(RequiredIcons::X))
-            text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+            text("X")
+                .align_x(Horizontal::Center)
+                .font(iced::Font {
+                    weight: iced::font::Weight::ExtraBold,
+                    ..iced::Font::DEFAULT
+                })
+                .width(Length::Fill),
         )
         .width(Length::Fill)
         .on_press(on_cancel.clone())
         .into();
         let submit_button = Button::new(
-            // text(icon_to_string(RequiredIcons::Check))
-            text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+            text(Renderer::CHECKMARK_ICON)
+                .font(Renderer::ICON_FONT)
+                .align_x(Horizontal::Center)
+                .width(Length::Fill),
         )
         .width(Length::Fill)
         .on_press(on_cancel.clone()) // Sending a fake message
