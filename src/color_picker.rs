@@ -60,8 +60,8 @@ where
     color: Color,
     /// The underlying element.
     underlay: Element<'a, Message, Theme, Renderer>,
-    // /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed.
-    // on_cancel: Message,
+    /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed.
+    on_cancel: Message,
     /// The function that produces a message when the submit button of the [`ColorPickerOverlay`] is pressed.
     on_submit: Box<dyn Fn(Color) -> Message + 'a>,
     /// The style of the [`ColorPickerOverlay`].
@@ -127,12 +127,13 @@ where
         .on_press(on_cancel.clone()) // Sending a fake message
         .into();
         // let overlay_el = crate::color::color(color, on_cancel.clone(), on_submit.clone()).into();
-        let overlay_el = overlay_element(on_cancel);
+        let overlay_el = overlay_element(on_cancel.clone());
 
         Self {
             show_picker,
             color,
             underlay: underlay.into(),
+            on_cancel,
             on_submit: Box::new(on_submit),
             class: <Theme as Catalog>::default(),
             overlay_el,
@@ -321,6 +322,7 @@ where
             ColorPickerOverlay::new(
                 &mut picker_state.overlay_state,
                 picker_tree,
+                self.on_cancel.clone(),
                 &self.on_submit,
                 position,
                 underlay_height,
@@ -378,7 +380,11 @@ where
     cancel_button: &'a mut Element<'b, Message, Theme, Renderer>,
     /// The submit button of the [`ColorPickerOverlay`].
     submit_button: &'a mut Element<'b, Message, Theme, Renderer>,
-    /// The function that produces a message when the submit button of the [`ColorPickerOverlay`].
+    /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed or
+    /// when pressed outside its bounds.
+    on_cancel: Message,
+    /// The function that produces a message when the submit button of the [`ColorPickerOverlay`]
+    /// is pressed.
     on_submit: &'a dyn Fn(Color) -> Message,
     /// The position of the [`ColorPickerOverlay`].
     position: Point,
@@ -405,6 +411,7 @@ where
     pub fn new(
         state: &'a mut OverlayState,
         tree: &'a mut Tree,
+        on_cancel: Message,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
         underlay_height: f32,
@@ -416,6 +423,7 @@ where
             state,
             cancel_button,
             submit_button,
+            on_cancel,
             on_submit,
             position,
             underlay_height,
@@ -485,6 +493,9 @@ where
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
                 self.state.color_bar_dragged = ColorBarDragged::None;
+                if cursor.is_over(sat_value_bounds) || cursor.is_over(hue_bounds) {
+                    shell.capture_event();
+                }
             }
             _ => {}
         }
@@ -653,6 +664,13 @@ where
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
                 self.state.color_bar_dragged = ColorBarDragged::None;
+                if cursor.is_over(red_bar_bounds)
+                    || cursor.is_over(green_bar_bounds)
+                    || cursor.is_over(blue_bar_bounds)
+                    || cursor.is_over(alpha_bar_bounds)
+                {
+                    shell.capture_event();
+                }
             }
             _ => {}
         }
@@ -1174,6 +1192,16 @@ where
         // ----------- Block 2 end ------------------
 
         if shell.is_event_captured() {
+            self.state.sat_value_canvas_cache.clear();
+            self.state.hue_canvas_cache.clear();
+        } else if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        ) && !cursor.is_over(layout.bounds())
+        {
+            // Clicked outside of bounds so lets send the `on_cancel` message to close the picker
+            shell.publish(self.on_cancel.clone());
+            shell.capture_event();
             self.state.sat_value_canvas_cache.clear();
             self.state.hue_canvas_cache.clear();
         }
