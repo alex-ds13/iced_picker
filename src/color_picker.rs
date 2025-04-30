@@ -492,9 +492,12 @@ where
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
-                self.state.color_bar_dragged = ColorBarDragged::None;
-                if cursor.is_over(sat_value_bounds) || cursor.is_over(hue_bounds) {
+                if matches!(
+                    self.state.color_bar_dragged,
+                    ColorBarDragged::SatValue | ColorBarDragged::Hue
+                ) {
                     shell.capture_event();
+                    self.state.color_bar_dragged = ColorBarDragged::None;
                 }
             }
             _ => {}
@@ -663,13 +666,15 @@ where
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
-                self.state.color_bar_dragged = ColorBarDragged::None;
-                if cursor.is_over(red_bar_bounds)
-                    || cursor.is_over(green_bar_bounds)
-                    || cursor.is_over(blue_bar_bounds)
-                    || cursor.is_over(alpha_bar_bounds)
-                {
+                if matches!(
+                    self.state.color_bar_dragged,
+                    ColorBarDragged::Red
+                        | ColorBarDragged::Green
+                        | ColorBarDragged::Blue
+                        | ColorBarDragged::Alpha
+                ) {
                     shell.capture_event();
+                    self.state.color_bar_dragged = ColorBarDragged::None;
                 }
             }
             _ => {}
