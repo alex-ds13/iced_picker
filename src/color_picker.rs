@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use iced::{
-    Alignment, Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Renderer,
-    Shadow, Size, Vector,
+    Alignment, Background, Border, Color, Element, Event, Length, Padding, Pixels, Point,
+    Rectangle, Renderer, Shadow, Size, Theme, Vector,
     advanced::{
         Clipboard, Layout, Shell, Widget,
         layout::{Limits, Node},
@@ -126,7 +126,7 @@ where
         .width(Length::Fill)
         .on_press(on_cancel.clone()) // Sending a fake message
         .into();
-        // let overlay_el = crate::color::color(color, on_cancel.clone(), on_submit.clone()).into();
+
         let overlay_el = overlay_element(on_cancel.clone());
 
         Self {
@@ -302,26 +302,25 @@ where
         renderer: &Renderer,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        if !self.show_picker {
-            return self.underlay.as_widget_mut().overlay(
-                &mut state.children[0],
-                layout,
-                renderer,
-                translation,
-            );
-        }
+        let (underlay_tree, picker_tree) = state.children.split_at_mut(1);
 
-        let picker_state: &mut State = state.state.downcast_mut::<State>();
-        let picker_tree = &mut state.children[1];
+        let under_overlay = self.underlay.as_widget_mut().overlay(
+            &mut underlay_tree[0],
+            layout,
+            renderer,
+            translation,
+        );
 
-        let bounds = layout.bounds();
-        let position = bounds.position();
-        let underlay_height = bounds.height;
+        let picker = self.show_picker.then(|| {
+            let picker_state: &mut State = state.state.downcast_mut::<State>();
 
-        Some(
+            let bounds = layout.bounds();
+            let position = bounds.position();
+            let underlay_height = bounds.height;
+
             ColorPickerOverlay::new(
                 &mut picker_state.overlay_state,
-                picker_tree,
+                &mut picker_tree[0],
                 self.on_cancel.clone(),
                 &self.on_submit,
                 position,
@@ -330,8 +329,12 @@ where
                 &mut self.cancel_button,
                 &mut self.submit_button,
             )
-            .overlay(),
-        )
+            .overlay()
+        });
+
+        let overlays = under_overlay.into_iter().chain(picker).collect::<Vec<_>>();
+
+        (!overlays.is_empty()).then(|| overlay::Group::with_children(overlays).overlay())
     }
 }
 
@@ -1353,13 +1356,20 @@ where
         .height(Length::Fixed(16.0 + PADDING.vertical()));
 
     let cancel_button = Button::new(
-        // text(icon_to_string(RequiredIcons::X))
-        text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+        text("X")
+            .align_x(Horizontal::Center)
+            .font(iced::Font {
+                weight: iced::font::Weight::ExtraBold,
+                ..iced::Font::DEFAULT
+            })
+            .width(Length::Fill),
     )
     .width(Length::Fill);
     let submit_button = Button::new(
-        // text(icon_to_string(RequiredIcons::Check))
-        text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+        text(Renderer::CHECKMARK_ICON)
+            .font(Renderer::ICON_FONT)
+            .align_x(Horizontal::Center)
+            .width(Length::Fill),
     )
     .width(Length::Fill);
 
@@ -1401,14 +1411,21 @@ where
     let element: Element<Message, Theme, Renderer> = Element::new(divider);
 
     let cancel_button = Button::new(
-        // text(icon_to_string(RequiredIcons::X))
-        text("X").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+        text("X")
+            .align_x(Horizontal::Center)
+            .font(iced::Font {
+                weight: iced::font::Weight::ExtraBold,
+                ..iced::Font::DEFAULT
+            })
+            .width(Length::Fill),
     )
     .width(Length::Fill)
     .on_press(on_cancel.clone());
     let submit_button = Button::new(
-        // text(icon_to_string(RequiredIcons::Check))
-        text("V").align_x(Horizontal::Center).width(Length::Fill), // .font(REQUIRED_FONT),
+        text(Renderer::CHECKMARK_ICON)
+            .font(Renderer::ICON_FONT)
+            .align_x(Horizontal::Center)
+            .width(Length::Fill),
     )
     .width(Length::Fill)
     .on_press(on_cancel); // Sending a fake message
@@ -2348,8 +2365,6 @@ impl Default for Focus {
         Self::None
     }
 }
-
-use iced::{Background, Theme};
 
 /// The appearance of a [`ColorPicker`](crate::widget::ColorPicker).
 #[derive(Clone, Copy, Debug)]
