@@ -7,7 +7,7 @@ use color_picker::color_picker;
 
 use iced::{
     Alignment, Color, Element, Length, Theme,
-    widget::{Button, Container, Row, Text, column, pick_list},
+    widget::{Button, Container, Row, Text, column, container, pick_list},
 };
 
 fn main() -> iced::Result {
@@ -18,7 +18,6 @@ fn main() -> iced::Result {
     )
     .title("Color Picker Example")
     .theme(ColorPickerExample::theme)
-    // .font(iced_fonts::REQUIRED_FONT_BYTES)
     .run()
 }
 
@@ -103,7 +102,8 @@ impl ColorPickerExample {
             Message::SubmitColor,
         );
 
-        let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
+        // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
+        let space = container("").height(300).style(container::dark);
 
         let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
         let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
@@ -113,7 +113,7 @@ impl ColorPickerExample {
             .push(picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, picker2, bar, color, row].spacing(20);
+        let col = column![theme_picker, picker2, bar, space, row].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)

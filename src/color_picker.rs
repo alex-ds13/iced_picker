@@ -334,8 +334,9 @@ where
     fn overlay<'b>(
         &'b mut self,
         state: &'b mut Tree,
-        layout: Layout<'_>,
+        layout: Layout<'b>,
         renderer: &Renderer,
+        viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let (underlay_tree, picker_tree) = state.children.split_at_mut(1);
@@ -344,6 +345,7 @@ where
             &mut underlay_tree[0],
             layout,
             renderer,
+            viewport,
             translation,
         );
 

@@ -160,8 +160,9 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for Bar<'a, Messa
     fn overlay<'b>(
         &'b mut self,
         _state: &'b mut Tree,
-        _layout: Layout<'_>,
+        _layout: Layout<'b>,
         _renderer: &Renderer,
+        _viewport: &iced::Rectangle,
         _translation: iced::Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         if self.show_overlay {
