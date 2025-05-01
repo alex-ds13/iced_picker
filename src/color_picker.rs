@@ -938,6 +938,15 @@ where
                 }
             }
 
+            if matches!(status, event::Status::Captured)
+                && !matches!(self.state.color, Color::BLACK | Color::WHITE)
+            {
+                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
+                // was on those cases
+                let hue = Hsv::from(self.state.color).hue;
+                self.state.current_hue_degrees = hue;
+            }
+
             status
         } else if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             self.state.keyboard_modifiers = *modifiers;
