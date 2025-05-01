@@ -215,10 +215,23 @@ where
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let color_picker_state = tree.state.downcast_mut::<State>();
+        let color_picker_state = &mut tree.state.downcast_mut::<State>().overlay_state;
 
-        if color_picker_state.overlay_state.color != self.color {
-            color_picker_state.overlay_state.color = self.color;
+        if color_picker_state.color != self.color {
+            color_picker_state.color = self.color;
+            if !matches!(self.color, Color::BLACK | Color::WHITE) {
+                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
+                // was on those cases
+                let hue = Hsv::from(self.color).hue;
+                color_picker_state.previous_hue_degrees = hue;
+                color_picker_state.current_hue_degrees = hue;
+            }
+        }
+
+        if !self.show_picker
+            && color_picker_state.current_hue_degrees != color_picker_state.previous_hue_degrees
+        {
+            color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
         }
 
         tree.diff_children(&[&self.underlay, &self.overlay_el]);
@@ -470,10 +483,11 @@ where
                         |value: u16, y: f32| ((i32::from(value) + y as i32).rem_euclid(360)) as u16;
 
                     if cursor.is_over(hue_bounds) {
+                        self.state.current_hue_degrees = move_value(hsv_color.hue, *y);
                         self.state.color = Color {
                             a: self.state.color.a,
                             ..Hsv {
-                                hue: move_value(hsv_color.hue, *y),
+                                hue: self.state.current_hue_degrees,
                                 ..hsv_color
                             }
                             .into()
@@ -530,20 +544,22 @@ where
                             .position_in(sat_value_bounds)
                             .map(calc_percentage_value)
                             .unwrap_or_default(),
-                        ..hsv_color
+                        hue: self.state.current_hue_degrees,
                     }
                     .into()
                 };
                 color_changed = true;
             }
             ColorBarDragged::Hue => {
+                self.state.current_hue_degrees = cursor
+                    .position_in(hue_bounds)
+                    .map(calc_hue)
+                    .unwrap_or_default();
+
                 self.state.color = Color {
                     a: self.state.color.a,
                     ..Hsv {
-                        hue: cursor
-                            .position_in(hue_bounds)
-                            .map(calc_hue)
-                            .unwrap_or_default(),
+                        hue: self.state.current_hue_degrees,
                         ..hsv_color
                     }
                     .into()
@@ -789,6 +805,12 @@ where
         }
 
         if color_changed {
+            if !matches!(self.state.color, Color::BLACK | Color::WHITE) {
+                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
+                // was on those cases
+                let hue = Hsv::from(self.state.color).hue;
+                self.state.current_hue_degrees = hue;
+            }
             shell.capture_event();
             shell.request_redraw();
         }
@@ -807,7 +829,7 @@ where
                 }
                 status = event::Status::Captured;
             } else {
-                let sat_value_handle = |key_code: &keyboard::Key, color: &mut Color| {
+                let sat_value_handle = |key_code: &keyboard::Key, color: &mut Color, hue: u16| {
                     let mut hsv_color: Hsv = (*color).into();
                     let mut status = event::Status::Ignored;
 
@@ -833,6 +855,7 @@ where
 
                     hsv_color.saturation = hsv_color.saturation.clamp(0.0, 1.0);
                     hsv_color.value = hsv_color.value.clamp(0.0, 1.0);
+                    hsv_color.hue = hue;
 
                     *color = Color {
                         a: color.a,
@@ -841,11 +864,11 @@ where
                     status
                 };
 
-                let hue_handle = |key_code: &keyboard::Key, color: &mut Color| {
+                let mut hue_handle = |key_code: &keyboard::Key, color: &mut Color| {
                     let mut hsv_color: Hsv = (*color).into();
                     let mut status = event::Status::Ignored;
 
-                    let mut value = i32::from(hsv_color.hue);
+                    let mut value = i32::from(self.state.current_hue_degrees);
 
                     match key_code {
                         keyboard::Key::Named(
@@ -864,6 +887,7 @@ where
                     }
 
                     hsv_color.hue = value.rem_euclid(360) as u16;
+                    self.state.current_hue_degrees = hsv_color.hue;
 
                     *color = Color {
                         a: color.a,
@@ -898,7 +922,13 @@ where
                 };
 
                 match self.state.focus {
-                    Focus::SatValue => status = sat_value_handle(key, &mut self.state.color),
+                    Focus::SatValue => {
+                        status = sat_value_handle(
+                            key,
+                            &mut self.state.color,
+                            self.state.current_hue_degrees,
+                        )
+                    }
                     Focus::Hue => status = hue_handle(key, &mut self.state.color),
                     Focus::Red => status = rgba_bar_handle(key, &mut self.state.color.r),
                     Focus::Green => status = rgba_bar_handle(key, &mut self.state.color.g),
@@ -1129,8 +1159,7 @@ where
         shell: &mut Shell<Message>,
     ) {
         if event::Status::Captured == self.on_event_keyboard(event) {
-            self.state.sat_value_canvas_cache.clear();
-            self.state.hue_canvas_cache.clear();
+            self.state.clear();
             shell.capture_event();
             shell.request_redraw();
             return;
@@ -1195,13 +1224,14 @@ where
         );
 
         if !fake_messages.is_empty() {
+            // Submit the selected color
             shell.publish((self.on_submit)(self.state.color));
+            self.state.previous_hue_degrees = self.state.current_hue_degrees;
         }
         // ----------- Block 2 end ------------------
 
         if shell.is_event_captured() {
-            self.state.sat_value_canvas_cache.clear();
-            self.state.hue_canvas_cache.clear();
+            self.state.clear();
         } else if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
@@ -1210,8 +1240,7 @@ where
             // Clicked outside of bounds so lets send the `on_cancel` message to close the picker
             shell.publish(self.on_cancel.clone());
             shell.capture_event();
-            self.state.sat_value_canvas_cache.clear();
-            self.state.hue_canvas_cache.clear();
+            self.state.clear();
         }
 
         if !matches!(
@@ -1789,7 +1818,11 @@ fn hsv_color<Message, Theme>(
                     frame.fill_rectangle(
                         Point::new(f32::from(column), f32::from(row)),
                         Size::new(1.0, 1.0),
-                        Color::from(Hsv::from_hsv(hsv_color.hue, saturation, value)),
+                        Color::from(Hsv::from_hsv(
+                            color_picker.state.current_hue_degrees,
+                            saturation,
+                            value,
+                        )),
                     );
                 }
             }
@@ -1896,7 +1929,8 @@ fn hsv_color<Message, Theme>(
                     ..Stroke::default()
                 };
 
-                let column = f32::from(hsv_color.hue) * frame.width() / 360.0;
+                let column =
+                    f32::from(color_picker.state.current_hue_degrees) * frame.width() / 360.0;
 
                 frame.stroke(
                     &Path::line(Point::new(column, 0.0), Point::new(column, frame.height())),
@@ -2225,6 +2259,10 @@ pub struct OverlayState {
     pub(crate) sat_value_canvas_cache: canvas::Cache,
     /// The cache of the hue canvas of the [`ColorPickerOverlay`].
     pub(crate) hue_canvas_cache: canvas::Cache,
+    /// The previous hue degrees of the [`ColorPickerOverlay`].
+    pub(crate) previous_hue_degrees: u16,
+    /// The current hue degrees of the [`ColorPickerOverlay`].
+    pub(crate) current_hue_degrees: u16,
     /// The dragged color bar of the [`ColorPickerOverlay`].
     pub(crate) color_bar_dragged: ColorBarDragged,
     /// the focus of the [`ColorPickerOverlay`].
@@ -2239,10 +2277,19 @@ impl OverlayState {
     /// Creates a new State with the given color.
     #[must_use]
     pub fn new(color: Color) -> Self {
+        let hue = Hsv::from(color).hue;
         Self {
             color,
+            previous_hue_degrees: hue,
+            current_hue_degrees: hue,
             ..Self::default()
         }
+    }
+
+    /// Clears the state cache
+    pub fn clear(&mut self) {
+        self.sat_value_canvas_cache.clear();
+        self.hue_canvas_cache.clear();
     }
 }
 
@@ -2252,6 +2299,8 @@ impl Default for OverlayState {
             color: Color::from_rgb(0.5, 0.25, 0.25),
             sat_value_canvas_cache: canvas::Cache::default(),
             hue_canvas_cache: canvas::Cache::default(),
+            previous_hue_degrees: 0,
+            current_hue_degrees: 0,
             color_bar_dragged: ColorBarDragged::None,
             focus: Focus::default(),
             keyboard_modifiers: keyboard::Modifiers::default(),
