@@ -622,13 +622,31 @@ where
                     a: self.state.color.a,
                     ..Hsv {
                         saturation: cursor
-                            .position_in(sat_value_bounds)
-                            .map(calc_percentage_sat)
-                            .unwrap_or_default(),
+                            .position()
+                            .map(|position| {
+                                calc_percentage_sat(Point {
+                                    x: (position.x - sat_value_bounds.x)
+                                        .max(0.0)
+                                        .min(sat_value_bounds.width),
+                                    y: (position.y - sat_value_bounds.y)
+                                        .max(0.0)
+                                        .min(sat_value_bounds.height),
+                                })
+                            })
+                            .unwrap_or(hsv_color.saturation),
                         value: cursor
-                            .position_in(sat_value_bounds)
-                            .map(calc_percentage_value)
-                            .unwrap_or_default(),
+                            .position()
+                            .map(|position| {
+                                calc_percentage_value(Point {
+                                    x: (position.x - sat_value_bounds.x)
+                                        .max(0.0)
+                                        .min(sat_value_bounds.width),
+                                    y: (position.y - sat_value_bounds.y)
+                                        .max(0.0)
+                                        .min(sat_value_bounds.height),
+                                })
+                            })
+                            .unwrap_or(hsv_color.value),
                         hue: self.state.current_hue_degrees,
                     }
                     .into()
@@ -637,9 +655,14 @@ where
             }
             ColorBarDragged::Hue => {
                 self.state.current_hue_degrees = cursor
-                    .position_in(hue_bounds)
-                    .map(calc_hue)
-                    .unwrap_or_default();
+                    .position()
+                    .map(|position| {
+                        calc_hue(Point {
+                            x: (position.x - hue_bounds.x).max(0.0).min(hue_bounds.width),
+                            y: (position.y - hue_bounds.y).max(0.0).min(hue_bounds.height),
+                        })
+                    })
+                    .unwrap_or(self.state.current_hue_degrees);
 
                 self.state.color = Color {
                     a: self.state.color.a,
@@ -802,22 +825,21 @@ where
             ColorBarDragged::Red => {
                 self.state.color = Color {
                     r: cursor
-                        .position_in(red_bar_bounds)
-                        .map(|position| calc_percentage(red_bar_bounds, position))
-                        .unwrap_or_else(|| {
-                            cursor
-                                .position()
-                                .map(|position| {
-                                    if position.x < red_bar_bounds.x {
-                                        0.0
-                                    } else if position.x > red_bar_bounds.x + red_bar_bounds.width {
-                                        1.0
-                                    } else {
-                                        self.state.color.r
-                                    }
-                                })
-                                .unwrap_or(self.state.color.r)
-                        }),
+                        .position()
+                        .map(|position| {
+                            calc_percentage(
+                                red_bar_bounds,
+                                Point {
+                                    x: (position.x - red_bar_bounds.x)
+                                        .max(0.0)
+                                        .min(red_bar_bounds.width),
+                                    y: (position.y - red_bar_bounds.y)
+                                        .max(0.0)
+                                        .min(red_bar_bounds.height),
+                                },
+                            )
+                        })
+                        .unwrap_or(self.state.color.r),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -825,24 +847,21 @@ where
             ColorBarDragged::Green => {
                 self.state.color = Color {
                     g: cursor
-                        .position_in(green_bar_bounds)
-                        .map(|position| calc_percentage(green_bar_bounds, position))
-                        .unwrap_or_else(|| {
-                            cursor
-                                .position()
-                                .map(|position| {
-                                    if position.x < green_bar_bounds.x {
-                                        0.0
-                                    } else if position.x
-                                        > green_bar_bounds.x + green_bar_bounds.width
-                                    {
-                                        1.0
-                                    } else {
-                                        self.state.color.g
-                                    }
-                                })
-                                .unwrap_or(self.state.color.g)
-                        }),
+                        .position()
+                        .map(|position| {
+                            calc_percentage(
+                                green_bar_bounds,
+                                Point {
+                                    x: (position.x - green_bar_bounds.x)
+                                        .max(0.0)
+                                        .min(green_bar_bounds.width),
+                                    y: (position.y - green_bar_bounds.y)
+                                        .max(0.0)
+                                        .min(green_bar_bounds.height),
+                                },
+                            )
+                        })
+                        .unwrap_or(self.state.color.g),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -850,23 +869,21 @@ where
             ColorBarDragged::Blue => {
                 self.state.color = Color {
                     b: cursor
-                        .position_in(blue_bar_bounds)
-                        .map(|position| calc_percentage(blue_bar_bounds, position))
-                        .unwrap_or_else(|| {
-                            cursor
-                                .position()
-                                .map(|position| {
-                                    if position.x < blue_bar_bounds.x {
-                                        0.0
-                                    } else if position.x > blue_bar_bounds.x + blue_bar_bounds.width
-                                    {
-                                        1.0
-                                    } else {
-                                        self.state.color.b
-                                    }
-                                })
-                                .unwrap_or(self.state.color.b)
-                        }),
+                        .position()
+                        .map(|position| {
+                            calc_percentage(
+                                blue_bar_bounds,
+                                Point {
+                                    x: (position.x - blue_bar_bounds.x)
+                                        .max(0.0)
+                                        .min(blue_bar_bounds.width),
+                                    y: (position.y - blue_bar_bounds.y)
+                                        .max(0.0)
+                                        .min(blue_bar_bounds.height),
+                                },
+                            )
+                        })
+                        .unwrap_or(self.state.color.b),
                     ..self.state.color
                 };
                 color_changed = true;
@@ -874,24 +891,21 @@ where
             ColorBarDragged::Alpha => {
                 self.state.color = Color {
                     a: cursor
-                        .position_in(alpha_bar_bounds)
-                        .map(|position| calc_percentage(alpha_bar_bounds, position))
-                        .unwrap_or_else(|| {
-                            cursor
-                                .position()
-                                .map(|position| {
-                                    if position.x < alpha_bar_bounds.x {
-                                        0.0
-                                    } else if position.x
-                                        > alpha_bar_bounds.x + alpha_bar_bounds.width
-                                    {
-                                        1.0
-                                    } else {
-                                        self.state.color.a
-                                    }
-                                })
-                                .unwrap_or(self.state.color.a)
-                        }),
+                        .position()
+                        .map(|position| {
+                            calc_percentage(
+                                alpha_bar_bounds,
+                                Point {
+                                    x: (position.x - alpha_bar_bounds.x)
+                                        .max(0.0)
+                                        .min(alpha_bar_bounds.width),
+                                    y: (position.y - alpha_bar_bounds.y)
+                                        .max(0.0)
+                                        .min(alpha_bar_bounds.height),
+                                },
+                            )
+                        })
+                        .unwrap_or(self.state.color.a),
                     ..self.state.color
                 };
                 color_changed = true;
