@@ -27,24 +27,23 @@ use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Pixels, Point,
     Rectangle, Renderer, Shadow, Size, Theme, Vector,
     advanced::{
-        Clipboard, Layout, Shell, Widget,
+        Clipboard, Layout, Overlay, Renderer as _, Shell, Text, Widget,
+        graphics::geometry::Renderer as _,
         layout::{Limits, Node},
         overlay, renderer,
+        text::Renderer as _,
         widget::tree::{self, Tag, Tree},
-    },
-    advanced::{
-        Overlay, Renderer as _, Text, graphics::geometry::Renderer as _, text::Renderer as _,
     },
     alignment::{Horizontal, Vertical},
     event, keyboard,
     mouse::{self, Cursor},
     touch,
-    widget::row,
     widget::{
-        Button, Column, Row,
+        Button, Column, Row, TextInput,
         canvas::{self, LineCap, Path, Stroke},
-        container, text,
+        container, row, text,
         text::Wrapping,
+        text_input,
     },
 };
 
@@ -75,7 +74,7 @@ use iced::{
 pub struct ColorPicker<'a, Message, Theme = iced::Theme>
 where
     Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog,
+    Theme: Catalog + iced::widget::button::Catalog + text_input::Catalog + Clone,
 {
     /// Show the picker.
     show_picker: bool,
@@ -95,6 +94,48 @@ where
     cancel_button: Element<'a, Message, Theme, Renderer>,
     /// The submit button of the [`ColorPickerOverlay`].
     submit_button: Element<'a, Message, Theme, Renderer>,
+    /// The hex input of the [`ColorPickerOverlay`].
+    hex_input: TextInput<'a, InternalMessage, InternalTheme<Theme>, Renderer>,
+}
+
+#[derive(Debug, Clone)]
+enum InternalMessage {
+    ChangeInput(String),
+}
+
+struct InternalTheme<Theme: text_input::Catalog + Clone> {
+    theme: Theme,
+    color: Color,
+}
+impl<Theme: text_input::Catalog + Clone> text_input::Catalog for InternalTheme<Theme> {
+    type Class<'a> = <Theme as text_input::Catalog>::Class<'a>;
+
+    fn default<'a>() -> Self::Class<'a> {
+        <Theme as text_input::Catalog>::default()
+    }
+
+    fn style(&self, class: &Self::Class<'_>, status: text_input::Status) -> text_input::Style {
+        let hsv = Hsv::from(self.color);
+        let default = <Theme as text_input::Catalog>::style(&self.theme, class, status);
+        text_input::Style {
+            background: self.color.into(),
+            value: Color {
+                a: 1.0,
+                ..Hsv {
+                    hue: 0,
+                    saturation: 0.0,
+                    value: if hsv.value < 0.5 { 1.0 } else { 0.0 },
+                }
+                .into()
+            },
+            border: Border {
+                color: default.border.color,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..default
+        }
+    }
 }
 
 impl<'a, Message, Theme> ColorPicker<'a, Message, Theme>
@@ -104,7 +145,9 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     /// Creates a new [`ColorPicker`] wrapping around the given underlay.
     ///
@@ -149,8 +192,12 @@ where
         .width(Length::Fill)
         .on_press(on_cancel.clone()) // Sending a fake message
         .into();
+        let hex_input = text_input(&color.as_hex_string(), &color.as_hex_string())
+            .on_input(InternalMessage::ChangeInput)
+            .padding(PADDING)
+            .align_x(iced::Alignment::Center);
 
-        let overlay_el = overlay_element(on_cancel.clone());
+        let overlay_el = overlay_element(color, on_cancel.clone());
 
         Self {
             show_picker,
@@ -162,6 +209,7 @@ where
             overlay_el,
             cancel_button,
             submit_button,
+            hex_input,
         }
     }
 
@@ -217,7 +265,9 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     fn tag(&self) -> Tag {
         Tag::of::<State>()
@@ -233,6 +283,7 @@ where
             Tree::new(&self.cancel_button),
             Tree::new(&self.submit_button),
             Tree::empty(),
+            Tree::new(&self.hex_input as &dyn Widget<_, _, _>),
         ];
         vec![Tree::new(&self.underlay), buttons_tree]
     }
@@ -366,6 +417,7 @@ where
                 &self.class,
                 &mut self.cancel_button,
                 &mut self.submit_button,
+                &mut self.hex_input,
             )
             .overlay()
         });
@@ -384,7 +436,9 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     fn from(color_picker: ColorPicker<'a, Message, Theme>) -> Self {
         Element::new(color_picker)
@@ -412,7 +466,7 @@ const RGBA_STEP: i16 = 1;
 pub struct ColorPickerOverlay<'a, 'b, Message, Theme>
 where
     Message: Clone + 'a,
-    Theme: Catalog + iced::widget::button::Catalog,
+    Theme: Catalog + iced::widget::button::Catalog + text_input::Catalog + Clone,
     'b: 'a,
 {
     /// The state of the [`ColorPickerOverlay`].
@@ -421,6 +475,8 @@ where
     cancel_button: &'a mut Element<'b, Message, Theme, Renderer>,
     /// The submit button of the [`ColorPickerOverlay`].
     submit_button: &'a mut Element<'b, Message, Theme, Renderer>,
+    /// The hex input of the [`ColorPickerOverlay`].
+    hex_input: &'a mut TextInput<'b, InternalMessage, InternalTheme<Theme>, Renderer>,
     /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed or
     /// when pressed outside its bounds.
     on_cancel: Message,
@@ -440,16 +496,18 @@ where
 impl<'a, 'b, Message, Theme> ColorPickerOverlay<'a, 'b, Message, Theme>
 where
     Message: 'a + Clone,
-    Theme: 'a
+    Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
     'b: 'a,
 {
     /// Creates a new [`ColorPickerOverlay`] on the given position.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(self) fn new(
         state: &'a mut OverlayState,
         tree: &'a mut Tree,
         on_cancel: Message,
@@ -459,11 +517,13 @@ where
         class: &'a <Theme as Catalog>::Class<'b>,
         cancel_button: &'a mut Element<'b, Message, Theme>,
         submit_button: &'a mut Element<'b, Message, Theme>,
+        hex_input: &'a mut TextInput<'b, InternalMessage, InternalTheme<Theme>>,
     ) -> Self {
         ColorPickerOverlay {
             state,
             cancel_button,
             submit_button,
+            hex_input,
             on_cancel,
             on_submit,
             position,
@@ -606,6 +666,7 @@ where
         &mut self,
         event: &Event,
         layout: Layout<'_>,
+        hex_input_layout: Layout<'_>,
         cursor: Cursor,
         shell: &mut Shell<Message>,
     ) {
@@ -650,6 +711,12 @@ where
         let alpha_bar_bounds = alpha_row_children
             .next()
             .expect("widget: Layout should have an alpha bar layout")
+            .bounds();
+
+        let hex_input_bounds = hex_input_layout
+            .children()
+            .next()
+            .expect("widget: Layout should have an hex input layout")
             .bounds();
 
         match event {
@@ -706,6 +773,9 @@ where
                 if cursor.is_over(alpha_bar_bounds) {
                     self.state.color_bar_dragged = ColorBarDragged::Alpha;
                     self.state.focus = Focus::Alpha;
+                }
+                if cursor.is_over(hex_input_bounds) {
+                    self.state.focus = Focus::None;
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
@@ -1092,11 +1162,13 @@ impl<'a, 'b, Message, Theme> Overlay<Message, Theme, Renderer>
     for ColorPickerOverlay<'a, 'b, Message, Theme>
 where
     Message: 'a + Clone,
-    Theme: 'a
+    Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
     'b: 'a,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
@@ -1214,19 +1286,55 @@ where
             .expect("widget: Layout should have a 2. block layout")
             .children();
 
-        // ----------- RGB Color -----------------------
         let rgba_color_layout = block2_children
             .next()
             .expect("widget: Layout should have a RGBA color layout");
-        self.update_rgba_color(event, rgba_color_layout, cursor, shell);
+        let hex_input_layout = block2_children
+            .next()
+            .expect("widget: Layout should have a hex text layout");
+        // ----------- RGB Color -----------------------
+        self.update_rgba_color(event, rgba_color_layout, hex_input_layout, cursor, shell);
 
         let mut fake_messages: Vec<Message> = Vec::new();
 
-        // ----------- Text input ----------------------
-        let _text_input_layout = block2_children
-            .next()
-            .expect("widget: Layout should have a hex text layout");
+        // ----------- Hex input ----------------------
+        let mut fake_input_messages: Vec<InternalMessage> = Vec::new();
+        let mut fake_input_shell = Shell::new(&mut fake_input_messages);
+        let mut should_update_input = true;
+        self.hex_input.update(
+            &mut self.tree.children[3],
+            event,
+            hex_input_layout,
+            cursor,
+            renderer,
+            clipboard,
+            &mut fake_input_shell,
+            &layout.bounds(),
+        );
 
+        match fake_input_shell.redraw_request() {
+            iced::window::RedrawRequest::NextFrame => shell.request_redraw(),
+            iced::window::RedrawRequest::At(instant) => shell.request_redraw_at(instant),
+            iced::window::RedrawRequest::Wait => {}
+        }
+        if !fake_input_messages.is_empty() {
+            // Update the selected color if string can be parsed
+            let InternalMessage::ChangeInput(color_str) = &fake_input_messages[0];
+
+            if let Some(color) = iced::Color::parse(color_str) {
+                self.state.color = color;
+                if !matches!(self.state.color, Color::BLACK | Color::WHITE) {
+                    // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
+                    // was on those cases
+                    let hue = Hsv::from(self.state.color).hue;
+                    self.state.current_hue_degrees = hue;
+                }
+            } else {
+                should_update_input = false;
+            }
+            shell.capture_event();
+            shell.request_redraw();
+        }
         // ----------- Buttons -------------------------
         let cancel_button_layout = block2_children
             .next()
@@ -1265,6 +1373,17 @@ where
         // ----------- Block 2 end ------------------
 
         if shell.is_event_captured() {
+            if should_update_input {
+                let new_hex_input: TextInput<InternalMessage, InternalTheme<Theme>> = text_input(
+                    &self.state.color.as_hex_string(),
+                    &self.state.color.as_hex_string(),
+                )
+                .on_input(InternalMessage::ChangeInput)
+                .padding(PADDING)
+                .align_x(iced::Alignment::Center);
+                self.tree.children[3].diff(&new_hex_input as &dyn Widget<_, _, _>);
+                *self.hex_input = new_hex_input;
+            }
             self.state.clear();
         } else if matches!(
             event,
@@ -1375,6 +1494,7 @@ where
 }
 
 pub fn overlay_element<'a, Message, Theme>(
+    color: Color,
     on_cancel: Message,
 ) -> Element<'a, Message, Theme, Renderer>
 where
@@ -1383,7 +1503,8 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog,
 {
     // RGBA Colors
     let mut rgba_colors: Column<'_, Message, Theme, Renderer> =
@@ -1414,9 +1535,9 @@ where
         );
     }
 
-    let hex_text_layout = Row::<Message, Theme, Renderer>::new()
-        .width(Length::Fill)
-        .height(Length::Fixed(16.0 + PADDING.vertical()));
+    let hex_input = text_input("0x00000000", "0x00000000")
+        .padding(PADDING)
+        .align_x(Alignment::Center);
 
     let cancel_button = Button::new(
         text("X")
@@ -1439,7 +1560,7 @@ where
     let block2 = Column::new()
         .spacing(PADDING.vertical() / 2.) // Average vertical padding
         .push(rgba_colors)
-        .push(hex_text_layout)
+        .push(hex_input)
         .push(
             Row::new()
                 .spacing(PADDING.vertical() / 2.)
@@ -1491,9 +1612,12 @@ where
             .width(Length::Fill),
     )
     .width(Length::Fill)
-    .on_press(on_cancel); // Sending a fake message
+    .on_press(on_cancel.clone()); // Sending a fake message
+    let hex_input = text_input(&color.as_hex_string(), &color.as_hex_string())
+        .on_input(move |_| on_cancel.clone())
+        .padding(PADDING);
 
-    row![cancel_button, submit_button, element].into()
+    row![cancel_button, submit_button, element, hex_input].into()
 }
 
 /// Defines the layout of the 1. block of the color picker containing the HSV part.
@@ -1504,7 +1628,12 @@ fn block1_layout<'a, Message, Theme>(
 ) -> Node
 where
     Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: 'a
+        + Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     let block1_limits = Limits::new(Size::ZERO, bounds.size())
         .width(Length::Fill)
@@ -1535,7 +1664,12 @@ fn block2_layout<'a, Message, Theme>(
 ) -> Node
 where
     Message: 'a + Clone,
-    Theme: 'a + Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: 'a
+        + Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     let block2_limits = Limits::new(Size::ZERO, bounds.size())
         .width(Length::Fill)
@@ -1551,16 +1685,11 @@ where
 
     let hex_text_limits = block2_limits;
 
-    let mut hex_text_layout = Row::<Message, Theme, Renderer>::new()
-        .width(Length::Fill)
-        .height(Length::Fixed(
-            renderer.default_size().0 + PADDING.vertical(),
-        ))
-        .layout(
-            &mut color_picker.tree.children[2],
-            renderer,
-            &hex_text_limits,
-        );
+    let mut hex_text_layout = (color_picker.hex_input as &mut dyn Widget<_, _, _>).layout(
+        &mut color_picker.tree.children[3],
+        renderer,
+        &hex_text_limits,
+    );
 
     let block2_limits = block2_limits.shrink(Size::new(
         0.0,
@@ -1679,7 +1808,11 @@ fn block1<Message, Theme>(
     style_sheet: &HashMap<StyleState, Style>,
 ) where
     Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     // ----------- Block 1 ----------------------
     let hsv_color_layout = layout;
@@ -1710,7 +1843,11 @@ fn block2<Message, Theme>(
     style_sheet: &HashMap<StyleState, Style>,
 ) where
     Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     // ----------- Block 2 ----------------------
     let mut block2_children = layout.children();
@@ -1733,14 +1870,18 @@ fn block2<Message, Theme>(
     let hex_text_layout = block2_children
         .next()
         .expect("Graphics: Layout should have a hex text layout");
-    hex_text(
+    let hex_input_theme = InternalTheme {
+        theme: theme.clone(),
+        color: color_picker.state.color,
+    };
+    (color_picker.hex_input as &dyn Widget<_, _, _>).draw(
+        &color_picker.tree.children[3],
         renderer,
-        hex_text_layout,
-        &color_picker.state.color,
-        cursor,
+        &hex_input_theme,
         style,
-        style_sheet,
-        color_picker.state.focus,
+        hex_text_layout,
+        cursor,
+        viewport,
     );
 
     // ----------- Buttons -------------------------
@@ -1821,7 +1962,11 @@ fn hsv_color<Message, Theme>(
     style_sheet: &HashMap<StyleState, Style>,
 ) where
     Message: Clone,
-    Theme: Catalog + iced::widget::button::Catalog + iced::widget::text::Catalog,
+    Theme: Catalog
+        + iced::widget::button::Catalog
+        + iced::widget::text::Catalog
+        + text_input::Catalog
+        + Clone,
 {
     let mut hsv_color_children = layout.children();
     let hsv_color: Hsv = color_picker.state.color.into();
@@ -2221,66 +2366,6 @@ fn rgba_color(
         color.a,
         cursor,
         Focus::Alpha,
-    );
-}
-
-/// Draws the hex text representation of the color.
-fn hex_text(
-    renderer: &mut Renderer,
-    layout: Layout<'_>,
-    color: &Color,
-    cursor: Cursor,
-    _style: &renderer::Style,
-    style_sheet: &HashMap<StyleState, Style>,
-    _focus: Focus,
-) {
-    let hsv: Hsv = (*color).into();
-
-    let hex_text_style_state = if cursor.is_over(layout.bounds()) {
-        StyleState::Hovered
-    } else {
-        StyleState::Active
-    };
-
-    let bounds = layout.bounds();
-    if (bounds.width > 0.) && (bounds.height > 0.) {
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: Border {
-                    radius: style_sheet[&hex_text_style_state].bar_border_radius.into(),
-                    width: style_sheet[&hex_text_style_state].bar_border_width,
-                    color: style_sheet[&hex_text_style_state].bar_border_color,
-                },
-                shadow: Shadow::default(),
-            },
-            *color,
-        );
-    }
-
-    renderer.fill_text(
-        Text {
-            content: color.as_hex_string(),
-            bounds: Size::new(bounds.width, bounds.height),
-            size: renderer.default_size(),
-            font: renderer.default_font(),
-            align_x: Horizontal::Center.into(),
-            align_y: Vertical::Center,
-            line_height: text::LineHeight::Relative(1.3),
-            shaping: text::Shaping::Basic,
-            wrapping: Wrapping::default(),
-        },
-        Point::new(bounds.center_x(), bounds.center_y()),
-        Color {
-            a: 1.0,
-            ..Hsv {
-                hue: 0,
-                saturation: 0.0,
-                value: if hsv.value < 0.5 { 1.0 } else { 0.0 },
-            }
-            .into()
-        },
-        bounds,
     );
 }
 
@@ -2700,7 +2785,9 @@ where
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
-        + container::Catalog,
+        + container::Catalog
+        + text_input::Catalog
+        + Clone,
     F: 'a + Fn(Color) -> Message + Clone,
 {
     ColorPicker::new(show_picker, color, underlay, on_cancel, on_submit)
