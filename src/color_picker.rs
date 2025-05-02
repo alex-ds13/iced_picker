@@ -1354,11 +1354,16 @@ where
             &layout.bounds(),
         );
 
+        // Reconcile redraws and captures
         match fake_input_shell.redraw_request() {
             iced::window::RedrawRequest::NextFrame => shell.request_redraw(),
             iced::window::RedrawRequest::At(instant) => shell.request_redraw_at(instant),
             iced::window::RedrawRequest::Wait => {}
         }
+        if fake_input_shell.event_status() == event::Status::Captured {
+            shell.capture_event();
+        }
+
         if !fake_input_messages.is_empty() {
             // Update the selected color if string can be parsed
             let InternalMessage::ChangeInput(color_str) = &fake_input_messages[0];
@@ -1415,10 +1420,23 @@ where
             &layout.bounds(),
         );
 
+        // Reconcile redraws and captures
+        match fake_submit_shell.redraw_request() {
+            iced::window::RedrawRequest::NextFrame => shell.request_redraw(),
+            iced::window::RedrawRequest::At(instant) => shell.request_redraw_at(instant),
+            iced::window::RedrawRequest::Wait => {}
+        }
+        if fake_submit_shell.event_status() == event::Status::Captured {
+            shell.capture_event();
+        }
+
         if !fake_messages.is_empty() {
             // Submit the selected color
             shell.publish((self.on_submit)(self.state.color));
             self.state.previous_hue_degrees = self.state.current_hue_degrees;
+
+            shell.capture_event();
+            shell.request_redraw();
         }
         // ----------- Block 2 end ------------------
 
@@ -1440,6 +1458,8 @@ where
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 | Event::Touch(touch::Event::FingerLifted { .. })
                 | Event::Touch(touch::Event::FingerLost { .. })
+                | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerPressed { .. })
         ) && !cursor.is_over(layout.bounds())
         {
             // Clicked outside of bounds so lets send the `on_cancel` message to close the picker
