@@ -1760,7 +1760,7 @@ where
                 .padding(PADDING)
                 .height(Length::Fill)
                 .push(
-                    text("X:")
+                    text("X: ")
                         .align_x(Horizontal::Center)
                         .align_y(Vertical::Center),
                 )
