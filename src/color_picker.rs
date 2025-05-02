@@ -1076,6 +1076,20 @@ where
 
         let mouse_interaction = mouse::Interaction::default();
 
+        if !matches!(self.state.color_bar_dragged, ColorBarDragged::None) {
+            // If a bar is being dragged keep the mouse interaction the same as the one from the
+            // dragged bar
+            self.state.mouse_interaction = match self.state.color_bar_dragged {
+                ColorBarDragged::None => mouse::Interaction::default(),
+                ColorBarDragged::SatValue | ColorBarDragged::Hue => mouse::Interaction::Pointer,
+                ColorBarDragged::Red
+                | ColorBarDragged::Green
+                | ColorBarDragged::Blue
+                | ColorBarDragged::Alpha => mouse::Interaction::ResizingHorizontally,
+            };
+            return;
+        }
+
         // Block 1
         let block1_layout = children
             .next()
@@ -1139,7 +1153,16 @@ where
             .expect("Graphics: Layout should have an alpha row layout");
         block2_mouse_interaction = block2_mouse_interaction.max(f(alpha_row_layout, cursor));
 
-        let _hex_text_layout = block2_children.next();
+        let hex_input_layout = block2_children
+            .next()
+            .expect("Graphics: Layout should have an hex input layout for a ColorPicker");
+        let hex_input_interaction = self.hex_input.mouse_interaction(
+            &self.tree.children[3],
+            hex_input_layout,
+            cursor,
+            viewport,
+            renderer,
+        );
 
         // Buttons
         let cancel_button_layout = block2_children
@@ -1167,6 +1190,7 @@ where
         self.state.mouse_interaction = mouse_interaction
             .max(block1_mouse_interaction)
             .max(block2_mouse_interaction)
+            .max(hex_input_interaction)
             .max(cancel_mouse_interaction)
             .max(submit_mouse_interaction);
     }
@@ -1309,11 +1333,15 @@ where
         // ----------- RGB Color -----------------------
         self.update_rgba_color(event, rgba_color_layout, hex_input_layout, cursor, shell);
 
-        let mut fake_messages: Vec<Message> = Vec::new();
-
         // ----------- Hex input ----------------------
         let mut fake_input_messages: Vec<InternalMessage> = Vec::new();
         let mut fake_input_shell = Shell::new(&mut fake_input_messages);
+
+        // if event was already captured, mark this fake shell with a captured_event as well
+        if shell.event_status() == event::Status::Captured {
+            fake_input_shell.capture_event();
+        }
+
         let mut should_update_input = true;
         self.hex_input.update(
             &mut self.tree.children[3],
@@ -1365,6 +1393,14 @@ where
             &layout.bounds(),
         );
 
+        let mut fake_messages: Vec<Message> = Vec::new();
+        let mut fake_submit_shell = Shell::new(&mut fake_messages);
+
+        // if event was already captured, mark this fake shell with a captured_event as well
+        if shell.event_status() == event::Status::Captured {
+            fake_submit_shell.capture_event();
+        }
+
         let submit_button_layout = block2_children
             .next()
             .expect("widget: Layout should have a submit button layout for a ColorPicker");
@@ -1375,7 +1411,7 @@ where
             cursor,
             renderer,
             clipboard,
-            &mut Shell::new(&mut fake_messages),
+            &mut fake_submit_shell,
             &layout.bounds(),
         );
 
@@ -1402,6 +1438,8 @@ where
         } else if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerLifted { .. })
+                | Event::Touch(touch::Event::FingerLost { .. })
         ) && !cursor.is_over(layout.bounds())
         {
             // Clicked outside of bounds so lets send the `on_cancel` message to close the picker
