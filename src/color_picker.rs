@@ -413,6 +413,7 @@ where
                 self.on_cancel.clone(),
                 &self.on_submit,
                 position,
+                *viewport,
                 underlay_height,
                 &self.class,
                 &mut self.cancel_button,
@@ -485,6 +486,8 @@ where
     on_submit: &'a dyn Fn(Color) -> Message,
     /// The position of the [`ColorPickerOverlay`].
     position: Point,
+    /// The viewport of the [`ColorPickerOverlay`].
+    viewport: Rectangle,
     /// The height of the underlay.
     underlay_height: f32,
     /// The style of the [`ColorPickerOverlay`].
@@ -513,6 +516,7 @@ where
         on_cancel: Message,
         on_submit: &'a dyn Fn(Color) -> Message,
         position: Point,
+        viewport: Rectangle,
         underlay_height: f32,
         class: &'a <Theme as Catalog>::Class<'b>,
         cancel_button: &'a mut Element<'b, Message, Theme>,
@@ -527,6 +531,7 @@ where
             on_cancel,
             on_submit,
             position,
+            viewport,
             underlay_height,
             class,
             tree,
@@ -1066,20 +1071,24 @@ where
     }
 
     fn update_mouse(
-        &mut self,
+        &self,
         layout: Layout<'_>,
         cursor: Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
-    ) {
+    ) -> mouse::Interaction {
         let mut children = layout.children();
 
-        let mouse_interaction = mouse::Interaction::default();
+        let mouse_interaction = if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Idle
+        } else {
+            mouse::Interaction::None
+        };
 
         if !matches!(self.state.color_bar_dragged, ColorBarDragged::None) {
             // If a bar is being dragged keep the mouse interaction the same as the one from the
             // dragged bar
-            self.state.mouse_interaction = match self.state.color_bar_dragged {
+            return match self.state.color_bar_dragged {
                 ColorBarDragged::None => mouse::Interaction::default(),
                 ColorBarDragged::SatValue | ColorBarDragged::Hue => mouse::Interaction::Pointer,
                 ColorBarDragged::Red
@@ -1087,7 +1096,6 @@ where
                 | ColorBarDragged::Blue
                 | ColorBarDragged::Alpha => mouse::Interaction::ResizingHorizontally,
             };
-            return;
         }
 
         // Block 1
@@ -1168,7 +1176,7 @@ where
         let cancel_button_layout = block2_children
             .next()
             .expect("Graphics: Layout should have a cancel button layout for a ColorPicker");
-        let cancel_mouse_interaction = self.cancel_button.as_widget_mut().mouse_interaction(
+        let cancel_mouse_interaction = self.cancel_button.as_widget().mouse_interaction(
             &self.tree.children[0],
             cancel_button_layout,
             cursor,
@@ -1179,7 +1187,7 @@ where
         let submit_button_layout = block2_children
             .next()
             .expect("Graphics: Layout should have a submit button layout for a ColorPicker");
-        let submit_mouse_interaction = self.submit_button.as_widget_mut().mouse_interaction(
+        let submit_mouse_interaction = self.submit_button.as_widget().mouse_interaction(
             &self.tree.children[1],
             submit_button_layout,
             cursor,
@@ -1187,12 +1195,12 @@ where
             renderer,
         );
 
-        self.state.mouse_interaction = mouse_interaction
+        mouse_interaction
             .max(block1_mouse_interaction)
             .max(block2_mouse_interaction)
             .max(hex_input_interaction)
             .max(cancel_mouse_interaction)
-            .max(submit_mouse_interaction);
+            .max(submit_mouse_interaction)
     }
 }
 
@@ -1467,27 +1475,15 @@ where
             shell.capture_event();
             self.state.clear();
         }
-
-        if !matches!(
-            event,
-            Event::Window(iced::window::Event::RedrawRequested(_))
-        ) {
-            let previous_interaction = self.state.mouse_interaction;
-            self.update_mouse(layout, cursor, &Rectangle::default(), renderer);
-            if previous_interaction != self.state.mouse_interaction {
-                shell.request_redraw();
-            }
-        }
     }
 
     fn mouse_interaction(
         &self,
-        _layout: Layout<'_>,
-        _cursor: Cursor,
-        _viewport: &Rectangle,
-        _renderer: &Renderer,
+        layout: Layout<'_>,
+        cursor: Cursor,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.state.mouse_interaction
+        self.update_mouse(layout, cursor, &self.viewport, renderer)
     }
 
     fn draw(
@@ -2460,8 +2456,6 @@ pub struct OverlayState {
     pub(crate) focus: Focus,
     /// The previously pressed keyboard modifiers.
     pub(crate) keyboard_modifiers: keyboard::Modifiers,
-    /// The current mouse interaction
-    pub(crate) mouse_interaction: mouse::Interaction,
 }
 
 impl OverlayState {
@@ -2495,7 +2489,6 @@ impl Default for OverlayState {
             color_bar_dragged: ColorBarDragged::None,
             focus: Focus::default(),
             keyboard_modifiers: keyboard::Modifiers::default(),
-            mouse_interaction: mouse::Interaction::default(),
         }
     }
 }

@@ -1,15 +1,9 @@
 use iced::{
-    Element, Point, Renderer, Size, Theme,
     advanced::{
-        self, Layout, Renderer as _, Widget,
-        layout::{Limits, Node},
-        mouse, overlay, renderer,
-        widget::{
-            Tree,
-            tree::{self, Tag},
-        },
-    },
-    widget::{button, column, row, text},
+        self, layout::{Limits, Node}, mouse, overlay, renderer, widget::{
+            tree::{self, Tag}, Tree
+        }, Layout, Renderer as _, Widget
+    }, widget::{button, column, row, text}, Element, Point, Rectangle, Renderer, Size, Theme
 };
 
 // use crate::Message;
@@ -175,6 +169,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for Bar<'a, Messa
                     state,
                     &mut self.overlay_el,
                     position,
+                    *_viewport,
                     self.on_cancel.clone(),
                 )
                 .overlay(),
@@ -203,6 +198,7 @@ pub struct Overlay<'a, 'b, Message, Theme> {
     pub element: &'b mut Element<'a, Message, Theme>,
     pub state: &'b mut Tree,
     pub position: Point,
+    pub viewport: Rectangle,
 }
 
 impl<'a, 'b, Message: Clone + 'a> Overlay<'a, 'b, Message, Theme> {
@@ -210,6 +206,7 @@ impl<'a, 'b, Message: Clone + 'a> Overlay<'a, 'b, Message, Theme> {
         state: &'b mut Tree,
         element: &'b mut Element<'a, Message>,
         position: Point,
+        viewport: Rectangle,
         _on_cancel: Message,
     ) -> Self {
         // let element = column![
@@ -230,6 +227,7 @@ impl<'a, 'b, Message: Clone + 'a> Overlay<'a, 'b, Message, Theme> {
             element,
             state,
             position,
+            viewport,
         }
     }
 
@@ -296,11 +294,10 @@ where
         &self,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        viewport: &iced::Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
         self.element
             .as_widget()
-            .mouse_interaction(self.state, layout, cursor, viewport, renderer)
+            .mouse_interaction(self.state, layout, cursor, &self.viewport, renderer)
     }
 }
