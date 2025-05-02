@@ -1,3 +1,26 @@
+// This is a reworked version of the iced_aw's ColorPicker ported to iced version
+// 0.14+ and with some changes/fixes that I wanted myself.
+//
+// Copyright (c) 2020 Kaiden42
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 use std::collections::HashMap;
 
 use iced::{
@@ -2473,7 +2496,7 @@ impl Catalog for Theme {
     }
 }
 
-/// The primary theme of a [`Badge`](crate::widget::badge::Badge).
+/// The primary theme of a [`ColorPicker`](crate::widget::color_picker::ColorPicker).
 #[must_use]
 pub fn primary(theme: &Theme, status: Status) -> Style {
     let palette = theme.extended_palette();
