@@ -103,7 +103,16 @@ impl ColorPickerExample {
         );
 
         // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
-        let space = container("").height(300).style(container::dark);
+        let base = container(iced::widget::row![
+            Button::new("Press Me1!").on_press(Message::CancelColor),
+            iced::widget::horizontal_space(),
+            Button::new("Press Me2!").on_press(Message::CancelColor),
+            iced::widget::horizontal_space(),
+            Button::new("Press Me3!").on_press(Message::CancelColor),
+        ])
+        .center_x(iced::Fill)
+        .center_y(300)
+        .style(container::dark);
 
         let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
         let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
@@ -113,7 +122,7 @@ impl ColorPickerExample {
             .push(picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, picker2, bar, space, row].spacing(20);
+        let col = column![theme_picker, picker2, bar, base, row].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
