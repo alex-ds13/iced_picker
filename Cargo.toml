@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "canvas", "debug", "lazy", "smol"], rev = "301aac794b9de4f021d402a6aba45e8677ed4716" }
+# iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "canvas", "debug", "lazy", "smol"], rev = "301aac794b9de4f021d402a6aba45e8677ed4716" }
+iced = { path = "../iced/", features = ["advanced", "canvas", "debug", "lazy", "smol"] }
 smol = "2.0.2"

@@ -1,13 +1,15 @@
 mod color;
 mod color_picker;
 mod custom_widget;
+mod hovered;
 mod test_overlay;
 
 use color_picker::color_picker;
+use hovered::hovered;
 
 use iced::{
     Alignment, Color, Element, Length, Theme,
-    widget::{Button, Container, Row, Text, column, container, pick_list},
+    widget::{Button, Container, Row, Text, column, container, pick_list, row},
 };
 
 fn main() -> iced::Result {
@@ -122,7 +124,12 @@ impl ColorPickerExample {
             .push(picker)
             .push(Text::new(format!("Color: {:?}", self.color)));
 
-        let col = column![theme_picker, picker2, bar, base, row].spacing(20);
+        let hovered_example = hovered(|is_hovered| {
+            println!("is_hovered: {}", is_hovered);
+            container(row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10))
+                .style(container::dark)
+        });
+        let col = column![theme_picker, picker2, bar, base, row, hovered_example].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
