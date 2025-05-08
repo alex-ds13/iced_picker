@@ -169,7 +169,7 @@ where
     ) -> Self
     where
         U: Into<Element<'a, Message, Theme, Renderer>>,
-        F: 'a + Fn(Color) -> Message + Clone,
+        F: Fn(Color) -> Message + 'a,
     {
         let cancel_button = Button::new(
             text("X")
@@ -404,7 +404,7 @@ where
             let picker_state: &mut State = state.state.downcast_mut::<State>();
 
             let bounds = layout.bounds();
-            let position = bounds.position();
+            let position = bounds.position() + translation;
             let underlay_height = bounds.height;
 
             ColorPickerOverlay::new(
@@ -1220,6 +1220,7 @@ where
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
         let space_below = bounds.height - (self.position.y + self.underlay_height + OFFSET);
         let space_above = self.position.y - OFFSET;
+        let screen_bounds = bounds;
 
         let mut show_below = false;
         let bounds = Size::new(
@@ -1297,7 +1298,7 @@ where
         let mut node =
             Node::with_children(Size::new(width, height), vec![block1_node, block2_node]);
 
-        node.center_and_bounce(position, bounds);
+        node.position_and_bounce(position, screen_bounds, show_below);
         node
     }
 
@@ -2806,13 +2807,15 @@ impl From<Hsv> for Color {
 
 /// Trait containing functions for positioning of nodes.
 pub trait Position {
-    /// Centers this node around the given position. If the node is over the
+    /// Position this node on the given position. If the node is over the
     /// specified bounds it's bouncing back to be fully visible on screen.
-    fn center_and_bounce(&mut self, position: Point, bounds: Size);
+    /// The `top` specifies if the position should be considered the top left
+    /// corner of the node or the bottom left corner.
+    fn position_and_bounce(&mut self, position: Point, bounds: Size, top: bool);
 }
 
 impl Position for Node {
-    fn center_and_bounce(&mut self, position: Point, bounds: Size) {
+    fn position_and_bounce(&mut self, position: Point, bounds: Size, top: bool) {
         self.move_to_mut(Point::new(position.x.max(0.0), position.y.max(0.0)));
 
         let new_self_bounds = self.bounds();
@@ -2824,11 +2827,15 @@ impl Position for Node {
             } else {
                 new_self_bounds.x
             },
-            if new_self_bounds.y + new_self_bounds.height > bounds.height {
+            if top && (new_self_bounds.y + new_self_bounds.height > bounds.height) {
                 (new_self_bounds.y - (new_self_bounds.height - (bounds.height - new_self_bounds.y)))
                     .max(0.0)
-            } else {
+            } else if !top && (new_self_bounds.y - new_self_bounds.height < 0.0) {
+                (new_self_bounds.y + (new_self_bounds.height - new_self_bounds.y)).max(0.0)
+            } else if top {
                 new_self_bounds.y
+            } else {
+                new_self_bounds.y - new_self_bounds.height
             },
         ));
     }
@@ -2853,7 +2860,7 @@ where
         + container::Catalog
         + text_input::Catalog
         + Clone,
-    F: 'a + Fn(Color) -> Message + Clone,
+    F: 'a + Fn(Color) -> Message,
 {
     ColorPicker::new(show_picker, color, underlay, on_cancel, on_submit)
 }
