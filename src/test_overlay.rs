@@ -80,13 +80,13 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for Bar<'a, Messa
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &advanced::layout::Limits,
     ) -> advanced::layout::Node {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
 
@@ -243,7 +243,7 @@ where
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> Node {
         let limits = Limits::new(Size::ZERO, bounds);
         self.element
-            .as_widget()
+            .as_widget_mut()
             .layout(self.state, renderer, &limits)
             .move_to(self.position)
     }

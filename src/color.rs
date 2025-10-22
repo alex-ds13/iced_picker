@@ -672,7 +672,7 @@ where
         Size::new(Length::Fixed(600.0), Length::Fixed(300.0))
     }
 
-    fn layout(&self, tree: &mut Tree, renderer: &Renderer, limits: &Limits) -> Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &Limits) -> Node {
         let state = tree.state.downcast_mut::<OverlayState>();
         let bounds = limits.max();
         let (max_width, max_height) = if bounds.width > bounds.height {
@@ -919,6 +919,7 @@ where
                         color: style_sheet[&style_state].border_color,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 style_sheet[&style_state].background,
             );
@@ -973,7 +974,7 @@ fn block1_layout(state: &mut OverlayState, renderer: &Renderer, bounds: Rectangl
 
 /// Defines the layout of the 2. block of the color picker containing the RGBA part, Hex and buttons.
 fn block2_layout<'a, Message, Theme>(
-    color_picker: &ColorPicker<'a, Message, Theme>,
+    color_picker: &mut ColorPicker<'a, Message, Theme>,
     state: &mut OverlayState,
     renderer: &Renderer,
     bounds: Rectangle,
@@ -1035,7 +1036,7 @@ where
                 ),
         );
     }
-    let element: Element<Message, Theme, Renderer> = Element::new(rgba_colors);
+    let mut element: Element<Message, Theme, Renderer> = Element::new(rgba_colors);
     let rgba_tree = if let Some(child_tree) = state.tree[2].children.get_mut(0) {
         child_tree.diff(element.as_widget());
         child_tree
@@ -1046,7 +1047,7 @@ where
     };
 
     let mut rgba_colors = element
-        .as_widget()
+        .as_widget_mut()
         .layout(rgba_tree, renderer, &block2_limits);
 
     let rgba_bounds = rgba_colors.bounds();
@@ -1226,6 +1227,7 @@ fn block2<'a, Message, Theme>(
                         color: style_sheet[&StyleState::Focused].border_color,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 Color::TRANSPARENT,
             );
@@ -1244,6 +1246,7 @@ fn block2<'a, Message, Theme>(
                         color: style_sheet[&StyleState::Focused].border_color,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 Color::TRANSPARENT,
             );
@@ -1518,6 +1521,7 @@ fn rgba_color(
                         color: Color::TRANSPARENT,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 color,
             );
@@ -1544,6 +1548,7 @@ fn rgba_color(
                             .bar_border_color,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 Color::TRANSPARENT,
             );
@@ -1591,6 +1596,7 @@ fn rgba_color(
                             .border_color,
                     },
                     shadow: Shadow::default(),
+                    snap: true,
                 },
                 Color::TRANSPARENT,
             );
@@ -1687,6 +1693,7 @@ fn hex_text(
                     color: style_sheet[&hex_text_style_state].bar_border_color,
                 },
                 shadow: Shadow::default(),
+                snap: true,
             },
             *color,
         );

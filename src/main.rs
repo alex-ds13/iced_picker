@@ -107,9 +107,9 @@ impl ColorPickerExample {
         // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
         let base = container(iced::widget::row![
             Button::new("Press Me1!").on_press(Message::CancelColor),
-            iced::widget::horizontal_space(),
+            iced::widget::space::horizontal(),
             Button::new("Press Me2!").on_press(Message::CancelColor),
-            iced::widget::horizontal_space(),
+            iced::widget::space::horizontal(),
             Button::new("Press Me3!").on_press(Message::CancelColor),
         ])
         .center_x(iced::Fill)
@@ -127,7 +127,13 @@ impl ColorPickerExample {
         let hovered_example = hovered(|is_hovered| {
             println!("is_hovered: {}", is_hovered);
             container(row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10))
-                .style(container::dark)
+                .style(move |t| {
+                    if is_hovered {
+                        container::dark(t)
+                    } else {
+                        container::rounded_box(t)
+                    }
+                })
         });
         let col = column![theme_picker, picker2, bar, base, row, hovered_example].spacing(20);
 

@@ -11,6 +11,7 @@ where
 {
     builder: Box<F>,
     message: std::marker::PhantomData<&'a Message>,
+    on_press: Option<Message>,
 }
 
 impl<'a, Message, F, I> Hovered<'a, Message, F, I>
@@ -22,7 +23,13 @@ where
         Self {
             builder: Box::new(f),
             message: std::marker::PhantomData,
+            on_press: None,
         }
+    }
+
+    pub fn on_press(mut self, message: Message) -> Self {
+        self.on_press = Some(message);
+        self
     }
 }
 
@@ -62,11 +69,17 @@ where
         let content = (self.builder)(state.is_hovered)
             .into()
             .map(InternalMessage::Message);
-        mouse_area(content)
-            // .interaction(iced::mouse::Interaction::Pointer)
+
+        let mut area = mouse_area(content)
+            .interaction(iced::mouse::Interaction::Pointer)
             .on_enter(InternalMessage::SetHovered(true))
-            .on_exit(InternalMessage::SetHovered(false))
-            .into()
+            .on_exit(InternalMessage::SetHovered(false));
+
+        if let Some(message) = &self.on_press {
+            area = area.on_press(InternalMessage::Message(message.clone()));
+        }
+
+        area.into()
     }
 }
 
