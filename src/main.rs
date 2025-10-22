@@ -86,46 +86,46 @@ impl ColorPickerExample {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let theme_picker = pick_list(Theme::ALL, Some(&self.theme), Message::Theme);
-        let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor);
-
-        let picker = color_picker(
-            self.show_picker,
-            self.color,
-            but,
-            Message::CancelColor,
-            Message::SubmitColor,
-        );
-
-        let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor2);
-
-        let picker2 = color_picker(
-            self.show_picker2,
-            self.color,
-            but,
-            Message::CancelColor,
-            Message::SubmitColor,
-        );
-
-        // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
-        let base = container(iced::widget::row![
-            Button::new("Press Me1!").on_press(Message::CancelColor),
-            iced::widget::space::horizontal(),
-            Button::new("Press Me2!").on_press(Message::CancelColor),
-            iced::widget::space::horizontal(),
-            Button::new("Press Me3!").on_press(Message::CancelColor),
-        ])
-        .center_x(iced::Fill)
-        .center_y(300)
-        .style(container::dark);
-
-        let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
-        let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
-        let row = Row::new()
-            .align_y(Alignment::Center)
-            .spacing(10)
-            .push(picker)
-            .push(Text::new(format!("Color: {:?}", self.color)));
+        // let theme_picker = pick_list(Theme::ALL, Some(&self.theme), Message::Theme);
+        // let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor);
+        //
+        // let picker = color_picker(
+        //     self.show_picker,
+        //     self.color,
+        //     but,
+        //     Message::CancelColor,
+        //     Message::SubmitColor,
+        // );
+        //
+        // let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor2);
+        //
+        // let picker2 = color_picker(
+        //     self.show_picker2,
+        //     self.color,
+        //     but,
+        //     Message::CancelColor,
+        //     Message::SubmitColor,
+        // );
+        //
+        // // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
+        // let base = container(iced::widget::row![
+        //     Button::new("Press Me1!").on_press(Message::CancelColor),
+        //     iced::widget::space::horizontal(),
+        //     Button::new("Press Me2!").on_press(Message::CancelColor),
+        //     iced::widget::space::horizontal(),
+        //     Button::new("Press Me3!").on_press(Message::CancelColor),
+        // ])
+        // .center_x(iced::Fill)
+        // .center_y(300)
+        // .style(container::dark);
+        //
+        // let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
+        // let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
+        // let row = Row::new()
+        //     .align_y(Alignment::Center)
+        //     .spacing(10)
+        //     .push(picker)
+        //     .push(Text::new(format!("Color: {:?}", self.color)));
 
         let hovered_example = hovered(|is_hovered| {
             println!("is_hovered: {}", is_hovered);
@@ -138,7 +138,8 @@ impl ColorPickerExample {
                     }
                 })
         });
-        let col = column![theme_picker, picker2, bar, base, row, hovered_example].spacing(20);
+        // let col = column![theme_picker, picker2, bar, base, row, hovered_example].spacing(20);
+        let col = column![hovered_example].spacing(20);
 
         Container::new(col)
             .width(Length::Fill)
