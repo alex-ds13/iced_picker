@@ -1,3 +1,4 @@
+mod atom;
 mod color;
 mod color_picker;
 mod custom_widget;
@@ -11,6 +12,8 @@ use iced::{
     Alignment, Color, Element, Length, Theme,
     widget::{Button, Container, Row, Text, column, container, pick_list, row},
 };
+
+pub use iced_core as core;
 
 fn main() -> iced::Result {
     iced::application(

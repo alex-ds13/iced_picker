@@ -1,8 +1,6 @@
 #![allow(deprecated)]
-use iced::{
-    Element,
-    widget::{Component, mouse_area},
-};
+use crate::atom::{Component, atom};
+use iced::{Element, widget::mouse_area};
 
 pub struct Hovered<'a, Message, F, I>
 where
@@ -46,7 +44,7 @@ pub enum InternalMessage<Message> {
     Message(Message),
 }
 
-impl<'a, Message, F, I> Component<Message> for Hovered<'a, Message, F, I>
+impl<'a, Message, F, I> Component<'a, Message> for Hovered<'a, Message, F, I>
 where
     Message: Clone + std::fmt::Debug + 'a,
     F: Fn(bool) -> I,
@@ -54,9 +52,9 @@ where
 {
     type State = State;
 
-    type Event = InternalMessage<Message>;
+    type InternalMessage = InternalMessage<Message>;
 
-    fn update(&mut self, state: &mut Self::State, event: Self::Event) -> Option<Message> {
+    fn update(&mut self, state: &mut Self::State, event: Self::InternalMessage) -> Option<Message> {
         match event {
             InternalMessage::None => {}
             InternalMessage::SetHovered(hover) => state.is_hovered = hover,
@@ -65,7 +63,7 @@ where
         None
     }
 
-    fn view(&self, state: &Self::State) -> Element<'a, Self::Event> {
+    fn view(&self, state: &Self::State) -> Element<'a, Self::InternalMessage> {
         let content = (self.builder)(state.is_hovered)
             .into()
             .map(InternalMessage::Message);
@@ -90,7 +88,8 @@ where
     I: Into<Element<'a, Message>> + 'a,
 {
     fn from(value: Hovered<'a, Message, F, I>) -> Self {
-        iced::widget::component(value)
+        atom(value)
+        // iced::widget::component(value)
     }
 }
 
