@@ -4,13 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.14.0-dev", features = ["advanced", "canvas", "debug", "lazy", "smol"] }
+iced = { version = "0.14.0-dev", features = ["advanced", "canvas", "debug", "smol"] }
 iced_core = "0.14.0-dev"
 iced_widget = "0.14.0-dev"
 # iced = { path = "../iced/", features = ["advanced", "canvas", "debug", "lazy", "smol"] }
 smol = "2.0.2"
 
 [patch.crates-io]
-iced = { git = "https://github.com/iced-rs/iced.git" }
-iced_core = { git = "https://github.com/iced-rs/iced.git" }
-iced_widget = { git = "https://github.com/iced-rs/iced.git" }
+# iced = { git = "https://github.com/iced-rs/iced.git", branch = "bless-component" }
+# iced_core = { git = "https://github.com/iced-rs/iced.git", branch = "bless-component" }
+# iced_widget = { git = "https://github.com/iced-rs/iced.git", branch = "bless-component" }
+iced = { path = "../iced/" }
+iced_core = { path = "../iced/core/" }
+iced_widget = { path = "../iced/widget/" }

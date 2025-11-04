@@ -9,27 +9,21 @@ use crate::core::{
 };
 use iced_widget::space;
 
-use std::marker::PhantomData;
-
 pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Renderer> {
     /// The internal state of this [`Component`].
     type State: Default;
 
     /// The type of message this [`Component`] handles internally.
-    type InternalMessage;
+    type Event;
 
-    /// Processes an [`InternalMessage`](Component::InternalMessage) and updates the [`Component`] state accordingly.
+    /// Processes an [`Event`](Component::Event) and updates the [`Component`] state accordingly.
     ///
     /// It can produce a `Message` for the parent application.
-    fn update(
-        &mut self,
-        state: &mut Self::State,
-        message: Self::InternalMessage,
-    ) -> Option<Message>;
+    fn update(&mut self, state: &mut Self::State, event: Self::Event) -> Option<Message>;
 
     /// Produces the widgets of the [`Component`], which may trigger an [`InternalMessage`](Component::InternalMessage)
     /// on user interaction.
-    fn view(&self, state: &Self::State) -> Element<'a, Self::InternalMessage, Theme, Renderer>;
+    fn view(&self, state: &Self::State) -> Element<'a, Self::Event, Theme, Renderer>;
 
     /// Update the [`Component`] state based on the provided [`Operation`](widget::Operation)
     ///
@@ -60,26 +54,17 @@ pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Rende
 }
 
 /// A widget that encapsulates a [`Component`]
-pub struct Atom<
-    'a,
-    T: Component<'a, Message, Theme, Renderer>,
-    State: Default,
-    InternalMessage,
-    Message: 'a,
-    Theme = iced::Theme,
-    Renderer = iced::Renderer,
-> {
+pub struct Atom<'a, T, Message, Theme = iced::Theme, Renderer = iced::Renderer>
+where
+    T: Component<'a, Message, Theme, Renderer> + 'a,
+{
     pub component: T,
     pub width: Length,
     pub height: Length,
-    pub content: Element<'a, InternalMessage, Theme, Renderer>,
-    pub internal_message: std::marker::PhantomData<InternalMessage>,
-    pub message: std::marker::PhantomData<Message>,
-    pub state: std::marker::PhantomData<State>,
+    pub content: Element<'a, T::Event, Theme, Renderer>,
 }
 
-impl<'a, T, State: Default, InternalMessage, Message, Theme, Renderer>
-    Atom<'a, T, State, InternalMessage, Message, Theme, Renderer>
+impl<'a, T, Message, Theme, Renderer> Atom<'a, T, Message, Theme, Renderer>
 where
     T: Component<'a, Message, Theme, Renderer>,
     Renderer: core::Renderer,
@@ -91,9 +76,6 @@ where
             width: Length::Shrink,
             height: Length::Shrink,
             content: Element::new(space()),
-            internal_message: std::marker::PhantomData,
-            message: std::marker::PhantomData,
-            state: std::marker::PhantomData,
         }
     }
 
@@ -110,20 +92,19 @@ where
     }
 }
 
-impl<'a, T, State, InternalMessage, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for Atom<'a, T, State, InternalMessage, Message, Theme, Renderer>
+impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for Atom<'a, T, Message, Theme, Renderer>
 where
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>,
-    State: Default + 'static,
-    <T as Component<'a, Message, Theme, Renderer>>::State: Default + 'static,
+    T: Component<'a, Message, Theme, Renderer>,
+    T::State: Default + 'static,
     Renderer: core::Renderer,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        tree::Tag::of::<T::State>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
+        tree::State::new(T::State::default())
     }
 
     fn diff(&self, tree: &mut Tree) {
@@ -150,7 +131,7 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let state = tree.state.downcast_mut::<State>();
+        let state = tree.state.downcast_mut::<T::State>();
         self.content = self.component.view(state);
         tree.diff_children(std::slice::from_ref(&self.content));
 
@@ -196,7 +177,7 @@ where
         shell.request_input_method(local_shell.input_method());
 
         if !local_messages.is_empty() {
-            let state = tree.state.downcast_mut::<State>();
+            let state = tree.state.downcast_mut::<T::State>();
             for message in local_messages
                 .into_iter()
                 .filter_map(|message| self.component.update(state, message))
@@ -254,7 +235,7 @@ where
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
-        let state = tree.state.downcast_mut::<State>();
+        let state = tree.state.downcast_mut::<T::State>();
         self.component.operate(layout.bounds(), state, operation);
 
         self.content.as_widget_mut().operate(
@@ -283,63 +264,45 @@ where
                 translation,
             )
             .map(|element| {
-                let state = tree.state.downcast_mut::<State>();
+                let state = tree.state.downcast_mut::<T::State>();
                 Overlay::overlay(element, &mut self.component, state)
             })
     }
 }
 
-pub struct Overlay<
-    'a,
-    'b,
-    T,
-    State,
-    InternalMessage,
-    Message,
-    Theme = iced::Theme,
-    Renderer = iced::Renderer,
-> where
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>,
-    State: Default,
-    Message: 'a,
+pub struct Overlay<'a, 'b, T, Message, Theme = iced::Theme, Renderer = iced::Renderer>
+where
+    T: Component<'a, Message, Theme, Renderer>,
 {
-    element: overlay::Element<'b, InternalMessage, Theme, Renderer>,
+    element: overlay::Element<'b, T::Event, Theme, Renderer>,
     component: &'b mut T,
-    state: &'b mut State,
-    phantom: PhantomData<overlay::Element<'a, Message, Theme, Renderer>>,
+    state: &'b mut T::State,
 }
 
-impl<'a, 'b, T, State, InternalMessage, Message, Theme, Renderer>
-    Overlay<'a, 'b, T, State, InternalMessage, Message, Theme, Renderer>
+impl<'a, 'b, T, Message, Theme, Renderer> Overlay<'a, 'b, T, Message, Theme, Renderer>
 where
     'a: 'b,
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>,
-    State: Default + 'static,
-    Message: 'a,
-    InternalMessage: 'b,
+    T: Component<'a, Message, Theme, Renderer>,
     Theme: 'b,
     Renderer: core::Renderer + 'b,
 {
     pub fn overlay(
-        element: overlay::Element<'b, InternalMessage, Theme, Renderer>,
+        element: overlay::Element<'b, T::Event, Theme, Renderer>,
         component: &'b mut T,
-        state: &'b mut State,
+        state: &'b mut T::State,
     ) -> overlay::Element<'b, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Overlay {
             element,
             component,
             state,
-            phantom: PhantomData,
         }))
     }
 }
 
-impl<'a, 'b, T, State, InternalMessage, Message, Theme, Renderer>
-    core::overlay::Overlay<Message, Theme, Renderer>
-    for Overlay<'a, 'b, T, State, InternalMessage, Message, Theme, Renderer>
+impl<'a, 'b, T, Message, Theme, Renderer> core::overlay::Overlay<Message, Theme, Renderer>
+    for Overlay<'a, 'b, T, Message, Theme, Renderer>
 where
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>,
-    State: Default + 'static,
+    T: Component<'a, Message, Theme, Renderer>,
     Renderer: core::Renderer,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
@@ -401,31 +364,24 @@ where
     }
 }
 
-impl<'a, T, State, InternalMessage, Message, Theme, Renderer>
-    From<Atom<'a, T, State, InternalMessage, Message, Theme, Renderer>>
+impl<'a, T, Message, Theme, Renderer> From<Atom<'a, T, Message, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
 where
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>
-        + 'a,
-    State: Default + 'static,
-    InternalMessage: 'a,
+    T: Component<'a, Message, Theme, Renderer> + 'a,
+    T::State: 'static,
     Message: 'a,
     Theme: 'a,
     Renderer: core::Renderer + 'a,
 {
-    fn from(atom: Atom<'a, T, State, InternalMessage, Message, Theme, Renderer>) -> Self {
+    fn from(atom: Atom<'a, T, Message, Theme, Renderer>) -> Self {
         Self::new(atom)
     }
 }
 
-pub fn atom<'a, T, State, InternalMessage, Message, Theme, Renderer>(
-    component: T,
-) -> Element<'a, Message, Theme, Renderer>
+pub fn atom<'a, T, Message, Theme, Renderer>(component: T) -> Element<'a, Message, Theme, Renderer>
 where
-    T: Component<'a, Message, Theme, Renderer, State = State, InternalMessage = InternalMessage>
-        + 'a,
-    State: Default + 'static,
-    InternalMessage: 'a,
+    T: Component<'a, Message, Theme, Renderer> + 'a,
+    T::State: 'static,
     Message: 'a,
     Theme: 'a,
     Renderer: core::Renderer + 'a,

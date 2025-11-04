@@ -1,7 +1,8 @@
-mod atom;
-use iced::widget::{button, center, column, container, row, scrollable, space, text};
-use iced::{Alignment, Element, Length, Task, Theme};
-use iced_core as core;
+use iced::widget::{
+    button, center, column, container, space, row, scrollable,
+    text,
+};
+use iced::{Alignment, Element, Length, Theme};
 
 pub fn main() -> iced::Result {
     iced::application(List::default, List::update, List::view)
@@ -12,15 +13,12 @@ pub fn main() -> iced::Result {
 
 struct List {
     content: Vec<(usize, State)>,
-    filter: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum Message {
     Update(usize),
     Remove(usize),
-    Selected(usize, f32),
-    FilterChanged(String),
 }
 
 impl List {
@@ -28,108 +26,64 @@ impl List {
         Theme::TokyoNight
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    fn update(&mut self, message: Message) {
         match message {
             Message::Update(index) => {
                 if let Some((_id, state)) = self.content.get_mut(index) {
-                    if matches!(state, State::Updated) {
-                        *state = State::Idle;
-                    } else {
-                        *state = State::Updated;
-                    }
+                    *state = State::Updated;
                 }
             }
             Message::Remove(index) => {
                 let _ = self.content.remove(index);
             }
-            Message::Selected(_idx, offset) => {
-                return iced::widget::operation::scroll_to(
-                    "SCROLLABLE",
-                    scrollable::AbsoluteOffset { x: 0.0, y: offset },
-                );
-            }
-            Message::FilterChanged(filter) => {
-                self.filter = filter.parse().unwrap_or_default();
-            }
         }
-        Task::none()
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        Element::from(
-            center(column![
-                row![
-                    text("Filter: "),
-                    iced::widget::text_input("", &self.filter.to_string())
-                        .on_input(Message::FilterChanged)
-                ],
-                scrollable(
-                    container(
-                        listview::listview(
-                            &self.content,
-                            |index, (id, state), _selected| -> Element<Message> {
-                                row![
-                                    match state {
-                                        State::Idle =>
-                                            Element::from(text(format!("I am item {id}!"))),
-                                        State::Updated => center(
-                                            column![
-                                                text(format!("I am item {id}!")),
-                                                text("... but different!")
-                                            ]
-                                            .spacing(20)
-                                        )
-                                        .height(300)
-                                        .into(),
-                                    },
-                                    space::horizontal(),
-                                    button("Update").on_press(Message::Update(index)),
-                                    button("Remove")
-                                        .on_press(Message::Remove(index))
-                                        .style(button::danger)
+    fn view(&self) -> Element<Message> {
+        center(
+            scrollable(
+                container(listview::listview(&self.content, |index, (id, state), selected| {
+                    row![
+                        match state {
+                            State::Idle =>
+                                Element::from(text(format!("I am item {id}!"))),
+                            State::Updated => center(
+                                column![
+                                    text(format!("I am item {id}!")),
+                                    text("... but different!")
                                 ]
-                                .spacing(10)
-                                .padding(5)
-                                .align_y(Alignment::Center)
-                                .height(Length::Shrink)
-                                .width(Length::Fill)
-                                .into()
-                            },
-                        )
-                        .on_selected(Message::Selected)
-                        .single_selection()
-                        .filter(
-                            self.content
-                                .iter()
-                                .filter_map(|(idx, _)| (idx >= &self.filter).then_some(*idx))
-                        )
-                    )
-                    .width(Length::Fill)
-                    .padding(10),
-                )
-                .id("SCROLLABLE")
-            ])
-            .padding(10),
+                                .spacing(20)
+                            )
+                            .height(300)
+                            .into(),
+                        },
+                        space::horizontal(),
+                        button("Update").on_press_maybe(
+                            matches!(state, State::Idle)
+                                .then_some(Message::Update(index))
+                        ),
+                        button("Remove")
+                            .on_press(Message::Remove(index))
+                            .style(button::danger)
+                    ]
+                    .spacing(10)
+                    .padding(5)
+                    .align_items(Alignment::Center)
+                    .into()
+                }))
+                .padding(10),
+            )
+            .width(Length::Fill),
         )
+        .padding(10)
+        .into()
     }
 }
 
 impl Default for List {
     fn default() -> Self {
         Self {
-            content: (0..1_000)
-                .map(|id| {
-                    (
-                        id,
-                        if id % 100 == 0 {
-                            State::Updated
-                        } else {
-                            State::Idle
-                        },
-                    )
-                })
-                .collect(),
-            filter: 0,
+            content: (0..1_000).map(|id| (id, State::Idle)).to_vec(),
         }
     }
 }
@@ -152,7 +106,7 @@ mod listview {
         widget::{Component, Id, button, column, component, container, sensor, space},
     };
 
-    pub static ITEM_HEIGHT: f32 = 50.8;
+    pub static ITEM_HEIGHT: f32 = 40.8;
 
     pub struct ListView<'a, 'b, T, Message> {
         id: Option<Id>,
@@ -175,9 +129,7 @@ mod listview {
                 items: items.into_iter().collect(),
                 single_selection: false,
                 filtered_ids: None,
-                view_item: Box::new(move |idx, item, selected| {
-                    view_item(idx, item, selected).into()
-                }),
+                view_item: Box::new(move |idx, item, selected| view_item(idx, item, selected).into()),
                 on_selected: None,
                 on_deselected: None,
             }
@@ -203,10 +155,7 @@ mod listview {
             self
         }
 
-        pub fn filter_maybe(
-            mut self,
-            filtered_ids: Option<impl IntoIterator<Item = usize>>,
-        ) -> Self {
+        pub fn filter_maybe(mut self, filtered_ids: Option<impl IntoIterator<Item = usize>>) -> Self {
             self.filtered_ids = filtered_ids.map(HashSet::from_iter);
             self
         }
@@ -349,7 +298,6 @@ mod listview {
                             state.heights.insert(idx, h);
                         }
                     }
-                    println!("[SHOW] Height for {} is {}", idx, height);
                 }
                 Event::HideItem(idx) => {
                     state.visible.remove(&idx);
@@ -370,7 +318,6 @@ mod listview {
                         }
                         state.heights.insert(idx, h);
                     }
-                    println!("[RESIZE] Height for {} is {}", idx, height);
                 }
                 Event::Content(message) => {
                     return Some(message);
@@ -411,15 +358,13 @@ mod listview {
                                     Event::Deselect(idx)
                                 })
                                 .style(if selected {
-                                    button::secondary
+                                    button::success
                                 } else {
-                                    button::subtle
+                                    button::primary
                                 })
                                 .into()
                         } else {
-                            container(space::horizontal().height(el_height))
-                                .style(container::bordered_box)
-                                .into()
+                            space::horizontal().height(el_height).into()
                         };
                         let s = sensor(el)
                             .on_show(move |size| Event::ShowItem(idx, size.height))
@@ -436,14 +381,14 @@ mod listview {
             content.into()
         }
 
-        // fn operate(
-        //     &self,
-        //     state: &mut Self::State,
-        //     bounds: iced::Rectangle,
-        //     operation: &mut dyn Operation,
-        // ) {
-        //     operation.custom(self.id.as_ref(), bounds, state);
-        // }
+        fn operate(
+            &self,
+            state: &mut Self::State,
+            bounds: iced::Rectangle,
+            operation: &mut dyn Operation,
+        ) {
+            operation.custom(self.id.as_ref(), bounds, state);
+        }
 
         fn diff(&self, state: &mut Self::State) {
             if !state.initialized {
@@ -533,188 +478,3 @@ mod listview {
         ListView::new(items, view_item)
     }
 }
-
-// mod atom;
-// mod color;
-// mod color_picker;
-// mod custom_widget;
-// mod double_click;
-// mod hovered;
-// mod list;
-// mod test_overlay;
-//
-// use color_picker::color_picker;
-// use double_click::double_click;
-// use hovered::hovered;
-//
-// use iced::{
-//     Alignment, Color, Element, Length, Theme,
-//     widget::{Button, Container, Row, Text, column, container, pick_list, row},
-// };
-//
-// pub use iced_core as core;
-//
-// fn main() -> iced::Result {
-//     iced::application(
-//         ColorPickerExample::default,
-//         ColorPickerExample::update,
-//         ColorPickerExample::view,
-//     )
-//     .title("Color Picker Example")
-//     .theme(ColorPickerExample::theme)
-//     .run()
-// }
-//
-// #[derive(Clone, Debug)]
-// #[allow(clippy::enum_variant_names)]
-// enum Message {
-//     ChooseColor,
-//     ChooseColor2,
-//     ShowTest,
-//     SubmitColor(Color),
-//     CancelColor,
-//     Theme(Theme),
-//     DoubleClick,
-// }
-//
-// #[derive(Debug)]
-// struct ColorPickerExample {
-//     color: Color,
-//     show_picker: bool,
-//     show_picker2: bool,
-//     show_test: bool,
-//     theme: Theme,
-//     double_clicked: bool,
-// }
-//
-// impl Default for ColorPickerExample {
-//     fn default() -> Self {
-//         Self {
-//             color: Color::from_rgba8(0, 0, 0, 1.0),
-//             show_picker: false,
-//             show_picker2: false,
-//             show_test: false,
-//             theme: Theme::TokyoNightStorm,
-//             double_clicked: false,
-//         }
-//     }
-// }
-// impl ColorPickerExample {
-//     fn update(&mut self, message: Message) {
-//         match message {
-//             Message::ShowTest => {
-//                 self.show_test = true;
-//             }
-//             Message::ChooseColor => {
-//                 self.show_picker = true;
-//             }
-//             Message::ChooseColor2 => {
-//                 self.show_picker2 = true;
-//             }
-//             Message::SubmitColor(color) => {
-//                 self.color = color;
-//                 self.show_picker = false;
-//                 self.show_picker2 = false;
-//             }
-//             Message::CancelColor => {
-//                 self.show_picker = false;
-//                 self.show_picker2 = false;
-//                 self.show_test = false;
-//             }
-//             Message::Theme(theme) => {
-//                 self.theme = theme;
-//             }
-//             Message::DoubleClick => self.double_clicked = !self.double_clicked,
-//         }
-//     }
-//
-//     fn view(&self) -> Element<'_, Message> {
-//         // let theme_picker = pick_list(Theme::ALL, Some(&self.theme), Message::Theme);
-//         // let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor);
-//         //
-//         // let picker = color_picker(
-//         //     self.show_picker,
-//         //     self.color,
-//         //     but,
-//         //     Message::CancelColor,
-//         //     Message::SubmitColor,
-//         // );
-//         //
-//         // let but = Button::new(Text::new("Set Color")).on_press(Message::ChooseColor2);
-//         //
-//         // let picker2 = color_picker(
-//         //     self.show_picker2,
-//         //     self.color,
-//         //     but,
-//         //     Message::CancelColor,
-//         //     Message::SubmitColor,
-//         // );
-//         //
-//         // // let color = color::color(self.color, Message::CancelColor, Message::SubmitColor);
-//         // let base = container(iced::widget::row![
-//         //     Button::new("Press Me1!").on_press(Message::CancelColor),
-//         //     iced::widget::space::horizontal(),
-//         //     Button::new("Press Me2!").on_press(Message::CancelColor),
-//         //     iced::widget::space::horizontal(),
-//         //     Button::new("Press Me3!").on_press(Message::CancelColor),
-//         // ])
-//         // .center_x(iced::Fill)
-//         // .center_y(300)
-//         // .style(container::dark);
-//         //
-//         // let but = Button::new(Text::new("Set Color")).on_press(Message::ShowTest);
-//         // let bar = test_overlay::Bar::new(self.show_test, but.into(), Message::CancelColor);
-//         // let row = Row::new()
-//         //     .align_y(Alignment::Center)
-//         //     .spacing(10)
-//         //     .push(picker)
-//         //     .push(Text::new(format!("Color: {:?}", self.color)));
-//
-//         let hovered_example = hovered(|is_hovered| {
-//             println!("is_hovered: {}", is_hovered);
-//             container(row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10)).style(
-//                 move |t| {
-//                     if is_hovered {
-//                         container::dark(t)
-//                     } else {
-//                         container::rounded_box(t)
-//                     }
-//                 },
-//             )
-//         });
-//
-//         let double_click_example = double_click(
-//             move || {
-//                 container(
-//                     row![
-//                         "foo",
-//                         if self.double_clicked { "bar" } else { "baz" },
-//                         "qux"
-//                     ]
-//                     .spacing(10),
-//                 )
-//                 .style(move |t| {
-//                     if self.double_clicked {
-//                         container::dark(t)
-//                     } else {
-//                         container::rounded_box(t)
-//                     }
-//                 })
-//             },
-//             Message::DoubleClick,
-//         );
-//         // let col = column![theme_picker, picker2, bar, base, row, hovered_example].spacing(20);
-//         let col = column![hovered_example, double_click_example].spacing(20);
-//
-//         Container::new(col)
-//             .width(Length::Fill)
-//             .height(Length::Fill)
-//             .center_x(Length::Fill)
-//             .center_y(Length::Fill)
-//             .into()
-//     }
-//
-//     fn theme(&self) -> Theme {
-//         self.theme.clone()
-//     }
-// }

@@ -48,7 +48,7 @@ pub enum InternalMessage {
     Message(Message),
 }
 
-impl Component<Message> for Expander<'_> {
+impl<'a> Component<'a, Message> for Expander<'a> {
     type State = State;
 
     type Event = InternalMessage;
@@ -66,7 +66,7 @@ impl Component<Message> for Expander<'_> {
     fn view(
         &self,
         state: &Self::State,
-    ) -> Element<'_, Self::Event> {
+    ) -> Element<'a, Self::Event> {
         todo!()
     }
 }
