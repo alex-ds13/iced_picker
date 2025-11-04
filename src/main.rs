@@ -32,10 +32,10 @@ impl List {
         match message {
             Message::Update(index) => {
                 if let Some((_id, state)) = self.content.get_mut(index) {
-                    if matches!(state, State::Updated) {
-                        *state = State::Idle;
+                    if matches!(state, State::Opened) {
+                        *state = State::Closed;
                     } else {
-                        *state = State::Updated;
+                        *state = State::Opened;
                     }
                 }
             }
@@ -70,9 +70,9 @@ impl List {
                             |index, (id, state), _selected| -> Element<Message> {
                                 row![
                                     match state {
-                                        State::Idle =>
+                                        State::Closed =>
                                             Element::from(text(format!("I am item {id}!"))),
-                                        State::Updated => center(
+                                        State::Opened => center(
                                             column![
                                                 text(format!("I am item {id}!")),
                                                 text("... but different!")
@@ -122,9 +122,9 @@ impl Default for List {
                     (
                         id,
                         if id % 100 == 0 {
-                            State::Updated
+                            State::Opened
                         } else {
-                            State::Idle
+                            State::Closed
                         },
                     )
                 })
@@ -136,8 +136,8 @@ impl Default for List {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Idle,
-    Updated,
+    Closed,
+    Opened,
 }
 
 mod listview {
