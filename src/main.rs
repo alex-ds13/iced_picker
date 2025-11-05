@@ -304,7 +304,7 @@ mod listview {
         Content(Message),
     }
 
-    impl<'a, T: Clone, Message: Clone + 'a> Component<'a, Message> for ListView<'a, '_, T, Message> {
+    impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message> for ListView<'a, '_, T, Message> {
         type State = State;
 
         type Event = Event<Message>;
@@ -514,7 +514,7 @@ mod listview {
         }
     }
 
-    impl<'a, 'b: 'a, T: Clone + 'a, Message: Clone + 'a> From<ListView<'a, 'b, T, Message>>
+    impl<'a, 'b: 'a, T: Clone + 'a, Message: Clone + 'static> From<ListView<'a, 'b, T, Message>>
         for Element<'a, Message>
     {
         fn from(value: ListView<'a, 'b, T, Message>) -> Self {
