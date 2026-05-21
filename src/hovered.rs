@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use crate::atom::{Component, atom};
 use iced::{Element, widget::mouse_area};
 
@@ -37,7 +36,7 @@ pub struct State {
 }
 
 #[derive(Clone, Debug, Default)]
-pub enum InternalMessage<Message> {
+pub enum Event<Message> {
     #[default]
     None,
     SetHovered(bool),
@@ -51,30 +50,29 @@ where
     I: Into<Element<'a, Message>>,
 {
     type State = State;
+    type Event = Event<Message>;
 
-    type InternalMessage = InternalMessage<Message>;
-
-    fn update(&mut self, state: &mut Self::State, event: Self::InternalMessage) -> Option<Message> {
+    fn update(&mut self, state: &mut Self::State, event: Self::Event) -> Option<Message> {
         match event {
-            InternalMessage::None => {}
-            InternalMessage::SetHovered(hover) => state.is_hovered = hover,
-            InternalMessage::Message(message) => return Some(message),
+            Event::None => {}
+            Event::SetHovered(hover) => state.is_hovered = hover,
+            Event::Message(message) => return Some(message),
         }
         None
     }
 
-    fn view(&self, state: &Self::State) -> Element<'a, Self::InternalMessage> {
+    fn view(&self, state: &Self::State) -> Element<'a, Self::Event> {
         let content = (self.builder)(state.is_hovered)
             .into()
-            .map(InternalMessage::Message);
+            .map(Event::Message);
 
         let mut area = mouse_area(content)
             .interaction(iced::mouse::Interaction::Pointer)
-            .on_enter(InternalMessage::SetHovered(true))
-            .on_exit(InternalMessage::SetHovered(false));
+            .on_enter(Event::SetHovered(true))
+            .on_exit(Event::SetHovered(false));
 
         if let Some(message) = &self.on_press {
-            area = area.on_press(InternalMessage::Message(message.clone()));
+            area = area.on_press(Event::Message(message.clone()));
         }
 
         area.into()
@@ -89,7 +87,6 @@ where
 {
     fn from(value: Hovered<'a, Message, F, I>) -> Self {
         atom(value)
-        // iced::widget::component(value)
     }
 }
 

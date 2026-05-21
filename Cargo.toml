@@ -3,14 +3,22 @@ name = "iced_picker"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "iced_picker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iced_picker"
+path = "src/main.rs"
+
 [dependencies]
-iced = { version = "0.14.0-dev", features = ["advanced", "canvas", "debug", "lazy", "smol"] }
-iced_core = "0.14.0-dev"
-iced_widget = "0.14.0-dev"
-# iced = { path = "../iced/", features = ["advanced", "canvas", "debug", "lazy", "smol"] }
+iced = { version = "0.15.0-dev", features = ["advanced", "canvas", "debug", "smol"] }
+iced_core = "0.15.0-dev"
+log = "0.4"
+num-traits = "0.2"
 smol = "2.0.2"
+unicode-segmentation = "1"
 
 [patch.crates-io]
-iced = { git = "https://github.com/iced-rs/iced.git" }
-iced_core = { git = "https://github.com/iced-rs/iced.git" }
-iced_widget = { git = "https://github.com/iced-rs/iced.git" }
+iced = { git = "https://github.com/alex-ds13/iced.git", branch = "bless-component-with-fixes" }
+iced_core = { git = "https://github.com/alex-ds13/iced.git", branch = "bless-component-with-fixes" }
