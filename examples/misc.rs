@@ -1,26 +1,28 @@
 use iced_picker::{
-    helpers::button_separator,
     modal::{self, modal},
     number_input::NumberInput,
     text_input::TextInput,
     tooltip::{self, tooltip, Open, Position},
 };
+
+const SAVE_TIP_ID: &str = "save_dropdown_tooltip";
 use iced::{
-    Border, Center, Element, Fill, Shrink, Theme,
-    widget::{button, center, column, container, row, text},
+    Border, Center, Element, Fill, Shrink, Subscription, Task, Theme,
+    keyboard,
+    widget::{button, center, column, container, operation, row, text},
 };
 
 fn main() -> iced::Result {
     iced::application(App::default, App::update, App::view)
         .title("Misc Widgets - iced_picker")
         .theme(App::theme)
+        .subscription(App::subscription)
         .run()
 }
 
 #[derive(Debug)]
 struct App {
     amount: f64,
-    formatted_amount: String,
     show_modal: bool,
     last_action: Option<String>,
 }
@@ -29,7 +31,6 @@ impl Default for App {
     fn default() -> Self {
         Self {
             amount: 42.50,
-            formatted_amount: "42.50 €".into(),
             show_modal: false,
             last_action: None,
         }
@@ -46,6 +47,7 @@ enum Message {
     Save,
     SaveAs,
     Backup,
+    TabPressed { shift: bool },
 }
 
 impl App {
@@ -53,14 +55,12 @@ impl App {
         Theme::TokyoNightStorm
     }
 
-    fn update(&mut self, message: Message) {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AmountChanged(v) => {
                 self.amount = v;
-                self.formatted_amount = format!("{:.2} €", v);
             }
             Message::FormattedChanged(s) => {
-                self.formatted_amount = s.clone();
                 let cleaned = s.trim().trim_end_matches('€').trim();
                 if let Ok(v) = cleaned.parse::<f64>() {
                     self.amount = v;
@@ -70,12 +70,39 @@ impl App {
             Message::CloseModal => self.show_modal = false,
             Message::Confirm => {
                 self.show_modal = false;
-                self.last_action = Some(format!("Confirmed: {}", self.formatted_amount));
+                self.last_action = Some(format!("Confirmed: {:.2} €", self.amount));
             }
             Message::Save => self.last_action = Some("Saved".into()),
-            Message::SaveAs => self.last_action = Some("Save As...".into()),
-            Message::Backup => self.last_action = Some("Backup created".into()),
+            Message::SaveAs => {
+                self.last_action = Some("Save As...".into());
+                return tooltip::close(SAVE_TIP_ID);
+            }
+            Message::Backup => {
+                self.last_action = Some("Backup created".into());
+                return tooltip::close(SAVE_TIP_ID);
+            }
+            Message::TabPressed { shift } => {
+                return if shift {
+                    operation::focus_previous()
+                } else {
+                    operation::focus_next()
+                };
+            }
         }
+        Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        keyboard::listen().filter_map(|event| match event {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                modifiers,
+                ..
+            } => Some(Message::TabPressed {
+                shift: modifiers.shift(),
+            }),
+            _ => None,
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -91,7 +118,7 @@ impl App {
 
         let formatted_row = row![
             text("Formatted:").width(100),
-            TextInput::new("0.00 €", self.formatted_amount.as_str())
+            TextInput::new("0.00 €", format!("{:.2} €", self.amount))
                 .padding([0, 5])
                 .line_height(1.85)
                 .on_input(Message::FormattedChanged),
@@ -125,7 +152,7 @@ impl App {
         let modal_content = container(
             column![
                 text("Are you sure?").size(20),
-                text(format!("Save with amount: {}", self.formatted_amount)),
+                text(format!("Save with amount: {:.2} €", self.amount)),
                 row![
                     button("Cancel")
                         .on_press(Message::CloseModal)
@@ -181,9 +208,10 @@ fn save_buttons_row() -> Element<'static, Message> {
     .style(container::bordered_box)
     .padding(10);
 
-    let dropdown = tooltip(text("▾").size(14).center(), dropdown_items)
+    let dropdown = tooltip(text("▾").center(), dropdown_items)
+        .id(SAVE_TIP_ID)
         .open(Open::LeftPointer)
-        .position(Position::TopRight)
+        .position(Position::BottomRight)
         .content_style(|t: &Theme, s| tooltip::Style {
             border: Border {
                 radius: iced::border::right(4.0),
@@ -192,7 +220,7 @@ fn save_buttons_row() -> Element<'static, Message> {
             ..tooltip::primary(t, s)
         });
 
-    row![save_btn, button_separator(), dropdown]
+    row![save_btn, dropdown]
         .align_y(Center)
         .width(Shrink)
         .into()

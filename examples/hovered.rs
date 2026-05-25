@@ -1,6 +1,6 @@
 use iced_picker::hovered::hovered;
 use iced::{
-    Element, Theme,
+    Center, Element, Theme,
     widget::{center, column, container, row, text},
 };
 
@@ -29,7 +29,10 @@ impl App {
             container(
                 row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10),
             )
-            .padding(10)
+            .width(260)
+            .height(42)
+            .align_x(Center)
+            .align_y(Center)
             .style(move |t| {
                 if is_hovered {
                     container::dark(t)
@@ -44,7 +47,10 @@ impl App {
                 text(if is_hovered { "Hovered!" } else { "Hover over me" })
                     .size(if is_hovered { 28.0 } else { 16.0 }),
             )
-            .padding(20)
+            .width(260)
+            .height(80)
+            .align_x(Center)
+            .align_y(Center)
             .style(move |t| {
                 if is_hovered {
                     container::rounded_box(t)
@@ -57,17 +63,28 @@ impl App {
         let nested = hovered(|outer| {
             container(
                 column![
-                    text(if outer { "Outer hovered" } else { "Hover anywhere" }),
+                    container(
+                        text(if outer { "Outer hovered" } else { "Hover anywhere" }),
+                    )
+                    .width(240)
+                    .height(24)
+                    .align_x(Center)
+                    .align_y(Center),
                     hovered(|inner| {
-                        container(text(if inner { "Inner hovered!" } else { "Inner area" }))
-                            .padding(10)
-                            .style(move |t| {
-                                if inner {
-                                    container::dark(t)
-                                } else {
-                                    container::rounded_box(t)
-                                }
-                            })
+                        container(
+                            text(if inner { "Inner hovered!" } else { "Inner area" }),
+                        )
+                        .width(240)
+                        .height(40)
+                        .align_x(Center)
+                        .align_y(Center)
+                        .style(move |t| {
+                            if inner {
+                                container::dark(t)
+                            } else {
+                                container::rounded_box(t)
+                            }
+                        })
                     }),
                 ]
                 .spacing(5),

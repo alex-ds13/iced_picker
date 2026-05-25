@@ -1,11 +1,11 @@
-use iced_picker::listview::listview;
 use iced::{
     Alignment, Element, Fill, Length, Shrink, Task, Theme,
     widget::{
-        button, center, checkbox, column, container,
-        operation::AbsoluteOffset, row, scrollable, space, text, text_input,
+        button, center, checkbox, column, container, operation::AbsoluteOffset, row, scrollable,
+        space, text, text_input,
     },
 };
+use iced_picker::listview::listview;
 use std::collections::HashSet;
 
 fn main() -> iced::Result {
@@ -32,6 +32,7 @@ enum Message {
     FilterChanged(String),
     SingleSelectionToggled(bool),
     ScrollToSelectedToggled(bool),
+    ClearSelection,
 }
 
 impl List {
@@ -84,6 +85,9 @@ impl List {
             }
             Message::ScrollToSelectedToggled(v) => {
                 self.scroll_to_selected = v;
+            }
+            Message::ClearSelection => {
+                self.selection.clear();
             }
         }
         Task::none()
@@ -177,11 +181,22 @@ impl List {
             self.selection.len(),
         ));
 
+        let clear_btn = {
+            let btn = button("Clear Selection").style(button::secondary);
+            if self.selection.is_empty() {
+                btn
+            } else {
+                btn.on_press(Message::ClearSelection)
+            }
+        };
+
+        let status_row = row![status, space::horizontal(), clear_btn].align_y(Alignment::Center);
+
         center(
             column![
                 options,
                 filter_input,
-                status,
+                status_row,
                 container(
                     scrollable(container(list).width(Fill).padding(10))
                         .id("SCROLLABLE")
@@ -217,7 +232,7 @@ impl Default for List {
             filter: 0,
             selection: HashSet::new(),
             single_selection: true,
-            scroll_to_selected: true,
+            scroll_to_selected: false,
         }
     }
 }
