@@ -1074,11 +1074,10 @@ where
                     } else {
                         // Widget was unfocused, clean up any partial state
                         if let Some(on_input) = &self.on_input {
-                            if state.is_decimal_partial {
-                                // Trim trailing dot and publish the clean numeric value
-                                let raw = self.value.to_string();
-                                let clean = raw.trim_end_matches('.');
-                                if let Ok(mut parsed) = clean.parse::<T>() {
+                            if let Some(display) = state.display_override.clone() {
+                                // Publish the clean value, trimming any trailing dot
+                                let to_parse = display.trim_end_matches('.');
+                                if let Ok(mut parsed) = to_parse.parse::<T>() {
                                     if parsed > self.max {
                                         parsed = self.max.clone();
                                     } else if parsed < self.min {
@@ -1086,7 +1085,7 @@ where
                                     }
                                     shell.publish((on_input)(parsed));
                                 }
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
                                 shell.request_redraw();
@@ -1190,30 +1189,36 @@ where
                             let mut editor = Editor::new(&mut self.value, &mut state.cursor);
                             editor.delete();
 
-                            if let Ok(mut parsed) = editor.contents().parse() {
+                            let value_str = self.value.to_string();
+                            if value_str.ends_with('.') {
+                                state.display_override = Some(value_str);
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                                shell.request_redraw();
+                            } else if let Ok(mut parsed) = value_str.parse() {
                                 if parsed > self.max {
                                     parsed = self.max.clone();
                                 } else if parsed < self.min {
                                     parsed = self.min.clone();
                                 }
+                                state.display_override = if parsed.to_string() != value_str {
+                                    Some(value_str)
+                                } else {
+                                    None
+                                };
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
-                                state.is_decimal_partial = false;
                             } else {
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
-                                    state.is_decimal_partial = false;
-                                } else if self.value.to_string().ends_with('.') {
-                                    state.is_decimal_partial = true;
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
+                                    state.display_override = None;
                                 } else {
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 }
                                 shell.request_redraw();
                             }
@@ -1262,7 +1267,7 @@ where
 
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                                 state.is_pasting = Some(Paste::Pasting(content.clone()));
                                 focus.updated_at = Instant::now();
                                 update_cache(state, &self.value);
@@ -1270,7 +1275,7 @@ where
                                 for _ in 0..content.len() {
                                     editor.backspace();
                                 }
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                             }
                             return;
                         }
@@ -1302,36 +1307,28 @@ where
                             // Normalize locale decimal separator to '.'
                             let c = if c == ',' { '.' } else { c };
 
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
+                            let has_selection = state.cursor.selection(&self.value).is_some();
+                            let has_dot = self.value.to_string().contains('.');
 
-                            if c.is_ascii_digit() || c == '-' || c == '.' {
-                                // Block duplicate decimal points
-                                if c != '.' || !editor.contents().contains('.') {
-                                    editor.insert(c);
+                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
+                            if (c.is_ascii_digit() || c == '-' || c == '.')
+                                && (c != '.' || !has_dot || has_selection)
+                            {
+                                editor.insert(c);
+                                // When a selection was active but didn't cover the existing dot wew
+                                // may have introduced a duplicate, roll back in that case.
+                                if c == '.'
+                                    && editor.contents().chars().filter(|&ch| ch == '.').count() > 1
+                                {
+                                    editor.backspace();
                                 }
                             }
 
-                            if let Ok(mut parsed) = editor.contents().parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                let message = (on_input)(parsed);
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                state.is_decimal_partial = false;
-                            } else if c == '-' && editor.contents() == "-" {
-                                state.is_empty = false;
-                                state.is_empty_neg = true;
-                                state.is_decimal_partial = false;
-                                shell.request_redraw();
-                            } else if c == '.' && editor.contents().ends_with('.') {
-                                // Trailing decimal point: allow as an intermediate state only
-                                // when T actually supports decimals (integers should reject it).
-                                let contents = editor.contents();
-                                let prefix = &contents[..contents.len() - 1];
+                            let value_str = editor.contents();
+                            if c == '.' && value_str.ends_with('.') {
+                                // Trailing dot: guard before parse because
+                                // "5.".parse::<f64>() = Ok(5.0) in Rust.
+                                let prefix = &value_str[..value_str.len() - 1];
                                 let test = if prefix.is_empty() {
                                     "0.1".to_string()
                                 } else if prefix == "-" {
@@ -1340,14 +1337,56 @@ where
                                     format!("{prefix}.1")
                                 };
                                 if test.parse::<T>().is_ok() {
-                                    state.is_decimal_partial = true;
+                                    // Normalize bare "." -> "0." and "-." -> "-0." so the
+                                    // display reads "0." / "-0.", the norm in most apps.
+                                    // Done through the editor so the cursor ends up after
+                                    // the dot without needing a sub-scope or snapshots.
+                                    if prefix.is_empty() || prefix == "-" {
+                                        editor.backspace();
+                                        editor.insert('0');
+                                        editor.insert('.');
+                                    }
+                                    state.display_override = Some(editor.contents());
                                     state.is_empty = false;
                                     state.is_empty_neg = false;
                                     shell.request_redraw();
                                 } else {
+                                    // T doesn't support decimals, revert.
                                     editor.backspace();
                                 }
+                            } else if let Ok(mut parsed) = value_str.parse() {
+                                if parsed > self.max {
+                                    parsed = self.max.clone();
+                                } else if parsed < self.min {
+                                    parsed = self.min.clone();
+                                }
+                                let canonical = parsed.to_string();
+                                if canonical != value_str {
+                                    // Canonical differs (e.g. "5.0"->"5", "5.50"->"5.5").
+                                    // Preserve the typed string, normalise a bare leading
+                                    // dot as a safety net (".5"->"0.5").
+                                    let display = if value_str.starts_with('.') {
+                                        format!("0{value_str}")
+                                    } else if value_str.starts_with("-.") {
+                                        format!("-0{}", &value_str[1..])
+                                    } else {
+                                        value_str
+                                    };
+                                    state.display_override = Some(display);
+                                } else {
+                                    state.display_override = None;
+                                }
+                                let message = (on_input)(parsed);
+                                shell.publish(message);
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                            } else if c == '-' && value_str == "-" {
+                                state.display_override = None;
+                                state.is_empty = false;
+                                state.is_empty_neg = true;
+                                shell.request_redraw();
                             } else {
+                                // Invalid result, revert.
                                 editor.backspace();
                             }
                             shell.capture_event();
@@ -1390,15 +1429,31 @@ where
                             let mut editor = Editor::new(&mut self.value, &mut state.cursor);
                             editor.backspace();
 
-                            if let Ok(mut parsed) = editor.contents().parse() {
+                            let value_str = self.value.to_string();
+                            if value_str.ends_with('.') {
+                                // Backspace left a trailing dot (e.g. "5.5"->"5.").
+                                // "5.".parse::<f64>() = Ok(5.0) so guard before parse.
+                                state.display_override = Some(value_str);
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                                shell.request_redraw();
+                            } else if let Ok(mut parsed) = value_str.parse() {
                                 if parsed > self.max {
                                     parsed = self.max.clone();
                                 } else if parsed < self.min {
                                     parsed = self.min.clone();
                                 }
+                                // Keep display_override when trailing zeros remain
+                                // (e.g. "5.100"->backspace->"5.10", canonical "5.1" != "5.10").
+                                state.display_override = if parsed.to_string() != value_str {
+                                    Some(value_str)
+                                } else {
+                                    None
+                                };
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
-                                state.is_decimal_partial = false;
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
 
                                 if cursor_before != state.cursor {
                                     shell.request_redraw();
@@ -1407,17 +1462,13 @@ where
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
-                                    state.is_decimal_partial = false;
-                                } else if self.value.to_string().ends_with('.') {
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
-                                    state.is_decimal_partial = true;
+                                    state.display_override = None;
                                 } else {
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 }
                                 shell.request_redraw();
                             }
@@ -1443,30 +1494,38 @@ where
                             let mut editor = Editor::new(&mut self.value, &mut state.cursor);
                             editor.delete();
 
-                            if let Ok(mut parsed) = editor.contents().parse() {
+                            let value_str = self.value.to_string();
+                            if value_str.ends_with('.') {
+                                state.display_override = Some(value_str);
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                                shell.request_redraw();
+                            } else if let Ok(mut parsed) = value_str.parse() {
                                 if parsed > self.max {
                                     parsed = self.max.clone();
                                 } else if parsed < self.min {
                                     parsed = self.min.clone();
                                 }
+                                state.display_override = if parsed.to_string() != value_str {
+                                    Some(value_str)
+                                } else {
+                                    None
+                                };
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
-                                state.is_decimal_partial = false;
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
                             } else {
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
-                                    state.is_decimal_partial = false;
-                                } else if self.value.to_string().ends_with('.') {
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
-                                    state.is_decimal_partial = true;
+                                    state.display_override = None;
                                 } else {
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                 }
                                 shell.request_redraw();
                             }
@@ -1611,11 +1670,9 @@ where
                             state.keyboard_modifiers = keyboard::Modifiers::default();
 
                             if let Some(on_input) = &self.on_input {
-                                if state.is_decimal_partial {
-                                    // Trim trailing dot and publish the clean numeric value
-                                    let raw = self.value.to_string();
-                                    let clean = raw.trim_end_matches('.');
-                                    if let Ok(mut parsed) = clean.parse::<T>() {
+                                if let Some(display) = state.display_override.clone() {
+                                    let to_parse = display.trim_end_matches('.');
+                                    if let Ok(mut parsed) = to_parse.parse::<T>() {
                                         if parsed > self.max {
                                             parsed = self.max.clone();
                                         } else if parsed < self.min {
@@ -1623,7 +1680,7 @@ where
                                         }
                                         shell.publish((on_input)(parsed));
                                     }
-                                    state.is_decimal_partial = false;
+                                    state.display_override = None;
                                     state.is_empty = false;
                                     state.is_empty_neg = false;
                                     shell.request_redraw();
@@ -1698,7 +1755,7 @@ where
 
                         state.is_empty = false;
                         state.is_empty_neg = false;
-                        state.is_decimal_partial = false;
+                        state.display_override = None;
                         state.is_pasting = Some(Paste::Pasting(value));
                         focus.updated_at = Instant::now();
                         update_cache(state, &self.value);
@@ -1706,7 +1763,7 @@ where
                         for _ in 0..content.len() {
                             editor.backspace();
                         }
-                        state.is_decimal_partial = false;
+                        state.display_override = None;
                     }
                     return;
                 }
@@ -1754,7 +1811,7 @@ where
                             shell.capture_event();
                             state.is_empty = false;
                             state.is_empty_neg = false;
-                            state.is_decimal_partial = false;
+                            state.display_override = None;
 
                             update_cache(state, &self.value);
                         } else {
@@ -1764,13 +1821,13 @@ where
                             if self.value.is_empty() {
                                 state.is_empty = true;
                                 state.is_empty_neg = false;
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                             } else if self.value.to_string() == *"-" {
                                 state.is_empty = false;
                                 state.is_empty_neg = true;
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                             } else {
-                                state.is_decimal_partial = false;
+                                state.display_override = None;
                             }
                             shell.request_redraw();
                             update_cache(state, &self.value);
@@ -1850,22 +1907,24 @@ where
                 self.line_height,
             );
             shell.request_redraw();
-        } else if state.is_decimal_partial && !self.value.to_string().ends_with('.') {
-            // The parent re-rendered with the last published (integer-part) value, stripping
-            // the trailing dot the user just typed.  Restore it so the display stays stable
-            // while the user continues typing decimal digits.
-            let with_dot = format!("{}.", self.value.to_string());
-            self.value = Value::new(&with_dot);
-            replace_paragraph(
-                renderer,
-                state,
-                layout,
-                &self.value,
-                self.font,
-                self.size,
-                self.line_height,
-            );
-            shell.request_redraw();
+        } else if let Some(display) = &state.display_override {
+            // The parent re-rendered with the canonical (shorter) value, e.g. "5" when
+            // the user had typed "5.", "5.0", or "5.50".  Restore the exact typed string
+            // so the display stays stable while the user continues editing.
+            let display = display.clone();
+            if self.value.to_string() != display {
+                self.value = Value::new(&display);
+                replace_paragraph(
+                    renderer,
+                    state,
+                    layout,
+                    &self.value,
+                    self.font,
+                    self.size,
+                    self.line_height,
+                );
+                shell.request_redraw();
+            }
         }
     }
 
@@ -1969,11 +2028,12 @@ pub struct State<P: text::Paragraph> {
     is_pasting: Option<Paste>,
     is_empty: bool,
     is_empty_neg: bool,
-    /// Tracks a trailing decimal point that has not yet been completed with digits
-    /// (e.g. the user just typed "25." on a float field). The visual value ends with
-    /// '.' but the last published value is still the integer part. Cleared as soon
-    /// as the next digit makes the value parse-able, or on unfocus/Escape.
-    is_decimal_partial: bool,
+    /// Stores the exact string the user has typed when it differs from the canonical
+    /// `T::to_string()` representation, e.g. `"5."`, `"5.0"`, `"5.50"`. Restored each
+    /// update call so the display does not collapse to the shorter canonical form while
+    /// the user is still editing.  Cleared on unfocus, Escape, or when the typed and
+    /// canonical strings agree again.
+    display_override: Option<String>,
     preedit: Option<input_method::Preedit>,
     last_click: Option<mouse::Click>,
     cursor: Cursor,
