@@ -792,6 +792,49 @@ where
             draw(renderer, text_bounds);
         }
     }
+
+    /// Runs the cleanup that must happen whenever the widget loses focus, regardless
+    /// of whether focus was lost via a mouse click, the Escape key, or a programmatic
+    /// operation (Tab navigation etc.).
+    ///
+    /// Publishes a clean numeric value when the display is in a partial state
+    /// (trailing dot, trailing zeros, empty field).  Returns `true` when a message
+    /// was published or a redraw was requested so the caller can decide whether to
+    /// also call `shell.capture_event()`.
+    fn on_unfocus(
+        &self,
+        state: &mut State<Renderer::Paragraph>,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let Some(on_input) = &self.on_input else {
+            return false;
+        };
+        if let Some(display) = state.display_override.clone() {
+            let to_parse = display.trim_end_matches('.');
+            if let Ok(mut parsed) = to_parse.parse::<T>() {
+                if parsed > self.max {
+                    parsed = self.max.clone();
+                } else if parsed < self.min {
+                    parsed = self.min.clone();
+                }
+                shell.publish((on_input)(parsed));
+            }
+            state.display_override = None;
+            state.is_empty = false;
+            state.is_empty_neg = false;
+            shell.request_redraw();
+            true
+        } else if self.value.to_string().parse::<T>().is_err() {
+            let message = on_input(T::default());
+            shell.publish(message);
+            state.is_empty = false;
+            state.is_empty_neg = false;
+            shell.request_redraw();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -966,6 +1009,15 @@ where
         };
 
         let state = state::<Renderer>(tree);
+
+        // Detect operation-driven unfocus (e.g. Tab / Shift+Tab navigation).
+        // Operations mutate state directly without going through update(), so we
+        // compare against the focus state recorded at the end of the previous call
+        // and run the same cleanup as click-away / Escape when focus was revoked.
+        if state.was_focused && !state.is_focused() {
+            self.on_unfocus(state, shell);
+        }
+
         match &event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
@@ -1072,32 +1124,9 @@ where
 
                         shell.capture_event();
                     } else {
-                        // Widget was unfocused, clean up any partial state
-                        if let Some(on_input) = &self.on_input {
-                            if let Some(display) = state.display_override.clone() {
-                                // Publish the clean value, trimming any trailing dot
-                                let to_parse = display.trim_end_matches('.');
-                                if let Ok(mut parsed) = to_parse.parse::<T>() {
-                                    if parsed > self.max {
-                                        parsed = self.max.clone();
-                                    } else if parsed < self.min {
-                                        parsed = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(parsed));
-                                }
-                                state.display_override = None;
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
-                                shell.capture_event();
-                            } else if self.value.to_string().parse::<T>().is_err() {
-                                let message = on_input(T::default());
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
-                                shell.capture_event();
-                            }
+                        // Widget was unfocused, clean up any partial state.
+                        if self.on_unfocus(state, shell) {
+                            shell.capture_event();
                         }
                     }
                 } else if state.is_focused() {
@@ -1503,7 +1532,7 @@ where
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
                                     state.display_override = None;
-                                    // Field was cleared — publish 0 (clamped to bounds).
+                                    // Field was cleared, publish 0 (clamped to bounds).
                                     let mut zero = T::default();
                                     if zero > self.max {
                                         zero = self.max.clone();
@@ -1735,30 +1764,7 @@ where
 
                             state.keyboard_modifiers = keyboard::Modifiers::default();
 
-                            if let Some(on_input) = &self.on_input {
-                                if let Some(display) = state.display_override.clone() {
-                                    let to_parse = display.trim_end_matches('.');
-                                    if let Ok(mut parsed) = to_parse.parse::<T>() {
-                                        if parsed > self.max {
-                                            parsed = self.max.clone();
-                                        } else if parsed < self.min {
-                                            parsed = self.min.clone();
-                                        }
-                                        shell.publish((on_input)(parsed));
-                                    }
-                                    state.display_override = None;
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
-                                    shell.request_redraw();
-                                } else if self.value.to_string().parse::<T>().is_err() {
-                                    let message = on_input(T::default());
-                                    shell.publish(message);
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
-                                    shell.request_redraw();
-                                }
-                            }
-
+                            self.on_unfocus(state, shell);
                             shell.capture_event();
                         }
                         _ => {}
@@ -1992,6 +1998,9 @@ where
                 shell.request_redraw();
             }
         }
+
+        // Record focus state so the next update() call can detect operation-driven unfocus.
+        state.was_focused = state.is_focused();
     }
 
     fn draw(
@@ -2090,6 +2099,10 @@ pub struct State<P: text::Paragraph> {
     placeholder: paragraph::Plain<P>,
     icon: paragraph::Plain<P>,
     is_focused: Option<Focus>,
+    /// Mirrors `is_focused.is_some()` as of the previous `update()` call.
+    /// Used to detect when focus was revoked by an operation (e.g. Tab
+    /// navigation) between frames rather than by a handled event.
+    was_focused: bool,
     is_dragging: bool,
     is_pasting: Option<Paste>,
     is_empty: bool,
