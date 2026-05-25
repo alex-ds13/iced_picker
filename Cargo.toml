@@ -7,10 +7,6 @@ edition = "2024"
 name = "iced_picker"
 path = "src/lib.rs"
 
-[[bin]]
-name = "iced_picker"
-path = "src/main.rs"
-
 [dependencies]
 iced = { version = "0.15.0-dev", features = ["advanced", "canvas", "debug", "smol"] }
 iced_core = "0.15.0-dev"
