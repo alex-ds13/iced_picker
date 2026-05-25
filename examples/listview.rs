@@ -2,10 +2,11 @@ use iced_picker::listview::listview;
 use iced::{
     Alignment, Element, Fill, Length, Shrink, Task, Theme,
     widget::{
-        button, center, column, container, operation::AbsoluteOffset, row, scrollable, space,
-        text, text_input,
+        button, center, checkbox, column, container,
+        operation::AbsoluteOffset, row, scrollable, space, text, text_input,
     },
 };
+use std::collections::HashSet;
 
 fn main() -> iced::Result {
     iced::application(List::default, List::update, List::view)
@@ -17,7 +18,9 @@ fn main() -> iced::Result {
 struct List {
     content: Vec<(usize, ItemState)>,
     filter: usize,
-    selected: Option<usize>,
+    selection: HashSet<usize>,
+    single_selection: bool,
+    scroll_to_selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,8 @@ enum Message {
     Selected(usize, f32),
     Deselected(usize),
     FilterChanged(String),
+    SingleSelectionToggled(bool),
+    ScrollToSelectedToggled(bool),
 }
 
 impl List {
@@ -46,34 +51,60 @@ impl List {
             }
             Message::Remove(pos) => {
                 self.content.remove(pos);
-                self.selected = match self.selected {
-                    Some(sel) if sel == pos => None,
-                    Some(sel) if sel > pos => Some(sel - 1),
-                    other => other,
-                };
+                self.selection = self
+                    .selection
+                    .iter()
+                    .filter(|&&i| i != pos)
+                    .map(|&i| if i > pos { i - 1 } else { i })
+                    .collect();
             }
             Message::Selected(pos, offset) => {
-                self.selected = Some(pos);
-                return iced::widget::operation::scroll_to(
-                    "SCROLLABLE",
-                    AbsoluteOffset { x: 0.0, y: offset },
-                );
+                if self.single_selection {
+                    self.selection = HashSet::from([pos]);
+                } else {
+                    self.selection.insert(pos);
+                }
+                if self.scroll_to_selected {
+                    return iced::widget::operation::scroll_to(
+                        "SCROLLABLE",
+                        AbsoluteOffset { x: 0.0, y: offset },
+                    );
+                }
             }
-            Message::Deselected(_) => {
-                self.selected = None;
+            Message::Deselected(pos) => {
+                self.selection.remove(&pos);
             }
             Message::FilterChanged(s) => {
                 self.filter = s.parse().unwrap_or_default();
-                self.selected = None;
+                self.selection.clear();
+            }
+            Message::SingleSelectionToggled(v) => {
+                self.single_selection = v;
+                self.selection.clear();
+            }
+            Message::ScrollToSelectedToggled(v) => {
+                self.scroll_to_selected = v;
             }
         }
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let options = row![
+            checkbox(self.single_selection)
+                .label("Single selection")
+                .on_toggle(Message::SingleSelectionToggled),
+            checkbox(self.scroll_to_selected)
+                .label("Scroll to selected")
+                .on_toggle(Message::ScrollToSelectedToggled),
+        ]
+        .spacing(20);
+
         let filter_input = row![
-            text("Show IDs ≥ "),
-            text_input("0", &self.filter.to_string()).on_input(Message::FilterChanged),
+            text("Show IDs ≥"),
+            text_input("0", &self.filter.to_string())
+                .on_input(Message::FilterChanged)
+                .width(80),
         ]
         .spacing(5)
         .align_y(Alignment::Center);
@@ -84,72 +115,80 @@ impl List {
             .enumerate()
             .filter_map(|(pos, (id, _))| (*id >= self.filter).then_some(pos));
 
-        let list = listview(
-            &self.content,
-            |pos, (id, state), _selected| -> Element<Message> {
-                row![
-                    match state {
-                        ItemState::Closed => Element::from(text(format!("Item {id}"))),
-                        ItemState::Opened => center(
-                            column![
-                                text(format!("Item {id} (expanded)")),
-                                text("Extra detail row"),
-                                text("Another detail row"),
-                            ]
-                            .spacing(8)
-                        )
-                        .height(120)
-                        .into(),
-                    },
-                    space::horizontal().width(Fill),
-                    button(match state {
-                        ItemState::Closed => "Expand",
-                        ItemState::Opened => "Collapse",
-                    })
-                    .on_press(Message::Toggle(pos)),
-                    button("Remove")
-                        .on_press(Message::Remove(pos))
-                        .style(button::danger),
-                ]
-                .spacing(10)
-                .padding(5)
-                .align_y(Alignment::Center)
-                .height(Shrink)
-                .width(Length::Fill)
-                .into()
-            },
-        )
-        .on_selected(Message::Selected)
-        .on_deselected(Message::Deselected)
-        .select_maybe(self.selected)
-        .single_selection()
-        .filter(filtered_positions);
+        let list = {
+            let base = listview(
+                &self.content,
+                |pos, (id, state), _selected| -> Element<Message> {
+                    row![
+                        match state {
+                            ItemState::Closed => Element::from(text(format!("Item {id}"))),
+                            ItemState::Opened => center(
+                                column![
+                                    text(format!("Item {id} (expanded)")),
+                                    text("Extra detail row"),
+                                    text("Another detail row"),
+                                ]
+                                .spacing(8),
+                            )
+                            .height(120)
+                            .into(),
+                        },
+                        space::horizontal().width(Fill),
+                        button(match state {
+                            ItemState::Closed => "Expand",
+                            ItemState::Opened => "Collapse",
+                        })
+                        .on_press(Message::Toggle(pos)),
+                        button("Remove")
+                            .on_press(Message::Remove(pos))
+                            .style(button::danger),
+                    ]
+                    .spacing(10)
+                    .padding(5)
+                    .align_y(Alignment::Center)
+                    .height(Shrink)
+                    .width(Length::Fill)
+                    .into()
+                },
+            )
+            .on_selected(Message::Selected)
+            .on_deselected(Message::Deselected)
+            .filter(filtered_positions);
 
-        let count = self
+            let base = if self.single_selection {
+                base.single_selection()
+            } else {
+                base.multiple_selection()
+            };
+
+            self.selection.iter().fold(base, |lv, &idx| lv.select(idx))
+        };
+
+        let visible_count = self
             .content
             .iter()
             .filter(|(id, _)| *id >= self.filter)
             .count();
 
         let status = text(format!(
-            "{} of {} items shown{}",
-            count,
+            "{} of {} items  ·  {} selected",
+            visible_count,
             self.content.len(),
-            self.selected
-                .map(|pos| format!(
-                    " · selected item {}",
-                    self.content.get(pos).map(|(id, _)| *id).unwrap_or(pos)
-                ))
-                .unwrap_or_default()
+            self.selection.len(),
         ));
 
         center(
             column![
+                options,
                 filter_input,
                 status,
-                scrollable(container(list).width(Fill).padding(10))
-                    .id("SCROLLABLE")
-                    .height(Fill),
+                container(
+                    scrollable(container(list).width(Fill).padding(10))
+                        .id("SCROLLABLE")
+                        .height(Fill),
+                )
+                .style(container::bordered_box)
+                .height(Fill),
             ]
             .spacing(10)
             .padding(10)
@@ -176,7 +215,9 @@ impl Default for List {
                 })
                 .collect(),
             filter: 0,
-            selected: None,
+            selection: HashSet::new(),
+            single_selection: true,
+            scroll_to_selected: true,
         }
     }
 }

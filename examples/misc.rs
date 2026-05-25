@@ -3,7 +3,7 @@ use iced_picker::{
     modal::{self, modal},
     number_input::NumberInput,
     text_input::TextInput,
-    tooltip::{Open, Position, tooltip},
+    tooltip::{self, tooltip, Open, Position},
 };
 use iced::{
     Border, Center, Element, Fill, Shrink, Theme,
@@ -20,6 +20,7 @@ fn main() -> iced::Result {
 #[derive(Debug)]
 struct App {
     amount: f64,
+    formatted_amount: String,
     show_modal: bool,
     last_action: Option<String>,
 }
@@ -28,6 +29,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             amount: 42.50,
+            formatted_amount: "42.50 €".into(),
             show_modal: false,
             last_action: None,
         }
@@ -37,6 +39,7 @@ impl Default for App {
 #[derive(Clone, Debug)]
 enum Message {
     AmountChanged(f64),
+    FormattedChanged(String),
     OpenModal,
     CloseModal,
     Confirm,
@@ -52,12 +55,22 @@ impl App {
 
     fn update(&mut self, message: Message) {
         match message {
-            Message::AmountChanged(v) => self.amount = v,
+            Message::AmountChanged(v) => {
+                self.amount = v;
+                self.formatted_amount = format!("{:.2} €", v);
+            }
+            Message::FormattedChanged(s) => {
+                self.formatted_amount = s.clone();
+                let cleaned = s.trim().trim_end_matches('€').trim();
+                if let Ok(v) = cleaned.parse::<f64>() {
+                    self.amount = v;
+                }
+            }
             Message::OpenModal => self.show_modal = true,
             Message::CloseModal => self.show_modal = false,
             Message::Confirm => {
                 self.show_modal = false;
-                self.last_action = Some(format!("Confirmed: €{:.2}", self.amount));
+                self.last_action = Some(format!("Confirmed: {}", self.formatted_amount));
             }
             Message::Save => self.last_action = Some("Saved".into()),
             Message::SaveAs => self.last_action = Some("Save As...".into()),
@@ -78,9 +91,10 @@ impl App {
 
         let formatted_row = row![
             text("Formatted:").width(100),
-            TextInput::new("€0.00", format!("€{:.2}", self.amount))
+            TextInput::new("0.00 €", self.formatted_amount.as_str())
                 .padding([0, 5])
-                .line_height(1.85),
+                .line_height(1.85)
+                .on_input(Message::FormattedChanged),
         ]
         .spacing(10)
         .align_y(Center);
@@ -111,7 +125,7 @@ impl App {
         let modal_content = container(
             column![
                 text("Are you sure?").size(20),
-                text(format!("Save with amount: €{:.2}", self.amount)),
+                text(format!("Save with amount: {}", self.formatted_amount)),
                 row![
                     button("Cancel")
                         .on_press(Message::CloseModal)
@@ -148,13 +162,6 @@ fn save_buttons_row() -> Element<'static, Message> {
 
     let dropdown_items = container(
         column![
-            button("Save As...")
-                .width(Fill)
-                .on_press(Message::SaveAs)
-                .style(|t: &Theme, s| match s {
-                    button::Status::Active => button::text(t, s),
-                    _ => button::background(t, s),
-                }),
             button("Backup")
                 .width(Fill)
                 .on_press(Message::Backup)
@@ -162,31 +169,31 @@ fn save_buttons_row() -> Element<'static, Message> {
                     button::Status::Active => button::text(t, s),
                     _ => button::background(t, s),
                 }),
+            button("Save As")
+                .on_press(Message::SaveAs)
+                .style(|t: &Theme, s| match s {
+                    button::Status::Active => button::text(t, s),
+                    _ => button::background(t, s),
+                }),
         ]
-        .spacing(2)
         .width(Shrink),
     )
-    .padding(5)
-    .style(container::bordered_box);
+    .style(container::bordered_box)
+    .padding(10);
 
-    let dropdown_trigger = button(text("▾").size(12).center())
-        .style(|t: &Theme, _| {
-            let s = button::Status::Active;
-            iced::widget::button::Style {
-                border: Border {
-                    radius: iced::border::right(4.0),
-                    ..button::primary(t, s).border
-                },
-                ..button::primary(t, s)
-            }
-        });
-
-    let dropdown = tooltip(dropdown_trigger, dropdown_items)
+    let dropdown = tooltip(text("▾").size(14).center(), dropdown_items)
         .open(Open::LeftPointer)
-        .position(Position::BottomLeft)
-        .gap(2.0);
+        .position(Position::TopRight)
+        .content_style(|t: &Theme, s| tooltip::Style {
+            border: Border {
+                radius: iced::border::right(4.0),
+                ..tooltip::primary(t, s).border
+            },
+            ..tooltip::primary(t, s)
+        });
 
     row![save_btn, button_separator(), dropdown]
         .align_y(Center)
+        .width(Shrink)
         .into()
 }

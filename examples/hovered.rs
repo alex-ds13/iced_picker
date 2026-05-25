@@ -55,22 +55,25 @@ impl App {
         });
 
         let nested = hovered(|outer| {
-            column![
-                text(if outer { "Outer hovered" } else { "Hover anywhere" }),
-                hovered(|inner| {
-                    container(text(if inner { "Inner hovered!" } else { "Inner area" }))
-                        .padding(10)
-                        .style(move |t| {
-                            if inner {
-                                container::dark(t)
-                            } else {
-                                container::rounded_box(t)
-                            }
-                        })
-                }),
-            ]
-            .spacing(5)
+            container(
+                column![
+                    text(if outer { "Outer hovered" } else { "Hover anywhere" }),
+                    hovered(|inner| {
+                        container(text(if inner { "Inner hovered!" } else { "Inner area" }))
+                            .padding(10)
+                            .style(move |t| {
+                                if inner {
+                                    container::dark(t)
+                                } else {
+                                    container::rounded_box(t)
+                                }
+                            })
+                    }),
+                ]
+                .spacing(5),
+            )
             .padding(10)
+            .style(container::bordered_box)
         });
 
         center(column![label_style, text_size, nested].spacing(30)).into()

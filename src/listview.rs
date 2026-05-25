@@ -295,11 +295,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                                     } else {
                                         None
                                     },
-                                    text_color: if selected {
-                                        palette.primary.base.text
-                                    } else {
-                                        palette.background.base.text
-                                    },
+                                    text_color: palette.background.base.text,
                                     border: iced::Border::default(),
                                     shadow: iced::Shadow::default(),
                                     snap: false,
