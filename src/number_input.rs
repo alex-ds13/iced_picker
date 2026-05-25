@@ -1191,6 +1191,16 @@ where
 
                             let value_str = self.value.to_string();
                             if value_str.ends_with('.') {
+                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
+                                let prefix = &value_str[..value_str.len() - 1];
+                                if let Ok(mut parsed) = prefix.parse::<T>() {
+                                    if parsed > self.max {
+                                        parsed = self.max.clone();
+                                    } else if parsed < self.min {
+                                        parsed = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(parsed));
+                                }
                                 state.display_override = Some(value_str);
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
@@ -1213,6 +1223,14 @@ where
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
                                     state.display_override = None;
+                                    // Field was cleared — publish 0 (clamped to bounds).
+                                    let mut zero = T::default();
+                                    if zero > self.max {
+                                        zero = self.max.clone();
+                                    } else if zero < self.min {
+                                        zero = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(zero));
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
@@ -1346,7 +1364,19 @@ where
                                         editor.insert('0');
                                         editor.insert('.');
                                     }
-                                    state.display_override = Some(editor.contents());
+                                    // Publish the integer part immediately
+                                    // (e.g. "5."->5, "0."->0, "-0."->-0).
+                                    let current = editor.contents();
+                                    let int_part = &current[..current.len() - 1];
+                                    if let Ok(mut parsed) = int_part.parse::<T>() {
+                                        if parsed > self.max {
+                                            parsed = self.max.clone();
+                                        } else if parsed < self.min {
+                                            parsed = self.min.clone();
+                                        }
+                                        shell.publish((on_input)(parsed));
+                                    }
+                                    state.display_override = Some(current);
                                     state.is_empty = false;
                                     state.is_empty_neg = false;
                                     shell.request_redraw();
@@ -1433,6 +1463,16 @@ where
                             if value_str.ends_with('.') {
                                 // Backspace left a trailing dot (e.g. "5.5"->"5.").
                                 // "5.".parse::<f64>() = Ok(5.0) so guard before parse.
+                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
+                                let prefix = &value_str[..value_str.len() - 1];
+                                if let Ok(mut parsed) = prefix.parse::<T>() {
+                                    if parsed > self.max {
+                                        parsed = self.max.clone();
+                                    } else if parsed < self.min {
+                                        parsed = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(parsed));
+                                }
                                 state.display_override = Some(value_str);
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
@@ -1463,6 +1503,14 @@ where
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
                                     state.display_override = None;
+                                    // Field was cleared — publish 0 (clamped to bounds).
+                                    let mut zero = T::default();
+                                    if zero > self.max {
+                                        zero = self.max.clone();
+                                    } else if zero < self.min {
+                                        zero = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(zero));
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
@@ -1496,6 +1544,16 @@ where
 
                             let value_str = self.value.to_string();
                             if value_str.ends_with('.') {
+                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
+                                let prefix = &value_str[..value_str.len() - 1];
+                                if let Ok(mut parsed) = prefix.parse::<T>() {
+                                    if parsed > self.max {
+                                        parsed = self.max.clone();
+                                    } else if parsed < self.min {
+                                        parsed = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(parsed));
+                                }
                                 state.display_override = Some(value_str);
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
@@ -1520,6 +1578,14 @@ where
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
                                     state.display_override = None;
+                                    // Field was cleared, publish 0 (clamped to bounds).
+                                    let mut zero = T::default();
+                                    if zero > self.max {
+                                        zero = self.max.clone();
+                                    } else if zero < self.min {
+                                        zero = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(zero));
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
