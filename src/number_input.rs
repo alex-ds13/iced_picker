@@ -1072,17 +1072,33 @@ where
 
                         shell.capture_event();
                     } else {
-                        // Widget was unfocused, lets check if the current value is valid, if it
-                        // isn't we send the default value
-                        if let Some(on_input) = &self.on_input
-                            && self.value.to_string().parse::<T>().is_err()
-                        {
-                            let message = on_input(T::default());
-                            shell.publish(message);
-                            state.is_empty = false;
-                            state.is_empty_neg = false;
-                            shell.request_redraw();
-                            shell.capture_event();
+                        // Widget was unfocused, clean up any partial state
+                        if let Some(on_input) = &self.on_input {
+                            if state.is_decimal_partial {
+                                // Trim trailing dot and publish the clean numeric value
+                                let raw = self.value.to_string();
+                                let clean = raw.trim_end_matches('.');
+                                if let Ok(mut parsed) = clean.parse::<T>() {
+                                    if parsed > self.max {
+                                        parsed = self.max.clone();
+                                    } else if parsed < self.min {
+                                        parsed = self.min.clone();
+                                    }
+                                    shell.publish((on_input)(parsed));
+                                }
+                                state.is_decimal_partial = false;
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                                shell.request_redraw();
+                                shell.capture_event();
+                            } else if self.value.to_string().parse::<T>().is_err() {
+                                let message = on_input(T::default());
+                                shell.publish(message);
+                                state.is_empty = false;
+                                state.is_empty_neg = false;
+                                shell.request_redraw();
+                                shell.capture_event();
+                            }
                         }
                     }
                 } else if state.is_focused() {
@@ -1182,13 +1198,22 @@ where
                                 }
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
+                                state.is_decimal_partial = false;
                             } else {
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
+                                    state.is_decimal_partial = false;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
+                                    state.is_decimal_partial = false;
+                                } else if self.value.to_string().ends_with('.') {
+                                    state.is_decimal_partial = true;
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                } else {
+                                    state.is_decimal_partial = false;
                                 }
                                 shell.request_redraw();
                             }
@@ -1237,6 +1262,7 @@ where
 
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
+                                state.is_decimal_partial = false;
                                 state.is_pasting = Some(Paste::Pasting(content.clone()));
                                 focus.updated_at = Instant::now();
                                 update_cache(state, &self.value);
@@ -1244,6 +1270,7 @@ where
                                 for _ in 0..content.len() {
                                     editor.backspace();
                                 }
+                                state.is_decimal_partial = false;
                             }
                             return;
                         }
@@ -1272,10 +1299,16 @@ where
                         state.is_pasting = None;
 
                         if let Some(c) = text.chars().next().filter(|c| !c.is_control()) {
+                            // Normalize locale decimal separator to '.'
+                            let c = if c == ',' { '.' } else { c };
+
                             let mut editor = Editor::new(&mut self.value, &mut state.cursor);
 
-                            if c.is_ascii_digit() || c == '-' || c == '.' || c == ',' {
-                                editor.insert(c);
+                            if c.is_ascii_digit() || c == '-' || c == '.' {
+                                // Block duplicate decimal points
+                                if c != '.' || !editor.contents().contains('.') {
+                                    editor.insert(c);
+                                }
                             }
 
                             if let Ok(mut parsed) = editor.contents().parse() {
@@ -1288,10 +1321,32 @@ where
                                 shell.publish(message);
                                 state.is_empty = false;
                                 state.is_empty_neg = false;
-                            } else if c == '-' && &editor.contents() == "-" {
+                                state.is_decimal_partial = false;
+                            } else if c == '-' && editor.contents() == "-" {
                                 state.is_empty = false;
                                 state.is_empty_neg = true;
+                                state.is_decimal_partial = false;
                                 shell.request_redraw();
+                            } else if c == '.' && editor.contents().ends_with('.') {
+                                // Trailing decimal point: allow as an intermediate state only
+                                // when T actually supports decimals (integers should reject it).
+                                let contents = editor.contents();
+                                let prefix = &contents[..contents.len() - 1];
+                                let test = if prefix.is_empty() {
+                                    "0.1".to_string()
+                                } else if prefix == "-" {
+                                    "-0.1".to_string()
+                                } else {
+                                    format!("{prefix}.1")
+                                };
+                                if test.parse::<T>().is_ok() {
+                                    state.is_decimal_partial = true;
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                    shell.request_redraw();
+                                } else {
+                                    editor.backspace();
+                                }
                             } else {
                                 editor.backspace();
                             }
@@ -1343,6 +1398,7 @@ where
                                 }
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
+                                state.is_decimal_partial = false;
 
                                 if cursor_before != state.cursor {
                                     shell.request_redraw();
@@ -1351,9 +1407,17 @@ where
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
+                                    state.is_decimal_partial = false;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
+                                    state.is_decimal_partial = false;
+                                } else if self.value.to_string().ends_with('.') {
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                    state.is_decimal_partial = true;
+                                } else {
+                                    state.is_decimal_partial = false;
                                 }
                                 shell.request_redraw();
                             }
@@ -1387,13 +1451,22 @@ where
                                 }
                                 let message = (on_input)(parsed);
                                 shell.publish(message);
+                                state.is_decimal_partial = false;
                             } else {
                                 if self.value.is_empty() {
                                     state.is_empty = true;
                                     state.is_empty_neg = false;
+                                    state.is_decimal_partial = false;
                                 } else if self.value.to_string() == *"-" {
                                     state.is_empty = false;
                                     state.is_empty_neg = true;
+                                    state.is_decimal_partial = false;
+                                } else if self.value.to_string().ends_with('.') {
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                    state.is_decimal_partial = true;
+                                } else {
+                                    state.is_decimal_partial = false;
                                 }
                                 shell.request_redraw();
                             }
@@ -1537,16 +1610,30 @@ where
 
                             state.keyboard_modifiers = keyboard::Modifiers::default();
 
-                            // Widget was unfocused, lets check if the current value is valid, if it
-                            // isn't we send the default value
-                            if let Some(on_input) = &self.on_input
-                                && self.value.to_string().parse::<T>().is_err()
-                            {
-                                let message = on_input(T::default());
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
+                            if let Some(on_input) = &self.on_input {
+                                if state.is_decimal_partial {
+                                    // Trim trailing dot and publish the clean numeric value
+                                    let raw = self.value.to_string();
+                                    let clean = raw.trim_end_matches('.');
+                                    if let Ok(mut parsed) = clean.parse::<T>() {
+                                        if parsed > self.max {
+                                            parsed = self.max.clone();
+                                        } else if parsed < self.min {
+                                            parsed = self.min.clone();
+                                        }
+                                        shell.publish((on_input)(parsed));
+                                    }
+                                    state.is_decimal_partial = false;
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                    shell.request_redraw();
+                                } else if self.value.to_string().parse::<T>().is_err() {
+                                    let message = on_input(T::default());
+                                    shell.publish(message);
+                                    state.is_empty = false;
+                                    state.is_empty_neg = false;
+                                    shell.request_redraw();
+                                }
                             }
 
                             shell.capture_event();
@@ -1611,6 +1698,7 @@ where
 
                         state.is_empty = false;
                         state.is_empty_neg = false;
+                        state.is_decimal_partial = false;
                         state.is_pasting = Some(Paste::Pasting(value));
                         focus.updated_at = Instant::now();
                         update_cache(state, &self.value);
@@ -1618,6 +1706,7 @@ where
                         for _ in 0..content.len() {
                             editor.backspace();
                         }
+                        state.is_decimal_partial = false;
                     }
                     return;
                 }
@@ -1665,6 +1754,7 @@ where
                             shell.capture_event();
                             state.is_empty = false;
                             state.is_empty_neg = false;
+                            state.is_decimal_partial = false;
 
                             update_cache(state, &self.value);
                         } else {
@@ -1674,9 +1764,13 @@ where
                             if self.value.is_empty() {
                                 state.is_empty = true;
                                 state.is_empty_neg = false;
+                                state.is_decimal_partial = false;
                             } else if self.value.to_string() == *"-" {
                                 state.is_empty = false;
                                 state.is_empty_neg = true;
+                                state.is_decimal_partial = false;
+                            } else {
+                                state.is_decimal_partial = false;
                             }
                             shell.request_redraw();
                             update_cache(state, &self.value);
@@ -1746,6 +1840,22 @@ where
             shell.request_redraw();
         } else if state.is_empty_neg && self.value.to_string() != *"-" {
             self.value = Value::new("-");
+            replace_paragraph(
+                renderer,
+                state,
+                layout,
+                &self.value,
+                self.font,
+                self.size,
+                self.line_height,
+            );
+            shell.request_redraw();
+        } else if state.is_decimal_partial && !self.value.to_string().ends_with('.') {
+            // The parent re-rendered with the last published (integer-part) value, stripping
+            // the trailing dot the user just typed.  Restore it so the display stays stable
+            // while the user continues typing decimal digits.
+            let with_dot = format!("{}.", self.value.to_string());
+            self.value = Value::new(&with_dot);
             replace_paragraph(
                 renderer,
                 state,
@@ -1859,6 +1969,11 @@ pub struct State<P: text::Paragraph> {
     is_pasting: Option<Paste>,
     is_empty: bool,
     is_empty_neg: bool,
+    /// Tracks a trailing decimal point that has not yet been completed with digits
+    /// (e.g. the user just typed "25." on a float field). The visual value ends with
+    /// '.' but the last published value is still the integer part. Cleared as soon
+    /// as the next digit makes the value parse-able, or on unfocus/Escape.
+    is_decimal_partial: bool,
     preedit: Option<input_method::Preedit>,
     last_click: Option<mouse::Click>,
     cursor: Cursor,
@@ -1909,7 +2024,7 @@ impl<P: text::Paragraph> State<P> {
             is_window_focused: true,
         });
 
-        self.move_cursor_to_end();
+        self.select_all();
     }
 
     /// Unfocuses the [`NumberInput`].
