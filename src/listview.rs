@@ -1,9 +1,48 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use iced::{
     Element, Fill, Renderer, Shrink, Theme,
     widget::{Action, Component, Id, button, column, component, container, sensor, space},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct Status {
+    pub button: button::Status,
+    pub selected: bool,
+    pub highlighted: bool,
+}
+
+pub type Style = button::Style;
+
+pub trait Catalog {
+    type Class<'a>;
+    fn default<'a>() -> Self::Class<'a>;
+    fn style(&self, class: &Self::Class<'_>, status: Status) -> Style;
+}
+
+pub type StyleFn<'a, Theme> = Rc<dyn Fn(&Theme, Status) -> Style + 'a>;
+
+impl Catalog for Theme {
+    type Class<'a> = StyleFn<'a, Self>;
+
+    fn default<'a>() -> Self::Class<'a> {
+        Rc::new(default_style)
+    }
+
+    fn style(&self, class: &Self::Class<'_>, status: Status) -> Style {
+        class(self, status)
+    }
+}
+
+pub fn default_style(theme: &Theme, status: Status) -> Style {
+    let Status {
+        button: button_status,
+        selected,
+        highlighted,
+    } = status;
+    listview_item_style(theme, button_status, selected, highlighted)
+}
 
 fn listview_item_style(
     theme: &Theme,
@@ -79,6 +118,7 @@ pub struct ListView<'a, 'b, T, Message> {
     on_selected: Option<Box<dyn Fn(usize, f32) -> Message + 'b>>,
     on_deselected: Option<Box<dyn Fn(usize) -> Message + 'b>>,
     clear_selection_maybe: Option<Message>,
+    class: <Theme as Catalog>::Class<'a>,
 }
 
 impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
@@ -98,6 +138,7 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
             on_selected: None,
             on_deselected: None,
             clear_selection_maybe: None,
+            class: <Theme as Catalog>::default(),
         }
     }
 
@@ -150,6 +191,16 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
 
     pub fn clear_selection_maybe(mut self, on_selection_cleared: Option<Message>) -> Self {
         self.clear_selection_maybe = on_selection_cleared;
+        self
+    }
+
+    pub fn style(mut self, style: impl Fn(&Theme, Status) -> Style + 'a) -> Self {
+        self.class = Rc::new(style);
+        self
+    }
+
+    pub fn class(mut self, class: impl Into<<Theme as Catalog>::Class<'a>>) -> Self {
+        self.class = class.into();
         self
     }
 
@@ -328,14 +379,23 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                         let item = container(
                             (self.view_item)(idx, item.clone(), selected).map(Event::Content),
                         );
+                        let class = self.class.clone();
                         button(item)
                             .on_press(if !selected {
                                 Event::Select(idx)
                             } else {
                                 Event::Deselect(idx)
                             })
-                            .style(move |theme: &Theme, status| {
-                                listview_item_style(theme, status, selected, highlighted)
+                            .style(move |theme: &Theme, button_status| {
+                                <Theme as Catalog>::style(
+                                    theme,
+                                    &class,
+                                    Status {
+                                        button: button_status,
+                                        selected,
+                                        highlighted,
+                                    },
+                                )
                             })
                             .into()
                     } else {
