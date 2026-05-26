@@ -5,6 +5,67 @@ use iced::{
     widget::{Action, Component, Id, button, column, component, container, sensor, space},
 };
 
+fn listview_item_style(
+    theme: &Theme,
+    status: button::Status,
+    selected: bool,
+    highlighted: bool,
+) -> button::Style {
+    let palette = theme.palette();
+
+    let text_color = match status {
+        button::Status::Disabled => palette.secondary.strong.color,
+        _ => palette.background.base.text,
+    };
+
+    let tint = |color: iced::Color, alpha: f32| iced::Color { a: alpha, ..color };
+
+    let background = match (status, selected) {
+        (button::Status::Disabled, _) => None,
+
+        (button::Status::Active, true) => Some(tint(palette.primary.base.color, 0.25).into()),
+        (button::Status::Hovered, true) => Some(tint(palette.primary.base.color, 0.35).into()),
+        (button::Status::Pressed, true) => Some(tint(palette.primary.base.color, 0.45).into()),
+
+        (button::Status::Active, false) => None,
+        (button::Status::Hovered, false) => Some(tint(palette.background.base.text, 0.06).into()),
+        (button::Status::Pressed, false) => Some(tint(palette.background.base.text, 0.12).into()),
+    };
+
+    let (border, shadow) = if highlighted {
+        let accent = palette.warning.base.color;
+        (
+            iced::Border {
+                color: accent,
+                width: 1.5,
+                radius: 0.0.into(),
+            },
+            iced::Shadow {
+                color: iced::Color { a: 0.45, ..accent },
+                offset: iced::Vector::new(0.0, 0.0),
+                blur_radius: 6.0,
+            },
+        )
+    } else {
+        (
+            iced::Border {
+                color: iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            iced::Shadow::default(),
+        )
+    };
+
+    button::Style {
+        background,
+        text_color,
+        border,
+        shadow,
+        snap: false,
+    }
+}
+
 pub static ITEM_HEIGHT: f32 = 40.8;
 
 pub struct ListView<'a, 'b, T, Message> {
@@ -273,33 +334,8 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                             } else {
                                 Event::Deselect(idx)
                             })
-                            .style(move |theme: &Theme, _status| {
-                                let palette = theme.palette();
-                                iced::widget::button::Style {
-                                    background: if selected {
-                                        Some(
-                                            iced::Color {
-                                                a: 0.3,
-                                                ..palette.primary.weak.color
-                                            }
-                                            .into(),
-                                        )
-                                    } else if highlighted {
-                                        Some(
-                                            iced::Color {
-                                                a: 0.15,
-                                                ..palette.primary.base.color
-                                            }
-                                            .into(),
-                                        )
-                                    } else {
-                                        None
-                                    },
-                                    text_color: palette.background.base.text,
-                                    border: iced::Border::default(),
-                                    shadow: iced::Shadow::default(),
-                                    snap: false,
-                                }
+                            .style(move |theme: &Theme, status| {
+                                listview_item_style(theme, status, selected, highlighted)
                             })
                             .into()
                     } else {
