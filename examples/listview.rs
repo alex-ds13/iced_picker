@@ -1,8 +1,8 @@
 use iced::{
     Alignment, Element, Fill, Length, Shrink, Task, Theme,
     widget::{
-        button, center, checkbox, column, container, operation::AbsoluteOffset, row, scrollable,
-        space, text, text_input,
+        button, center, checkbox, column, container, operation::AbsoluteOffset, pick_list, row,
+        scrollable, space, text, text_input,
     },
 };
 use iced_picker::listview::listview;
@@ -21,6 +21,7 @@ struct List {
     selection: HashSet<usize>,
     single_selection: bool,
     scroll_to_selected: bool,
+    theme: Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -33,11 +34,12 @@ enum Message {
     SingleSelectionToggled(bool),
     ScrollToSelectedToggled(bool),
     ClearSelection,
+    ThemeChanged(Theme),
 }
 
 impl List {
     fn theme(&self) -> Theme {
-        Theme::TokyoNight
+        self.theme.clone()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -89,11 +91,17 @@ impl List {
             Message::ClearSelection => {
                 self.selection.clear();
             }
+            Message::ThemeChanged(theme) => self.theme = theme,
         }
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let theme_picker = pick_list(Some(self.theme.clone()), Theme::ALL, |t: &Theme| {
+            t.to_string()
+        })
+        .on_select(Message::ThemeChanged);
+
         let options = row![
             checkbox(self.single_selection)
                 .label("Single selection")
@@ -101,8 +109,12 @@ impl List {
             checkbox(self.scroll_to_selected)
                 .label("Scroll to selected")
                 .on_toggle(Message::ScrollToSelectedToggled),
+            space::horizontal(),
+            text("Theme:"),
+            theme_picker,
         ]
-        .spacing(20);
+        .spacing(20)
+        .align_y(Alignment::Center);
 
         let filter_input = row![
             text("Show IDs ≥"),
@@ -233,6 +245,7 @@ impl Default for List {
             selection: HashSet::new(),
             single_selection: true,
             scroll_to_selected: false,
+            theme: Theme::TokyoNight,
         }
     }
 }
