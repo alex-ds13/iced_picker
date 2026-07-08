@@ -260,7 +260,7 @@ impl State {
 
 impl<'a, Message, Theme> Widget<Message, Theme, Renderer> for ColorPicker<'a, Message, Theme>
 where
-    Message: 'a + Clone,
+    Message: 'a + Clone + std::fmt::Debug,
     Theme: 'a
         + Catalog
         + iced::widget::button::Catalog
@@ -277,18 +277,7 @@ where
         tree::State::new(State::new(self.color))
     }
 
-    fn children(&self) -> Vec<Tree> {
-        let mut buttons_tree = Tree::empty();
-        buttons_tree.children = vec![
-            Tree::new(&self.cancel_button),
-            Tree::new(&self.submit_button),
-            Tree::empty(),
-            Tree::new(&self.hex_input as &dyn Widget<_, _, _>),
-        ];
-        vec![Tree::new(&self.underlay), buttons_tree]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         let color_picker_state = &mut tree.state.downcast_mut::<State>().overlay_state;
 
         if color_picker_state.color != self.color {
@@ -308,7 +297,7 @@ where
             color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
         }
 
-        tree.diff_children(&[&self.underlay, &self.overlay_el]);
+        tree.diff_children(&mut [&mut self.underlay, &mut self.overlay_el]);
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -430,7 +419,7 @@ where
 impl<'a, Message, Theme> From<ColorPicker<'a, Message, Theme>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Message: 'a + Clone,
+    Message: 'a + Clone + std::fmt::Debug,
     Theme: 'a
         + Catalog
         + iced::widget::button::Catalog
@@ -496,7 +485,7 @@ where
 
 impl<'a, 'b, Message, Theme> ColorPickerOverlay<'a, 'b, Message, Theme>
 where
-    Message: 'a + Clone,
+    Message: 'a + Clone + std::fmt::Debug,
     Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
@@ -1205,7 +1194,7 @@ where
 impl<'a, 'b, Message, Theme> Overlay<Message, Theme, Renderer>
     for ColorPickerOverlay<'a, 'b, Message, Theme>
 where
-    Message: 'a + Clone,
+    Message: 'a + Clone + std::fmt::Debug,
     Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
@@ -1245,10 +1234,8 @@ where
 
         let limits = Limits::new(Size::ZERO, bounds)
             .shrink(PADDING)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .max_width(max_width)
-            .max_height(max_height);
+            .width(Length::Fill.max(max_width))
+            .height(Length::Fill.max(max_height));
 
         let divider = if bounds.width > bounds.height {
             Row::<(), Theme, Renderer>::new()
@@ -1341,7 +1328,7 @@ where
 
         // ----------- Hex input ----------------------
         let mut fake_input_messages: Vec<InternalMessage> = Vec::new();
-        let mut fake_input_shell = Shell::new(&mut fake_input_messages);
+        let mut fake_input_shell = shell.local(&mut fake_input_messages);
 
         // if event was already captured, mark this fake shell with a captured_event as well
         if shell.event_status() == event::Status::Captured {
@@ -1403,7 +1390,7 @@ where
         );
 
         let mut fake_messages: Vec<Message> = Vec::new();
-        let mut fake_submit_shell = Shell::new(&mut fake_messages);
+        let mut fake_submit_shell = shell.local(&mut fake_messages);
 
         // if event was already captured, mark this fake shell with a captured_event as well
         if shell.event_status() == event::Status::Captured {
@@ -1445,14 +1432,15 @@ where
 
         if shell.is_event_captured() {
             if should_update_input {
-                let new_hex_input: TextInput<InternalMessage, InternalTheme<Theme>> = text_input(
-                    &self.state.color.as_hex_string(),
-                    &self.state.color.as_hex_string(),
-                )
-                .on_input(InternalMessage::ChangeInput)
-                .padding(PADDING)
-                .align_x(iced::Alignment::Center);
-                self.tree.children[3].diff(&new_hex_input as &dyn Widget<_, _, _>);
+                let mut new_hex_input: TextInput<InternalMessage, InternalTheme<Theme>> =
+                    text_input(
+                        &self.state.color.as_hex_string(),
+                        &self.state.color.as_hex_string(),
+                    )
+                    .on_input(InternalMessage::ChangeInput)
+                    .padding(PADDING)
+                    .align_x(iced::Alignment::Center);
+                self.tree.children[3].diff(&mut new_hex_input as &mut dyn Widget<_, _, _>);
                 *self.hex_input = new_hex_input;
             }
             self.state.clear();
@@ -1790,7 +1778,7 @@ where
     }
     let mut element: Element<Message, Theme, Renderer> = Element::new(rgba_colors);
     let rgba_tree = if let Some(child_tree) = color_picker.tree.children[2].children.get_mut(0) {
-        child_tree.diff(element.as_widget());
+        child_tree.diff(element.as_widget_mut());
         child_tree
     } else {
         let child_tree = Tree::new(element.as_widget());
@@ -1818,8 +1806,8 @@ where
     let hex_bounds = hex_text_layout.bounds();
 
     // Buttons
-    let cancel_limits =
-        block2_limits.max_width(((rgba_bounds.width / 2.0) - BUTTON_SPACING.0).max(0.0));
+    let cancel_limits = block2_limits
+        .width(Length::Fill.max(((rgba_bounds.width / 2.0) - BUTTON_SPACING.0).max(0.0)));
 
     let mut cancel_button = color_picker.cancel_button.as_widget_mut().layout(
         &mut color_picker.tree.children[0],
@@ -1827,8 +1815,8 @@ where
         &cancel_limits,
     );
 
-    let submit_limits =
-        block2_limits.max_width(((rgba_bounds.width / 2.0) - BUTTON_SPACING.0).max(0.0));
+    let submit_limits = block2_limits
+        .width(Length::Fill.max(((rgba_bounds.width / 2.0) - BUTTON_SPACING.0).max(0.0)));
 
     let mut submit_button = color_picker.submit_button.as_widget_mut().layout(
         &mut color_picker.tree.children[1],

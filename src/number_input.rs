@@ -853,26 +853,24 @@ where
         tree::State::new(State::<Renderer::Paragraph>::new())
     }
 
-    fn children(&self) -> Vec<Tree> {
-        vec![
-            Tree::new(&self.increment_button as &dyn Widget<_, _, _>),
-            Tree::new(&self.decrement_button as &dyn Widget<_, _, _>),
-        ]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
         // Stop pasting if input becomes disabled
         if self.on_input.is_none() {
             state.is_pasting = None;
         }
+
+        tree.diff_children(&mut [
+            &mut self.increment_button as &mut dyn Widget<_, _, _>,
+            &mut self.decrement_button as &mut dyn Widget<_, _, _>,
+        ]);
     }
 
     fn size(&self) -> Size<Length> {
         Size {
             width: self.width,
-            height: Length::Shrink,
+            height: Length::Fit,
         }
     }
 
@@ -921,7 +919,7 @@ where
             )
         };
         let mut buttons_messages = Vec::<ButtonMessage>::new();
-        let mut buttons_shell = Shell::new(&mut buttons_messages);
+        let mut buttons_shell = shell.local(&mut buttons_messages);
 
         // Reconcile buttons shell with main shell:
         if shell.is_event_captured() {

@@ -105,22 +105,14 @@ where
         tree::State::new(T::State::default())
     }
 
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         // The Tree diff is deferred to layout, here we simply call the component diff function to
         // diff the `State`
         self.component.diff(tree.state.downcast_mut());
     }
 
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::empty()]
-    }
-
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
-    }
-
-    fn size_hint(&self) -> Size<Length> {
-        self.component.size_hint()
     }
 
     fn layout(
@@ -131,7 +123,7 @@ where
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<T::State>();
         self.content = self.component.view(state);
-        tree.diff_children(std::slice::from_ref(&self.content));
+        tree.diff_children(std::slice::from_mut(&mut self.content));
 
         let node = self
             .content
@@ -153,7 +145,7 @@ where
         viewport: &Rectangle,
     ) {
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = shell.local(&mut local_messages);
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -168,7 +160,7 @@ where
             shell.capture_event();
         }
 
-        local_shell.revalidate_layout(|| shell.invalidate_layout());
+        local_shell.revalidate_layout(|diff| shell.invalidate_layout_with(diff));
         shell.request_redraw_at(local_shell.redraw_request());
         shell.request_input_method(local_shell.input_method());
 
@@ -327,7 +319,7 @@ where
         shell: &mut Shell<'_, Message>,
     ) {
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = shell.local(&mut local_messages);
         self.element
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, &mut local_shell);
@@ -336,7 +328,7 @@ where
             shell.capture_event();
         }
 
-        local_shell.revalidate_layout(|| shell.invalidate_layout());
+        local_shell.revalidate_layout(|diff| shell.invalidate_layout_with(diff));
         shell.request_redraw_at(local_shell.redraw_request());
         shell.request_input_method(local_shell.input_method());
 

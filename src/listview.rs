@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use iced::{
-    Element, Fill, Renderer, Shrink, Theme,
+    Element, Fill, Fit, Renderer, Theme,
     widget::{Action, Component, Id, button, column, component, container, sensor, space},
 };
 
@@ -416,14 +416,14 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
         content.into()
     }
 
-    fn size_hint(&self) -> iced::Size<iced::Length> {
+    fn size(&self) -> iced::Size<iced::Length> {
         iced::Size {
             width: Fill,
-            height: Shrink,
+            height: Fit,
         }
     }
 
-    fn diff(&self, state: &mut Self::State) {
+    fn diff(&mut self, state: &mut Self::State) {
         if !state.initialized {
             state.heights = self
                 .items
