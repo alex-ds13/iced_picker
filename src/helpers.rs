@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 use crate::text_input::TextInput;
 use iced::widget::{
-    button, container, row, rule,
+    Button, Row, Rule, Text, button, container, row, rule,
     text::{self, IntoFragment},
-    tooltip, Button, Row, Rule, Text,
+    tooltip,
 };
-use iced::{Center, Color, Element, Fill, Fit, Task, Theme};
+use iced::{Center, Color, Element, Fit, Task, Theme};
 
 pub fn label<'a, Message>(label: impl Into<Text<'a>>) -> Row<'a, Message> {
     Row::new().push(label.into()).align_y(Center).height(30.0)
