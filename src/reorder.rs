@@ -3,7 +3,9 @@
 //! Press a row and move past a small deadband to drag it. The row floats under
 //! the cursor while an insertion line marks where it will drop. A press and
 //! release without movement is left to the row's own widget, so a button row
-//! still registers a click.
+//! still registers a click. In live mode ([`Reorder::live`]) the reorder is
+//! emitted while the drag happens and the empty slot follows the row, instead
+//! of the insertion line.
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
@@ -11,7 +13,8 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::alignment::Alignment;
 use iced::{
-    Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size, Vector, mouse, touch,
+    Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size, Vector, mouse,
+    touch,
 };
 
 /// How far the cursor must travel from the press point before a press turns
@@ -29,6 +32,7 @@ where
     spacing: f32,
     padding: Padding,
     width: Length,
+    live: bool,
     on_reorder: Option<Box<dyn Fn(usize, usize) -> Message + 'a>>,
     class: Theme::Class<'a>,
 }
@@ -45,6 +49,7 @@ where
             spacing: 0.0,
             padding: Padding::ZERO,
             width: Length::Fill,
+            live: false,
             on_reorder: None,
             class: Theme::default(),
         }
@@ -92,6 +97,17 @@ where
         self
     }
 
+    /// Reorders live while dragging: as soon as the dragged row would land in
+    /// a new slot, [`Self::on_reorder`] is emitted and the empty slot follows
+    /// it, instead of showing an insertion line and emitting only on drop.
+    ///
+    /// This assumes the application applies every emitted reorder to its rows.
+    /// One that is ignored leaves the tracked slot out of sync until the drop.
+    pub fn live(mut self, live: bool) -> Self {
+        self.live = live;
+        self
+    }
+
     /// Sets the style of the list.
     #[must_use]
     pub fn style(mut self, style: impl Fn(&Theme, Status) -> Style + 'a) -> Self
@@ -136,7 +152,7 @@ enum Action {
     /// A row is being dragged.
     Dragging {
         index: usize,
-        origin: Point,
+        grab_offset: Vector,
         cursor: Point,
     },
 }
@@ -158,16 +174,15 @@ fn row_at(layout: Layout<'_>, point: Point) -> Option<usize> {
         .position(|row| row.bounds().contains(point))
 }
 
-/// The target index for a row dragged from `from` and dropped at `cursor`. The
-/// raw insertion index counts the rows whose midpoint sits above the cursor,
-/// then shifts down by one when it lands past the moved row so the app can
-/// `remove(from)` then `insert(to, item)`.
-fn drop_index(layout: Layout<'_>, cursor: Point, from: usize) -> usize {
+/// The target index for a row dragged to `cursor`: the slot whose row the
+/// cursor is over (the count of rows fully above it), clamped to the last row.
+/// It is the `to` of a `remove(from)` then `insert(to, item)`.
+fn drop_index(layout: Layout<'_>, cursor: Point) -> usize {
     let ins = layout
         .children()
-        .filter(|row| row.bounds().center_y() < cursor.y)
+        .filter(|row| row.bounds().y + row.bounds().height < cursor.y)
         .count();
-    if ins > from { ins - 1 } else { ins }
+    ins.min(layout.children().len().saturating_sub(1))
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -267,8 +282,15 @@ where
         };
 
         // While not dragging, the children see every event, so a press and
-        // release without movement still fires the row's own click.
-        if !dragging {
+        // release without movement still fires the row's own click. A drag
+        // swallows everything except redraw housekeeping, which the children
+        // still need to keep their visual state fresh.
+        if !dragging
+            || matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            )
+        {
             for ((child, tree), layout) in self
                 .children
                 .iter_mut()
@@ -296,24 +318,44 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { .. })
             | Event::Touch(touch::Event::FingerMoved { .. }) => {
-                let Some(position) = cursor.position() else {
+                let Some(position) = cursor.land().position() else {
                     return;
                 };
                 let state = tree.state.downcast_mut::<State>();
                 match state.action {
                     Action::Pending { index, origin } if position.distance(origin) > DEADBAND => {
+                        let row = layout
+                            .children()
+                            .nth(index)
+                            .map(|row| row.bounds().position())
+                            .unwrap_or(origin);
                         state.action = Action::Dragging {
                             index,
-                            origin,
+                            grab_offset: origin - row,
                             cursor: position,
                         };
                         shell.capture_event();
                         shell.request_redraw();
                     }
-                    Action::Dragging { index, origin, .. } => {
+                    Action::Dragging {
+                        index, grab_offset, ..
+                    } => {
+                        let index = if self.live {
+                            let to = drop_index(layout, position);
+                            if to != index
+                                && let Some(on_reorder) = &self.on_reorder
+                            {
+                                shell.publish(on_reorder(index, to));
+                                to
+                            } else {
+                                index
+                            }
+                        } else {
+                            index
+                        };
                         state.action = Action::Dragging {
                             index,
-                            origin,
+                            grab_offset,
                             cursor: position,
                         };
                         shell.capture_event();
@@ -339,8 +381,8 @@ where
 
                 if let Some((index, drop_cursor)) = drag {
                     // Forward the release once so the source row's button clears
-                    // its pressed state. Its bounds are not under the cursor at
-                    // a real drop, so it publishes nothing.
+                    // its pressed state. Levitate the cursor so it publishes nothing.
+                    let cursor = cursor.levitate();
                     for ((child, tree), layout) in self
                         .children
                         .iter_mut()
@@ -352,13 +394,17 @@ where
                             .update(tree, event, layout, cursor, renderer, shell, viewport);
                     }
 
-                    let to = drop_index(layout, drop_cursor, index);
-                    if to != index
-                        && let Some(on_reorder) = &self.on_reorder
-                    {
-                        shell.publish(on_reorder(index, to));
+                    // A live drag already emitted every move while it happened.
+                    if !self.live {
+                        let to = drop_index(layout, drop_cursor);
+                        if to != index
+                            && let Some(on_reorder) = &self.on_reorder
+                        {
+                            shell.publish(on_reorder(index, to));
+                        }
                     }
                     shell.capture_event();
+                    shell.request_redraw();
                 }
             }
             _ => {}
@@ -402,12 +448,23 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        for ((child, tree), layout) in self
+        let dragged = match tree.state.downcast_ref::<State>().action {
+            Action::Dragging { index, .. } => Some(index),
+            _ => None,
+        };
+
+        for (i, ((child, tree), layout)) in self
             .children
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
+            .enumerate()
         {
+            // The dragged row only appears in the overlay, so its slot stays
+            // an empty gap of the same size.
+            if Some(i) == dragged {
+                continue;
+            }
             child
                 .as_widget()
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
@@ -425,19 +482,30 @@ where
         let appearance = <Theme as Catalog>::style(theme, &self.class, Status::Dragging);
         let rows: Vec<Rectangle> = layout.children().map(|l| l.bounds()).collect();
 
-        // Dim the source slot, since the row itself is floating in the overlay.
         if let Some(bounds) = rows.get(index) {
             renderer.fill_quad(
                 Quad {
                     bounds: *bounds,
+                    border: appearance.slot_border,
                     ..Quad::default()
                 },
-                appearance.dragged_overlay,
+                appearance.slot_background,
             );
         }
 
+        // A live drag moves the slot itself, so it needs no insertion line.
+        if self.live {
+            return;
+        }
+
         // The insertion line sits at the gap the row would drop into.
-        let ins = rows.iter().filter(|b| b.center_y() < drop_cursor.y).count();
+        let ins = drop_index(layout, drop_cursor);
+
+        // If hovering over the same place it was grabbed don't draw insertion line.
+        if ins == index {
+            return;
+        }
+
         let content = layout.bounds();
         let x = content.x + self.padding.left;
         let width = (content.width - self.padding.left - self.padding.right).max(0.0);
@@ -445,10 +513,12 @@ where
             content.y
         } else if ins == 0 {
             rows[0].y
-        } else if ins >= rows.len() {
+        } else if ins >= rows.len() - 1 {
             rows[rows.len() - 1].y + rows[rows.len() - 1].height
-        } else {
+        } else if ins < index {
             (rows[ins - 1].y + rows[ins - 1].height + rows[ins].y) / 2.0
+        } else {
+            (rows[ins].y + rows[ins].height + rows[ins + 1].y) / 2.0
         };
         renderer.fill_quad(
             Quad {
@@ -472,7 +542,9 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        if let Action::Dragging { index, origin, .. } = tree.state.downcast_ref::<State>().action
+        if let Action::Dragging {
+            index, grab_offset, ..
+        } = tree.state.downcast_ref::<State>().action
             && index < self.children.len()
             && let Some(child_layout) = layout.children().nth(index)
         {
@@ -480,7 +552,7 @@ where
                 content: &self.children[index],
                 tree: &tree.children[index],
                 layout: child_layout,
-                origin,
+                grab_offset,
             })));
         }
 
@@ -500,7 +572,7 @@ struct PickedRow<'a, 'b, Message, Theme, Renderer> {
     content: &'b Element<'a, Message, Theme, Renderer>,
     tree: &'b Tree,
     layout: Layout<'b>,
-    origin: Point,
+    grab_offset: Vector,
 }
 
 impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
@@ -509,7 +581,8 @@ where
     Renderer: iced::advanced::Renderer,
 {
     fn layout(&mut self, _renderer: &Renderer, _bounds: Size) -> layout::Node {
-        layout::Node::new(self.layout.bounds().size()).move_to(self.origin)
+        let bounds = self.layout.bounds();
+        layout::Node::new(bounds.size()).move_to(bounds.position())
     }
 
     fn draw(
@@ -520,9 +593,11 @@ where
         _layout: Layout<'_>,
         cursor: mouse::Cursor,
     ) {
+        // Place the row so it keeps its grab offset under the cursor, even
+        // when its slot has moved since the drag started (live mode).
         let translation = cursor
             .position()
-            .map(|position| position - self.origin)
+            .map(|position| (position - self.grab_offset) - self.layout.bounds().position())
             .unwrap_or(Vector::ZERO);
 
         renderer.with_translation(translation, |renderer| {
@@ -578,8 +653,10 @@ pub struct Style {
     pub line_color: Color,
     /// The thickness of the insertion line.
     pub line_width: f32,
-    /// A translucent tint drawn over the dragged row's original slot.
-    pub dragged_overlay: Color,
+    /// The fill of the dragged row's now-empty slot.
+    pub slot_background: Color,
+    /// The border of the dragged row's now-empty slot.
+    pub slot_border: Border,
 }
 
 /// The theme catalog of a [`Reorder`].
@@ -619,10 +696,14 @@ pub fn default(theme: &iced::Theme, _status: Status) -> Style {
     Style {
         line_color: palette.primary.strong.color,
         line_width: 2.0,
-        dragged_overlay: {
-            let mut color = palette.background.base.color;
-            color.a = 0.6;
-            color
+        slot_background: Color {
+            a: 0.2,
+            ..Color::BLACK
+        },
+        slot_border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 2.0.into(),
         },
     }
 }
