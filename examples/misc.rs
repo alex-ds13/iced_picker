@@ -2,13 +2,12 @@ use iced_picker::{
     modal::{self, modal},
     number_input::NumberInput,
     text_input::TextInput,
-    tooltip::{self, tooltip, Open, Position},
+    tooltip::{self, Open, Position, tooltip},
 };
 
 const SAVE_TIP_ID: &str = "save_dropdown_tooltip";
 use iced::{
-    Border, Center, Element, Fill, Shrink, Subscription, Task, Theme,
-    keyboard,
+    Border, Center, Element, Fill, Shrink, Subscription, Task, Theme, keyboard,
     widget::{button, center, column, container, operation, row, text},
 };
 

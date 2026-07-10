@@ -1,8 +1,8 @@
-use iced_picker::hovered::hovered;
 use iced::{
     Center, Element, Theme,
     widget::{center, column, container, row, text},
 };
+use iced_picker::hovered::hovered;
 
 fn main() -> iced::Result {
     iced::application(App::default, App::update, App::view)
@@ -26,26 +26,28 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let label_style = hovered(|is_hovered| {
-            container(
-                row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10),
-            )
-            .width(260)
-            .height(42)
-            .align_x(Center)
-            .align_y(Center)
-            .style(move |t| {
-                if is_hovered {
-                    container::dark(t)
-                } else {
-                    container::rounded_box(t)
-                }
-            })
+            container(row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10))
+                .width(260)
+                .height(42)
+                .align_x(Center)
+                .align_y(Center)
+                .style(move |t| {
+                    if is_hovered {
+                        container::dark(t)
+                    } else {
+                        container::rounded_box(t)
+                    }
+                })
         });
 
         let text_size = hovered(|is_hovered| {
             container(
-                text(if is_hovered { "Hovered!" } else { "Hover over me" })
-                    .size(if is_hovered { 28.0 } else { 16.0 }),
+                text(if is_hovered {
+                    "Hovered!"
+                } else {
+                    "Hover over me"
+                })
+                .size(if is_hovered { 28.0 } else { 16.0 }),
             )
             .width(260)
             .height(80)
@@ -63,17 +65,21 @@ impl App {
         let nested = hovered(|outer| {
             container(
                 column![
-                    container(
-                        text(if outer { "Outer hovered" } else { "Hover anywhere" }),
-                    )
+                    container(text(if outer {
+                        "Outer hovered"
+                    } else {
+                        "Hover anywhere"
+                    }),)
                     .width(240)
                     .height(24)
                     .align_x(Center)
                     .align_y(Center),
                     hovered(|inner| {
-                        container(
-                            text(if inner { "Inner hovered!" } else { "Inner area" }),
-                        )
+                        container(text(if inner {
+                            "Inner hovered!"
+                        } else {
+                            "Inner area"
+                        }))
                         .width(240)
                         .height(40)
                         .align_x(Center)

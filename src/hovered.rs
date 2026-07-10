@@ -62,9 +62,7 @@ where
     }
 
     fn view(&self, state: &Self::State) -> Element<'a, Self::Event> {
-        let content = (self.builder)(state.is_hovered)
-            .into()
-            .map(Event::Message);
+        let content = (self.builder)(state.is_hovered).into().map(Event::Message);
 
         let mut area = mouse_area(content)
             .interaction(iced::mouse::Interaction::Pointer)

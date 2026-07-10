@@ -1,8 +1,8 @@
-use iced_picker::color_picker::color_picker;
 use iced::{
     Center, Color, Element, Fill, Length, Shrink, Theme,
     widget::{Button, Column, Text, column, container, pick_list, row, space},
 };
+use iced_picker::color_picker::color_picker;
 
 fn main() -> iced::Result {
     iced::application(
