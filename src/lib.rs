@@ -2,6 +2,7 @@ pub use iced_core as core;
 
 pub mod atom;
 pub mod color_picker;
+pub mod combo_box;
 pub mod helpers;
 pub mod hover;
 pub mod hovered;
