@@ -664,7 +664,7 @@ where
                             shell.capture_event();
                             shell.request_redraw();
                         }
-                        (key::Named::ArrowUp, _) | (key::Named::Tab, true) => {
+                        (key::Named::ArrowUp, _) => {
                             if let Some(index) = &mut menu.hovered_option {
                                 if *index == 0 {
                                     *index = state.filtered_options.options.len().saturating_sub(1);
@@ -688,9 +688,7 @@ where
                             shell.capture_event();
                             shell.request_redraw();
                         }
-                        (key::Named::ArrowDown, _) | (key::Named::Tab, false)
-                            if !modifiers.shift() =>
-                        {
+                        (key::Named::ArrowDown, _) => {
                             if let Some(index) = &mut menu.hovered_option {
                                 if *index >= state.filtered_options.options.len().saturating_sub(1)
                                 {
