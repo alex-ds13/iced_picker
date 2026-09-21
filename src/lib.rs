@@ -11,7 +11,6 @@ pub mod modal;
 pub mod number_input;
 pub mod opaque_maybe;
 pub mod reorder;
-pub mod text_input;
 pub mod tooltip;
 
 pub use atom::{Atom, Component};

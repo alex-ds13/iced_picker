@@ -21,50 +21,36 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-pub(super) mod cursor;
-pub(super) mod editor;
-pub(super) mod value;
-
 use std::fmt::Display;
 use std::str::FromStr;
 
-use cursor::Cursor;
-use editor::Editor;
-use value::Value;
-
-use iced::advanced::clipboard;
 use iced::advanced::layout::{self, Limits};
-use iced::advanced::mouse::{self, click};
+use iced::advanced::mouse;
 use iced::advanced::renderer;
 use iced::advanced::text::paragraph::{self, Paragraph as _};
 use iced::advanced::text::{self, Text};
 use iced::advanced::widget;
-use iced::advanced::widget::operation::{self, Operation};
+use iced::advanced::widget::operation::{Focusable, Operation, TextInput as _};
 use iced::advanced::widget::tree::{self, Tree};
-use iced::advanced::{Layout, Shell, Widget};
+use iced::advanced::{Layout, Shell, Widget, shell};
 use iced::alignment;
 use iced::keyboard;
 use iced::keyboard::key;
-use iced::time::{Duration, Instant};
-use iced::touch;
 use iced::widget::{Button, button};
 use iced::window;
 use iced::{
-    Alignment, Background, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size,
-    Theme, Vector,
+    Alignment, Background, Color, Element, Event, Font, Length, Padding, Pixels, Point, Rectangle,
+    Size, Theme,
     border::{self, Border},
 };
-use iced_core::input_method::{self, InputMethod};
 use num_traits::{Bounded, Num, NumAssignOps};
 
 /// A field that can be filled with numbers.
 ///
 /// # Example
 /// ```no_run
-/// # mod iced { pub mod widget { pub use iced_widget::*; } pub use iced_widget::Renderer; pub use iced_widget::core::*; }
-/// # pub type Element<'a, Message> = iced_widget::core::Element<'a, Message, iced_widget::Theme, iced_widget::Renderer>;
-/// #
-/// use iced::widget::number_input;
+/// use iced::Element;
+/// use iced_picker::number_input::NumberInput;
 ///
 /// struct State {
 ///    content: i32,
@@ -76,7 +62,7 @@ use num_traits::{Bounded, Num, NumAssignOps};
 /// }
 ///
 /// fn view(state: &State) -> Element<'_, Message> {
-///     number_input("Type some number here...", &state.content)
+///     NumberInput::new("Type some number here...", state.content)
 ///         .on_input(Message::ContentChanged)
 ///         .into()
 /// }
@@ -97,12 +83,11 @@ where
 {
     id: Option<widget::Id>,
     placeholder: String,
-    value: Value,
-    _number_value: T,
+    value: T,
     max: T,
     min: T,
     is_secure: bool,
-    font: Option<Renderer::Font>,
+    font: Option<Font>,
     width: Length,
     padding: Padding,
     size: Option<Pixels>,
@@ -111,7 +96,7 @@ where
     on_input: Option<Box<dyn Fn(T) -> Message + 'a>>,
     on_paste: Option<Box<dyn Fn(T) -> Message + 'a>>,
     on_submit: Option<Message>,
-    icon: Option<Icon<Renderer::Font>>,
+    icon: Option<Icon>,
     class: <Theme as Catalog>::Class<'a>,
     last_status: Option<Status>,
     increment_button: Button<'a, ButtonMessage, Theme, Renderer>,
@@ -129,15 +114,12 @@ impl<'a, T, Message, Theme, Renderer> NumberInput<'a, T, Message, Theme, Rendere
 where
     Message: Clone,
     Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer + 'static,
     T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
 {
     /// Creates a new [`NumberInput`] with the given placeholder and
     /// its current value.
     pub fn new(placeholder: &str, value: T) -> Self {
-        let v_str = value.to_string();
-        let _number_value = value;
-        let value = Value::new(&v_str);
         let text_size = Pixels(16.0);
         let line_height = text::LineHeight::default();
         let height = line_height.to_absolute(text_size) + DEFAULT_PADDING.y();
@@ -158,7 +140,6 @@ where
             id: None,
             placeholder: String::from(placeholder),
             value,
-            _number_value,
             max: T::max_value(),
             min: T::min_value(),
             is_secure: false,
@@ -257,15 +238,13 @@ where
     }
 
     /// Sets the [`Font`] of the [`NumberInput`].
-    ///
-    /// [`Font`]: text::Renderer::Font
-    pub fn font(mut self, font: Renderer::Font) -> Self {
+    pub fn font(mut self, font: Font) -> Self {
         self.font = Some(font);
         self
     }
 
     /// Sets the [`Icon`] of the [`NumberInput`].
-    pub fn icon(mut self, icon: Icon<Renderer::Font>) -> Self {
+    pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
         self
     }
@@ -375,227 +354,467 @@ where
         self
     }
 
-    /// Lays out the [`NumberInput`], overriding its [`Value`] if provided.
+    /// Returns `value` brought inside the `min` and `max` bounds.
+    fn clamp(&self, value: T) -> T {
+        if value > self.max {
+            self.max.clone()
+        } else if value < self.min {
+            self.min.clone()
+        } else {
+            value
+        }
+    }
+
+    /// Builds the message for a single step up or down, or `None` when the widget is
+    /// disabled or the value already sits on the bound it would move towards.
+    fn step(&self, increment: bool) -> Option<Message> {
+        let on_input = self.on_input.as_ref()?;
+        let mut value = self.value.clone();
+
+        if increment {
+            if value >= self.max {
+                return None;
+            }
+
+            value += T::one();
+        } else {
+            if value <= self.min {
+                return None;
+            }
+
+            value -= T::one();
+        }
+
+        Some(on_input(self.clamp(value)))
+    }
+
+    /// The layouts of the increment and decrement buttons.
+    fn button_layouts<'b>(&self, layout: Layout<'b>) -> (Layout<'b>, Layout<'b>) {
+        let mut children = layout
+            .children()
+            .skip(if self.icon.is_some() { 2 } else { 1 });
+
+        (children.next().unwrap(), children.next().unwrap())
+    }
+
+    /// Runs the cleanup that must happen whenever the widget loses focus, regardless
+    /// of whether focus was lost via a mouse click, the Escape key, or a programmatic
+    /// operation (Tab navigation etc.).
     ///
-    /// [`Renderer`]: text::Renderer
-    pub fn layout(
+    /// Publishes the clamped value of whatever partial text was being edited (trailing
+    /// dot, trailing zeros, empty field) and collapses the display to the canonical
+    /// form of that value.
+    fn on_unfocus(&self, state: &mut State<Renderer>, shell: &mut Shell<'_, Message>) {
+        let Some(on_input) = &self.on_input else {
+            return;
+        };
+
+        let text = state.input.value();
+        let value = self.clamp(parse_number(&text).unwrap_or_else(|| T::zero()));
+        let has_changed = value != self.value;
+        let canonical = value.to_string();
+
+        if text != canonical {
+            state.input.overwrite(&canonical);
+            shell.request_redraw();
+        }
+
+        if has_changed {
+            state.transaction = Some(shell.publish_and_track(on_input(value)));
+        }
+    }
+}
+
+impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for NumberInput<'a, T, Message, Theme, Renderer>
+where
+    Message: Clone,
+    Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
+    Renderer: text::Renderer + 'static,
+    T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<State<Renderer>>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(State::<Renderer>::new())
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(&mut [
+            &mut self.increment_button as &mut dyn Widget<_, _, _>,
+            &mut self.decrement_button as &mut dyn Widget<_, _, _>,
+        ]);
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: self.width,
+            height: Length::Fit,
+        }
+    }
+
+    fn layout(
         &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
-        value: Option<&Value>,
     ) -> layout::Node {
-        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-        let value = value.unwrap_or(&self.value);
+        let state = tree.state.downcast_mut::<State<Renderer>>();
 
-        let font = self.font.unwrap_or_else(|| renderer.default_font());
-        let text_size = self.size.unwrap_or_else(|| renderer.default_size());
-        let padding = self.padding.fit(Size::ZERO, limits.max());
+        if state
+            .transaction
+            .as_ref()
+            .is_none_or(shell::Tracking::is_processed)
+        {
+            let text = state.input.value();
+            let canonical = self.value.to_string();
+
+            // While editing, text that still denotes `self.value` is left as typed, so
+            // the partial states ("", "-", "5.", "5.0") survive the re-render that our
+            // own publish triggers.
+            let is_current = if state.input.is_focused() {
+                parse_number::<T>(&text).is_some_and(|parsed| {
+                    parsed == self.value
+                        // An unfinished number keeps its text when only the bounds make
+                        // it differ, e.g. an empty field with a `min` above zero.
+                        || (is_partial_number(&text) && self.clamp(parsed) == self.value)
+                })
+            } else {
+                text == canonical
+            };
+
+            if !is_current {
+                state.input.overwrite(&canonical);
+            }
+        }
+
+        let text_size = self.size.unwrap_or_else(|| renderer.text_size());
+        let padding = self.padding.fit(Size::ZERO, limits.bounds());
         let height = self.line_height.to_absolute(text_size);
+        let buttons_width = f32::from(self.buttons_width);
 
-        let limits = limits
+        let text_bounds = limits
             .width(self.width)
             .shrink(padding)
-            .shrink(Size::new(self.buttons_width.into(), 0.0));
-        let text_bounds = limits.resolve(self.width, height, Size::ZERO);
+            .shrink(Size::new(buttons_width, 0.0))
+            .resolve(self.width, height, Size::ZERO);
 
-        let placeholder_text = Text {
-            font,
-            line_height: self.line_height,
-            content: self.placeholder.as_str(),
-            bounds: Size::new(f32::INFINITY, text_bounds.height),
-            size: text_size,
-            align_x: text::Alignment::Default,
-            align_y: alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::default(),
-            ellipsis: text::Ellipsis::None,
-            hint_factor: renderer.scale_factor(),
-        };
-
-        state.placeholder.update(placeholder_text);
-
-        let secure_value = self.is_secure.then(|| value.secure());
-        let value = secure_value.as_ref().unwrap_or(value);
-
-        state.value.update(Text {
-            content: &value.to_string(),
-            ..placeholder_text
-        });
-
-        let button_padding = 1.0;
-        let button_limits = Limits::new(
-            Size::ZERO,
-            Size::new(
-                f32::from(self.buttons_width) - 2.0 * button_padding,
-                (f32::from(height) + padding.y()) / 2.0 - button_padding,
-            ),
-        );
-
-        let increment_node =
-            self.increment_button
-                .layout(&mut tree.children[0], renderer, &button_limits);
-        let decrement_node =
-            self.decrement_button
-                .layout(&mut tree.children[1], renderer, &button_limits);
-
-        if let Some(icon) = &self.icon {
+        let icon_width = self.icon.as_ref().map(|icon| {
             let mut content = [0; 4];
 
-            let icon_text = Text {
+            state.icon.update(Text {
                 line_height: self.line_height,
                 content: icon.code_point.encode_utf8(&mut content) as &_,
                 font: icon.font,
-                size: icon.size.unwrap_or_else(|| renderer.default_size()),
+                size: icon.size.unwrap_or_else(|| renderer.text_size()),
                 bounds: Size::new(f32::INFINITY, text_bounds.height),
                 align_x: text::Alignment::Center,
                 align_y: alignment::Vertical::Center,
                 shaping: text::Shaping::Advanced,
                 wrapping: text::Wrapping::default(),
                 ellipsis: text::Ellipsis::None,
-                hint_factor: renderer.scale_factor(),
-            };
+                hint_factor: renderer.hint_factor(),
+            });
 
-            state.icon.update(icon_text);
+            state.icon.min_width()
+        });
 
-            let icon_width = state.icon.min_width();
+        let reserved = self
+            .icon
+            .as_ref()
+            .zip(icon_width)
+            .map_or(0.0, |(icon, width)| width + icon.spacing);
 
-            let (text_position, icon_position, increment_position, decrement_position) =
-                match icon.side {
-                    Side::Left => (
-                        Point::new(padding.left + icon_width + icon.spacing, padding.top),
-                        Point::new(padding.left, padding.top),
-                        Point::new(
-                            padding.left
-                                + icon_width
-                                + icon.spacing
-                                + text_bounds.width
-                                + padding.right
-                                + button_padding,
-                            button_padding,
-                        ),
-                        Point::new(
-                            padding.left
-                                + icon_width
-                                + icon.spacing
-                                + text_bounds.width
-                                + padding.right
-                                + button_padding,
-                            button_limits.max().height + button_padding,
-                        ),
-                    ),
-                    Side::Right => (
-                        Point::new(padding.left, padding.top),
-                        Point::new(padding.left + text_bounds.width - icon_width, padding.top),
-                        Point::new(
-                            padding.left
-                                + text_bounds.width
-                                + icon_width
-                                + padding.right
-                                + button_padding,
-                            button_padding,
-                        ),
-                        Point::new(
-                            padding.left
-                                + text_bounds.width
-                                + icon_width
-                                + padding.right
-                                + button_padding,
-                            button_limits.max().height + button_padding,
-                        ),
-                    ),
+        let input_size = Size::new(
+            text_bounds.width - reserved + padding.x(),
+            text_bounds.height + padding.y(),
+        );
+
+        let input_x = match self.icon.as_ref().map(|icon| &icon.side) {
+            Some(Side::Left) => reserved,
+            _ => 0.0,
+        };
+
+        let input_node = state
+            .input
+            .layout(
+                renderer,
+                &Limits::new(Size::ZERO, input_size),
+                text::input::Layout {
+                    width: Length::Fixed(input_size.width),
+                    height: Length::Fixed(input_size.height),
+                    padding,
+                    placeholder: self.placeholder.as_str(),
+                    font: self.font,
+                    size: self.size,
+                    line_height: Some(self.line_height),
+                    alignment: self.alignment.into(),
+                    multiline: None,
+                    is_secure: self.is_secure,
+                },
+            )
+            .move_to(Point::new(input_x, 0.0));
+
+        let button_padding = 1.0;
+        let button_limits = Limits::new(
+            Size::ZERO,
+            Size::new(
+                buttons_width - 2.0 * button_padding,
+                (f32::from(height) + padding.y()) / 2.0 - button_padding,
+            ),
+        );
+
+        let buttons_x = text_bounds.width + padding.x() + button_padding;
+
+        let increment_node = self
+            .increment_button
+            .layout(&mut tree.children[0], renderer, &button_limits)
+            .move_to(Point::new(buttons_x, button_padding));
+
+        let decrement_node = self
+            .decrement_button
+            .layout(&mut tree.children[1], renderer, &button_limits)
+            .move_to(Point::new(
+                buttons_x,
+                button_limits.max.height + button_padding,
+            ));
+
+        let children = match (&self.icon, icon_width) {
+            (Some(icon), Some(icon_width)) => {
+                let icon_x = match icon.side {
+                    Side::Left => padding.left,
+                    Side::Right => padding.left + text_bounds.width - icon_width,
                 };
 
-            let text_node =
-                layout::Node::new(text_bounds - Size::new(icon_width + icon.spacing, 0.0))
-                    .move_to(text_position);
+                let icon_node = layout::Node::new(Size::new(icon_width, text_bounds.height))
+                    .move_to(Point::new(icon_x, padding.top));
 
-            let icon_node =
-                layout::Node::new(Size::new(icon_width, text_bounds.height)).move_to(icon_position);
+                vec![input_node, icon_node, increment_node, decrement_node]
+            }
+            _ => vec![input_node, increment_node, decrement_node],
+        };
 
-            let increment_node = increment_node.move_to(increment_position);
-            let decrement_node = decrement_node.move_to(decrement_position);
-
-            layout::Node::with_children(
-                text_bounds
-                    .expand(padding)
-                    .expand(Size::new(self.buttons_width.into(), 0.0)),
-                vec![text_node, icon_node, increment_node, decrement_node],
-            )
-        } else {
-            let text_node =
-                layout::Node::new(text_bounds).move_to(Point::new(padding.left, padding.top));
-            let increment_node = increment_node.move_to(Point::new(
-                text_bounds.width + padding.x() + button_padding,
-                button_padding,
-            ));
-            let decrement_node = decrement_node.move_to(Point::new(
-                text_bounds.width + padding.x() + button_padding,
-                button_limits.max().height + button_padding,
-            ));
-
-            layout::Node::with_children(
-                text_bounds
-                    .expand(padding)
-                    .expand(Size::new(self.buttons_width.into(), 0.0)),
-                vec![text_node, increment_node, decrement_node],
-            )
-        }
+        layout::Node::with_children(
+            text_bounds
+                .expand(padding)
+                .expand(Size::new(buttons_width, 0.0)),
+            children,
+        )
     }
 
-    fn input_method<'c>(
-        &self,
-        state: &'c State<Renderer::Paragraph>,
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
         layout: Layout<'_>,
-        value: &Value,
-    ) -> InputMethod<&'c str> {
-        let Some(Focus {
-            is_window_focused: true,
-            ..
-        }) = &state.is_focused
-        else {
-            return InputMethod::Disabled;
+        viewport: &Rectangle,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let state = tree.state.downcast_mut::<State<Renderer>>();
+        let was_focused = state.input.is_focused();
+
+        operation.text_input(self.id.as_ref(), layout.bounds(), &mut state.input);
+        operation.focusable(self.id.as_ref(), layout.bounds(), &mut state.input);
+
+        // Focus granted by an operation (Tab navigation) selects the value, just like
+        // the first click on the field does.
+        if !was_focused && state.input.is_focused() {
+            state.input.select_all();
+        }
+
+        let (increment_layout, decrement_layout) = self.button_layouts(layout);
+
+        self.increment_button.operate(
+            &mut tree.children[0],
+            increment_layout,
+            viewport,
+            renderer,
+            operation,
+        );
+        self.decrement_button.operate(
+            &mut tree.children[1],
+            decrement_layout,
+            viewport,
+            renderer,
+            operation,
+        );
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let (increment_layout, decrement_layout) = self.button_layouts(layout);
+        let mut buttons_messages = shell::Bus::<ButtonMessage>::new();
+        {
+            let mut buttons_shell = shell.local(&mut buttons_messages);
+
+            if shell.is_event_captured() {
+                buttons_shell.capture_event();
+            }
+            buttons_shell.request_redraw_at(shell.redraw_request());
+            buttons_shell.request_input_method(shell.input_method());
+
+            self.increment_button.update(
+                &mut tree.children[0],
+                event,
+                increment_layout,
+                cursor,
+                renderer,
+                &mut buttons_shell,
+                viewport,
+            );
+            self.decrement_button.update(
+                &mut tree.children[1],
+                event,
+                decrement_layout,
+                cursor,
+                renderer,
+                &mut buttons_shell,
+                viewport,
+            );
+
+            shell.invalidate(buttons_shell.invalidation());
+            shell.request_redraw_at(buttons_shell.redraw_request());
+            shell.request_input_method(buttons_shell.input_method());
+            shell.clipboard_mut().merge(buttons_shell.clipboard_mut());
+            if buttons_shell.is_event_captured() {
+                shell.capture_event();
+            }
+        }
+
+        for (message, receipt) in buttons_messages.drain() {
+            if let Some(message) = self.step(matches!(message, ButtonMessage::Increment)) {
+                shell.forward(message, receipt);
+            }
+
+            shell.request_redraw();
+            shell.capture_event();
+        }
+
+        if shell.is_event_captured() {
+            // if the buttons handled the event we can simply return
+            return;
+        }
+
+        let input_bounds = layout.children().next().unwrap().bounds();
+        let state = tree.state.downcast_mut::<State<Renderer>>();
+
+        // Operations mutate focus directly instead of going through update(), so the
+        // focus recorded at the end of the previous call is what reveals them.
+        if state.was_focused && !state.input.is_focused() {
+            self.on_unfocus(state, shell);
+            state.was_focused = false;
+        }
+
+        let was_focused = state.was_focused;
+
+        if let Some(on_input) = &self.on_input {
+            let stepped = self.wheel_step(event, layout, cursor, shell);
+
+            if !stepped {
+                let previous_text = state.input.value();
+                let had_focus = state.input.is_focused();
+
+                let edit = state
+                    .input
+                    .update(event, input_bounds, cursor, shell, |key_press| {
+                        if key_press.is_focused {
+                            match key_press.modified_key.as_ref() {
+                                keyboard::Key::Named(key::Named::Enter) => {
+                                    if let Some(on_submit) = &self.on_submit {
+                                        return Some(text::editor::Binding::Custom(
+                                            on_submit.clone(),
+                                        ));
+                                    }
+                                }
+                                keyboard::Key::Named(key::Named::ArrowUp) => {
+                                    return self.step(true).map(text::editor::Binding::Custom);
+                                }
+                                keyboard::Key::Named(key::Named::ArrowDown) => {
+                                    return self.step(false).map(text::editor::Binding::Custom);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        text::editor::Binding::from_key_press(key_press)
+                    });
+
+                // The click that brings focus to the field selects the whole value, so
+                // typing replaces it.
+                if !had_focus && state.input.is_focused() {
+                    state.input.select_all();
+                    shell.request_redraw();
+                }
+
+                if let Some(edit) = edit {
+                    let text = state.input.value();
+
+                    if is_number_text::<T>(&text) {
+                        let value = self.clamp(parse_number(&text).unwrap_or_else(|| T::zero()));
+
+                        let on_edit = match &self.on_paste {
+                            Some(on_paste) if edit.has_pasted => on_paste,
+                            _ => on_input,
+                        };
+
+                        state.transaction = Some(shell.publish_and_track(on_edit(value)));
+                    } else {
+                        // `Input` applies the edit before handing it over, so a result
+                        // that is not a number is undone by restoring the old text.
+                        state.input.overwrite(&previous_text);
+                        shell.request_redraw();
+                    }
+                }
+            }
+        }
+
+        let is_focused = state.input.is_focused();
+
+        if was_focused && !is_focused {
+            self.on_unfocus(state, shell);
+        }
+
+        state.was_focused = is_focused;
+
+        let status = if self.on_input.is_none() {
+            Status::Disabled
+        } else if is_focused {
+            Status::Focused {
+                is_hovered: cursor.is_over(layout.bounds()),
+            }
+        } else if cursor.is_over(layout.bounds()) {
+            Status::Hovered
+        } else {
+            Status::Active
         };
 
-        let secure_value = self.is_secure.then(|| value.secure());
-        let value = secure_value.as_ref().unwrap_or(value);
+        if let Event::Window(window::Event::RedrawRequested(_now)) = event {
+            self.last_status = Some(status);
 
-        let text_bounds = layout.children().next().unwrap().bounds();
-
-        let caret_index = match state.cursor.state(value) {
-            cursor::State::Index(position) => position,
-            cursor::State::Selection { start, end } => start.min(end),
-        };
-
-        let text = state.value.raw();
-        let (cursor_x, scroll_offset) =
-            measure_cursor_and_scroll_offset(text, text_bounds, caret_index);
-
-        let alignment_offset =
-            alignment_offset(text_bounds.width, text.min_width(), self.alignment);
-
-        let x = (text_bounds.x + cursor_x).floor() - scroll_offset + alignment_offset;
-
-        InputMethod::Enabled {
-            cursor: Rectangle::new(
-                Point::new(x, text_bounds.y),
-                Size::new(1.0, text_bounds.height),
-            ),
-            purpose: if self.is_secure {
-                input_method::Purpose::Secure
-            } else {
-                input_method::Purpose::Normal
-            },
-            preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
+            shell.request_input_method(
+                &state
+                    .input
+                    .input_method(input_bounds.shrink(self.padding).position()),
+            );
+        } else if self
+            .last_status
+            .is_some_and(|last_status| status != last_status)
+        {
+            shell.request_redraw();
         }
     }
 
-    /// Draws the [`NumberInput`] with the given [`Renderer`], overriding its
-    /// [`Value`] if provided.
-    ///
-    /// [`Renderer`]: text::Renderer
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw(
+    fn draw(
         &self,
         tree: &Tree,
         renderer: &mut Renderer,
@@ -603,20 +822,9 @@ where
         renderer_style: &renderer::Style,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        value: Option<&Value>,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        let value = value.unwrap_or(&self.value);
-        let is_disabled = self.on_input.is_none();
-
-        let secure_value = self.is_secure.then(|| value.secure());
-        let value = secure_value.as_ref().unwrap_or(value);
-
-        let bounds = layout.bounds();
-
-        let mut children_layout = layout.children();
-        let text_bounds = children_layout.next().unwrap().bounds();
+        let state = tree.state.downcast_ref::<State<Renderer>>();
 
         let style = <Theme as Catalog>::style(
             theme,
@@ -624,9 +832,12 @@ where
             self.last_status.unwrap_or(Status::Disabled),
         );
 
+        let mut children_layout = layout.children();
+        let input_layout = children_layout.next().unwrap();
+
         renderer.fill_quad(
             renderer::Quad {
-                bounds,
+                bounds: layout.bounds(),
                 border: style.border,
                 ..renderer::Quad::default()
             },
@@ -635,7 +846,6 @@ where
 
         if self.icon.is_some() {
             let icon_layout = children_layout.next().unwrap();
-
             let icon = state.icon.raw();
 
             renderer.fill_paragraph(
@@ -672,1346 +882,16 @@ where
             viewport,
         );
 
-        let text = value.to_string();
-
-        let (cursor, offset, is_selecting) = if let Some(focus) = state
-            .is_focused
-            .as_ref()
-            .filter(|focus| focus.is_window_focused)
-        {
-            match state.cursor.state(value) {
-                cursor::State::Index(position) => {
-                    let (text_value_width, offset) =
-                        measure_cursor_and_scroll_offset(state.value.raw(), text_bounds, position);
-
-                    let is_cursor_visible = !is_disabled
-                        && ((focus.now - focus.updated_at).as_millis()
-                            / CURSOR_BLINK_INTERVAL_MILLIS)
-                            .is_multiple_of(2);
-
-                    let cursor = if is_cursor_visible {
-                        Some((
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: (text_bounds.x + text_value_width).floor(),
-                                    y: text_bounds.y,
-                                    width: 1.0,
-                                    height: text_bounds.height,
-                                },
-                                ..renderer::Quad::default()
-                            },
-                            style.value,
-                        ))
-                    } else {
-                        None
-                    };
-
-                    (cursor, offset, false)
-                }
-                cursor::State::Selection { start, end } => {
-                    let left = start.min(end);
-                    let right = end.max(start);
-
-                    let (left_position, left_offset) =
-                        measure_cursor_and_scroll_offset(state.value.raw(), text_bounds, left);
-
-                    let (right_position, right_offset) =
-                        measure_cursor_and_scroll_offset(state.value.raw(), text_bounds, right);
-
-                    let width = right_position - left_position;
-
-                    (
-                        Some((
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: text_bounds.x + left_position,
-                                    y: text_bounds.y,
-                                    width,
-                                    height: text_bounds.height,
-                                },
-                                ..renderer::Quad::default()
-                            },
-                            style.selection,
-                        )),
-                        if end == right {
-                            right_offset
-                        } else {
-                            left_offset
-                        },
-                        true,
-                    )
-                }
-            }
-        } else {
-            (None, 0.0, false)
-        };
-
-        let draw = |renderer: &mut Renderer, viewport| {
-            let paragraph = if text.is_empty()
-                && state
-                    .preedit
-                    .as_ref()
-                    .map(|preedit| preedit.content.is_empty())
-                    .unwrap_or(true)
-            {
-                state.placeholder.raw()
-            } else {
-                state.value.raw()
-            };
-
-            let alignment_offset =
-                alignment_offset(text_bounds.width, paragraph.min_width(), self.alignment);
-
-            if let Some((cursor, color)) = cursor {
-                renderer.with_translation(
-                    Vector::new(alignment_offset - offset, 0.0),
-                    |renderer| {
-                        renderer.fill_quad(cursor, color);
-                    },
-                );
-            } else {
-                renderer.with_translation(Vector::ZERO, |_| {});
-            }
-
-            renderer.fill_paragraph(
-                paragraph,
-                text_bounds.anchor(paragraph.min_bounds(), Alignment::Start, Alignment::Center)
-                    + Vector::new(alignment_offset - offset, 0.0),
-                if text.is_empty() {
-                    style.placeholder
-                } else {
-                    style.value
-                },
-                viewport,
-            );
-        };
-
-        if is_selecting {
-            renderer.with_layer(text_bounds, |renderer| draw(renderer, *viewport));
-        } else {
-            draw(renderer, text_bounds);
-        }
-    }
-
-    /// Runs the cleanup that must happen whenever the widget loses focus, regardless
-    /// of whether focus was lost via a mouse click, the Escape key, or a programmatic
-    /// operation (Tab navigation etc.).
-    ///
-    /// Publishes a clean numeric value when the display is in a partial state
-    /// (trailing dot, trailing zeros, empty field).  Returns `true` when a message
-    /// was published or a redraw was requested so the caller can decide whether to
-    /// also call `shell.capture_event()`.
-    fn on_unfocus(
-        &self,
-        state: &mut State<Renderer::Paragraph>,
-        shell: &mut Shell<'_, Message>,
-    ) -> bool {
-        let Some(on_input) = &self.on_input else {
-            return false;
-        };
-        if let Some(display) = state.display_override.clone() {
-            let to_parse = display.trim_end_matches('.');
-            if let Ok(mut parsed) = to_parse.parse::<T>() {
-                if parsed > self.max {
-                    parsed = self.max.clone();
-                } else if parsed < self.min {
-                    parsed = self.min.clone();
-                }
-                shell.publish((on_input)(parsed));
-            }
-            state.display_override = None;
-            state.is_empty = false;
-            state.is_empty_neg = false;
-            shell.request_redraw();
-            true
-        } else if self.value.to_string().parse::<T>().is_err() {
-            let message = on_input(T::default());
-            shell.publish(message);
-            state.is_empty = false;
-            state.is_empty_neg = false;
-            shell.request_redraw();
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for NumberInput<'a, T, Message, Theme, Renderer>
-where
-    Message: Clone,
-    Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
-    Renderer: text::Renderer + 'a,
-    T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
-{
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State<Renderer::Paragraph>>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(State::<Renderer::Paragraph>::new())
-    }
-
-    fn diff(&mut self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-
-        // Stop pasting if input becomes disabled
-        if self.on_input.is_none() {
-            state.is_pasting = None;
-        }
-
-        tree.diff_children(&mut [
-            &mut self.increment_button as &mut dyn Widget<_, _, _>,
-            &mut self.decrement_button as &mut dyn Widget<_, _, _>,
-        ]);
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size {
-            width: self.width,
-            height: Length::Fit,
-        }
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.layout(tree, renderer, limits, None)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        _renderer: &Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-
-        operation.focusable(self.id.as_ref(), layout.bounds(), state);
-
-        operation.text_input(self.id.as_ref(), layout.bounds(), state);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        let (increment_layout, decrement_layout) = if self.icon.is_some() {
-            (
-                layout.children().nth(2).unwrap(),
-                layout.children().nth(3).unwrap(),
-            )
-        } else {
-            (
-                layout.children().nth(1).unwrap(),
-                layout.children().nth(2).unwrap(),
-            )
-        };
-        let mut buttons_messages = Vec::<ButtonMessage>::new();
-        let mut buttons_shell = shell.local(&mut buttons_messages);
-
-        // Reconcile buttons shell with main shell:
-        if shell.is_event_captured() {
-            buttons_shell.capture_event();
-        }
-        buttons_shell.request_redraw_at(shell.redraw_request());
-        buttons_shell.request_input_method(shell.input_method());
-
-        self.increment_button.update(
-            &mut tree.children[0],
-            event,
-            increment_layout,
-            cursor,
+        state.input.draw(
             renderer,
-            &mut buttons_shell,
-            viewport,
-        );
-        self.decrement_button.update(
-            &mut tree.children[1],
-            event,
-            decrement_layout,
-            cursor,
-            renderer,
-            &mut buttons_shell,
-            viewport,
-        );
-
-        // Reconcile main shell with buttons shell
-        shell.request_redraw_at(buttons_shell.redraw_request());
-        shell.request_input_method(buttons_shell.input_method());
-        if buttons_shell.is_event_captured() {
-            shell.capture_event();
-        }
-
-        if !buttons_messages.is_empty()
-            && let Some(on_input) = &self.on_input
-        {
-            for message in buttons_messages {
-                match message {
-                    ButtonMessage::Increment => {
-                        if let Ok(mut parsed) = self.value.to_string().parse()
-                            && parsed < self.max
-                        {
-                            parsed += T::one();
-                            if parsed > self.max {
-                                parsed = self.max.clone();
-                            }
-                            let message = (on_input)(parsed);
-                            shell.publish(message);
-                        }
-                    }
-                    ButtonMessage::Decrement => {
-                        if let Ok(mut parsed) = self.value.to_string().parse()
-                            && parsed > self.min
-                        {
-                            parsed -= T::one();
-                            if parsed < self.min {
-                                parsed = self.min.clone();
-                            }
-                            let message = (on_input)(parsed);
-                            shell.publish(message);
-                        }
-                    }
-                }
-                shell.request_redraw();
-                shell.capture_event();
-            }
-        }
-
-        if shell.is_event_captured() {
-            // if the buttons handled the event we can simply return
-            return;
-        }
-
-        let update_cache = |state, value| {
-            replace_paragraph(
-                renderer,
-                state,
-                layout,
-                value,
-                self.font,
-                self.size,
-                self.line_height,
-            );
-        };
-
-        let state = state::<Renderer>(tree);
-
-        // Detect operation-driven unfocus (e.g. Tab / Shift+Tab navigation).
-        // Operations mutate state directly without going through update(), so we
-        // compare against the focus state recorded at the end of the previous call
-        // and run the same cleanup as click-away / Escape when focus was revoked.
-        if state.was_focused && !state.is_focused() {
-            self.on_unfocus(state, shell);
-        }
-
-        match &event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerPressed { .. }) => {
-                let cursor_before = state.cursor;
-
-                let click_position = cursor.position_over(layout.bounds());
-
-                let was_previously_focused = state.is_focused();
-
-                state.is_focused = if click_position.is_some() {
-                    let now = Instant::now();
-
-                    Some(Focus {
-                        updated_at: now,
-                        now,
-                        is_window_focused: true,
-                    })
-                } else {
-                    None
-                };
-
-                if was_previously_focused {
-                    if let Some(cursor_position) = click_position {
-                        let text_layout = layout.children().next().unwrap();
-
-                        let target = {
-                            let text_bounds = text_layout.bounds();
-
-                            let alignment_offset = alignment_offset(
-                                text_bounds.width,
-                                state.value.raw().min_width(),
-                                self.alignment,
-                            );
-
-                            cursor_position.x - text_bounds.x - alignment_offset
-                        };
-
-                        let click = mouse::Click::new(
-                            cursor_position,
-                            mouse::Button::Left,
-                            state.last_click,
-                        );
-
-                        match click.kind() {
-                            click::Kind::Single => {
-                                let position = if target > 0.0 {
-                                    let value = if self.is_secure {
-                                        self.value.secure()
-                                    } else {
-                                        self.value.clone()
-                                    };
-
-                                    find_cursor_position(
-                                        text_layout.bounds(),
-                                        &value,
-                                        state,
-                                        target,
-                                    )
-                                } else {
-                                    None
-                                }
-                                .unwrap_or(0);
-
-                                if state.keyboard_modifiers.shift() {
-                                    state
-                                        .cursor
-                                        .select_range(state.cursor.start(&self.value), position);
-                                } else {
-                                    state.cursor.move_to(position);
-                                }
-                                state.is_dragging = true;
-                            }
-                            click::Kind::Double => {
-                                if self.is_secure {
-                                    state.cursor.select_all(&self.value);
-                                } else {
-                                    let position = find_cursor_position(
-                                        text_layout.bounds(),
-                                        &self.value,
-                                        state,
-                                        target,
-                                    )
-                                    .unwrap_or(0);
-
-                                    state.cursor.select_range(
-                                        self.value.previous_start_of_word(position),
-                                        self.value.next_end_of_word(position),
-                                    );
-                                }
-
-                                state.is_dragging = false;
-                            }
-                            click::Kind::Triple => {
-                                state.cursor.select_all(&self.value);
-                                state.is_dragging = false;
-                            }
-                        }
-
-                        state.last_click = Some(click);
-
-                        if cursor_before != state.cursor {
-                            shell.request_redraw();
-                        }
-
-                        shell.capture_event();
-                    } else {
-                        // Widget was unfocused, clean up any partial state.
-                        if self.on_unfocus(state, shell) {
-                            shell.capture_event();
-                        }
-                    }
-                } else if state.is_focused() {
-                    state.cursor.select_all(&self.value);
-                    shell.request_redraw();
-                    shell.capture_event();
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerLifted { .. })
-            | Event::Touch(touch::Event::FingerLost { .. }) => {
-                state.is_dragging = false;
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position })
-            | Event::Touch(touch::Event::FingerMoved { position, .. })
-                if state.is_dragging =>
-            {
-                let text_layout = layout.children().next().unwrap();
-
-                let target = {
-                    let text_bounds = text_layout.bounds();
-
-                    let alignment_offset = alignment_offset(
-                        text_bounds.width,
-                        state.value.raw().min_width(),
-                        self.alignment,
-                    );
-
-                    position.x - text_bounds.x - alignment_offset
-                };
-
-                let value = if self.is_secure {
-                    self.value.secure()
-                } else {
-                    self.value.clone()
-                };
-
-                let position =
-                    find_cursor_position(text_layout.bounds(), &value, state, target).unwrap_or(0);
-
-                let selection_before = state.cursor.selection(&value);
-
-                state
-                    .cursor
-                    .select_range(state.cursor.start(&value), position);
-
-                if let Some(focus) = &mut state.is_focused {
-                    focus.updated_at = Instant::now();
-                }
-
-                if selection_before != state.cursor.selection(&value) {
-                    shell.request_redraw();
-                }
-
-                shell.capture_event();
-            }
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                text,
-                modified_key,
-                physical_key,
-                ..
-            }) => {
-                if let Some(focus) = &mut state.is_focused {
-                    let modifiers = state.keyboard_modifiers;
-
-                    match key.to_latin(*physical_key) {
-                        Some('c') if state.keyboard_modifiers.command() && !self.is_secure => {
-                            if let Some((start, end)) = state.cursor.selection(&self.value) {
-                                shell.write_clipboard(clipboard::Content::Text(
-                                    self.value.select(start, end).to_string(),
-                                ));
-                            }
-
-                            shell.capture_event();
-                            return;
-                        }
-                        Some('x') if state.keyboard_modifiers.command() && !self.is_secure => {
-                            let Some(on_input) = &self.on_input else {
-                                return;
-                            };
-
-                            if let Some((start, end)) = state.cursor.selection(&self.value) {
-                                shell.write_clipboard(clipboard::Content::Text(
-                                    self.value.select(start, end).to_string(),
-                                ));
-                            }
-
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                            editor.delete();
-
-                            let value_str = self.value.to_string();
-                            if value_str.ends_with('.') {
-                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
-                                let prefix = &value_str[..value_str.len() - 1];
-                                if let Ok(mut parsed) = prefix.parse::<T>() {
-                                    if parsed > self.max {
-                                        parsed = self.max.clone();
-                                    } else if parsed < self.min {
-                                        parsed = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(parsed));
-                                }
-                                state.display_override = Some(value_str);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
-                            } else if let Ok(mut parsed) = value_str.parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                state.display_override = if parsed.to_string() != value_str {
-                                    Some(value_str)
-                                } else {
-                                    None
-                                };
-                                let message = (on_input)(parsed);
-                                shell.publish(message);
-                            } else {
-                                if self.value.is_empty() {
-                                    state.is_empty = true;
-                                    state.is_empty_neg = false;
-                                    state.display_override = None;
-                                    // Field was cleared — publish 0 (clamped to bounds).
-                                    let mut zero = T::default();
-                                    if zero > self.max {
-                                        zero = self.max.clone();
-                                    } else if zero < self.min {
-                                        zero = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(zero));
-                                } else if self.value.to_string() == *"-" {
-                                    state.is_empty = false;
-                                    state.is_empty_neg = true;
-                                    state.display_override = None;
-                                } else {
-                                    state.display_override = None;
-                                }
-                                shell.request_redraw();
-                            }
-                            shell.capture_event();
-
-                            focus.updated_at = Instant::now();
-                            update_cache(state, &self.value);
-                            return;
-                        }
-                        Some('v')
-                            if state.keyboard_modifiers.command()
-                                && !state.keyboard_modifiers.alt() =>
-                        {
-                            let Some(on_input) = &self.on_input else {
-                                return;
-                            };
-
-                            let content = match &state.is_pasting {
-                                Some(Paste::Pasting(content)) => content,
-                                Some(Paste::Reading) => return,
-                                None => {
-                                    shell.read_clipboard(clipboard::Kind::Text);
-                                    state.is_pasting = Some(Paste::Reading);
-                                    return;
-                                }
-                            };
-
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                            if !content.is_empty() {
-                                editor.paste(content.clone());
-                            }
-
-                            if let Ok(mut parsed) = editor.contents().parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                let message = if let Some(paste) = &self.on_paste {
-                                    (paste)(parsed)
-                                } else {
-                                    (on_input)(parsed)
-                                };
-                                shell.publish(message);
-                                shell.capture_event();
-
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                state.display_override = None;
-                                state.is_pasting = Some(Paste::Pasting(content.clone()));
-                                focus.updated_at = Instant::now();
-                                update_cache(state, &self.value);
-                            } else {
-                                for _ in 0..content.len() {
-                                    editor.backspace();
-                                }
-                                state.display_override = None;
-                            }
-                            return;
-                        }
-                        Some('a') if state.keyboard_modifiers.command() => {
-                            let cursor_before = state.cursor;
-
-                            state.cursor.select_all(&self.value);
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    if let Some(text) = text {
-                        let Some(on_input) = &self.on_input else {
-                            return;
-                        };
-
-                        state.is_pasting = None;
-
-                        if let Some(c) = text.chars().next().filter(|c| !c.is_control()) {
-                            // Normalize locale decimal separator to '.'
-                            let c = if c == ',' { '.' } else { c };
-
-                            let has_selection = state.cursor.selection(&self.value).is_some();
-                            let has_dot = self.value.to_string().contains('.');
-
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                            if (c.is_ascii_digit() || c == '-' || c == '.')
-                                && (c != '.' || !has_dot || has_selection)
-                            {
-                                editor.insert(c);
-                                // When a selection was active but didn't cover the existing dot wew
-                                // may have introduced a duplicate, roll back in that case.
-                                if c == '.'
-                                    && editor.contents().chars().filter(|&ch| ch == '.').count() > 1
-                                {
-                                    editor.backspace();
-                                }
-                            }
-
-                            let value_str = editor.contents();
-                            if c == '.' && value_str.ends_with('.') {
-                                // Trailing dot: guard before parse because
-                                // "5.".parse::<f64>() = Ok(5.0) in Rust.
-                                let prefix = &value_str[..value_str.len() - 1];
-                                let test = if prefix.is_empty() {
-                                    "0.1".to_string()
-                                } else if prefix == "-" {
-                                    "-0.1".to_string()
-                                } else {
-                                    format!("{prefix}.1")
-                                };
-                                if test.parse::<T>().is_ok() {
-                                    // Normalize bare "." -> "0." and "-." -> "-0." so the
-                                    // display reads "0." / "-0.", the norm in most apps.
-                                    // Done through the editor so the cursor ends up after
-                                    // the dot without needing a sub-scope or snapshots.
-                                    if prefix.is_empty() || prefix == "-" {
-                                        editor.backspace();
-                                        editor.insert('0');
-                                        editor.insert('.');
-                                    }
-                                    // Publish the integer part immediately
-                                    // (e.g. "5."->5, "0."->0, "-0."->-0).
-                                    let current = editor.contents();
-                                    let int_part = &current[..current.len() - 1];
-                                    if let Ok(mut parsed) = int_part.parse::<T>() {
-                                        if parsed > self.max {
-                                            parsed = self.max.clone();
-                                        } else if parsed < self.min {
-                                            parsed = self.min.clone();
-                                        }
-                                        shell.publish((on_input)(parsed));
-                                    }
-                                    state.display_override = Some(current);
-                                    state.is_empty = false;
-                                    state.is_empty_neg = false;
-                                    shell.request_redraw();
-                                } else {
-                                    // T doesn't support decimals, revert.
-                                    editor.backspace();
-                                }
-                            } else if let Ok(mut parsed) = value_str.parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                let canonical = parsed.to_string();
-                                if canonical != value_str {
-                                    // Canonical differs (e.g. "5.0"->"5", "5.50"->"5.5").
-                                    // Preserve the typed string, normalise a bare leading
-                                    // dot as a safety net (".5"->"0.5").
-                                    let display = if value_str.starts_with('.') {
-                                        format!("0{value_str}")
-                                    } else if value_str.starts_with("-.") {
-                                        format!("-0{}", &value_str[1..])
-                                    } else {
-                                        value_str
-                                    };
-                                    state.display_override = Some(display);
-                                } else {
-                                    state.display_override = None;
-                                }
-                                let message = (on_input)(parsed);
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                            } else if c == '-' && value_str == "-" {
-                                state.display_override = None;
-                                state.is_empty = false;
-                                state.is_empty_neg = true;
-                                shell.request_redraw();
-                            } else {
-                                // Invalid result, revert.
-                                editor.backspace();
-                            }
-                            shell.capture_event();
-
-                            focus.updated_at = Instant::now();
-                            update_cache(state, &self.value);
-                            return;
-                        }
-                    }
-
-                    #[cfg(target_os = "macos")]
-                    let macos_shortcut = crate::text_editor::convert_macos_shortcut(key, modifiers);
-
-                    #[cfg(target_os = "macos")]
-                    let modified_key = macos_shortcut.as_ref().unwrap_or(modified_key);
-
-                    match modified_key.as_ref() {
-                        keyboard::Key::Named(key::Named::Enter) => {
-                            if let Some(on_submit) = self.on_submit.clone() {
-                                shell.publish(on_submit);
-                                shell.capture_event();
-                            }
-                        }
-                        keyboard::Key::Named(key::Named::Backspace) => {
-                            let Some(on_input) = &self.on_input else {
-                                return;
-                            };
-
-                            let cursor_before = state.cursor;
-
-                            if modifiers.jump() && state.cursor.selection(&self.value).is_none() {
-                                if self.is_secure {
-                                    let cursor_pos = state.cursor.end(&self.value);
-                                    state.cursor.select_range(0, cursor_pos);
-                                } else {
-                                    state.cursor.select_left_by_words(&self.value);
-                                }
-                            }
-
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                            editor.backspace();
-
-                            let value_str = self.value.to_string();
-                            if value_str.ends_with('.') {
-                                // Backspace left a trailing dot (e.g. "5.5"->"5.").
-                                // "5.".parse::<f64>() = Ok(5.0) so guard before parse.
-                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
-                                let prefix = &value_str[..value_str.len() - 1];
-                                if let Ok(mut parsed) = prefix.parse::<T>() {
-                                    if parsed > self.max {
-                                        parsed = self.max.clone();
-                                    } else if parsed < self.min {
-                                        parsed = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(parsed));
-                                }
-                                state.display_override = Some(value_str);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
-                            } else if let Ok(mut parsed) = value_str.parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                // Keep display_override when trailing zeros remain
-                                // (e.g. "5.100"->backspace->"5.10", canonical "5.1" != "5.10").
-                                state.display_override = if parsed.to_string() != value_str {
-                                    Some(value_str)
-                                } else {
-                                    None
-                                };
-                                let message = (on_input)(parsed);
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-
-                                if cursor_before != state.cursor {
-                                    shell.request_redraw();
-                                }
-                            } else {
-                                if self.value.is_empty() {
-                                    state.is_empty = true;
-                                    state.is_empty_neg = false;
-                                    state.display_override = None;
-                                    // Field was cleared, publish 0 (clamped to bounds).
-                                    let mut zero = T::default();
-                                    if zero > self.max {
-                                        zero = self.max.clone();
-                                    } else if zero < self.min {
-                                        zero = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(zero));
-                                } else if self.value.to_string() == *"-" {
-                                    state.is_empty = false;
-                                    state.is_empty_neg = true;
-                                    state.display_override = None;
-                                } else {
-                                    state.display_override = None;
-                                }
-                                shell.request_redraw();
-                            }
-                            shell.capture_event();
-
-                            focus.updated_at = Instant::now();
-                            update_cache(state, &self.value);
-                        }
-                        keyboard::Key::Named(key::Named::Delete) => {
-                            let Some(on_input) = &self.on_input else {
-                                return;
-                            };
-
-                            if modifiers.jump() && state.cursor.selection(&self.value).is_none() {
-                                if self.is_secure {
-                                    let cursor_pos = state.cursor.end(&self.value);
-                                    state.cursor.select_range(cursor_pos, self.value.len());
-                                } else {
-                                    state.cursor.select_right_by_words(&self.value);
-                                }
-                            }
-
-                            let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                            editor.delete();
-
-                            let value_str = self.value.to_string();
-                            if value_str.ends_with('.') {
-                                // Publish the integer part immediately (e.g. "5."->5, "0."->0).
-                                let prefix = &value_str[..value_str.len() - 1];
-                                if let Ok(mut parsed) = prefix.parse::<T>() {
-                                    if parsed > self.max {
-                                        parsed = self.max.clone();
-                                    } else if parsed < self.min {
-                                        parsed = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(parsed));
-                                }
-                                state.display_override = Some(value_str);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                                shell.request_redraw();
-                            } else if let Ok(mut parsed) = value_str.parse() {
-                                if parsed > self.max {
-                                    parsed = self.max.clone();
-                                } else if parsed < self.min {
-                                    parsed = self.min.clone();
-                                }
-                                state.display_override = if parsed.to_string() != value_str {
-                                    Some(value_str)
-                                } else {
-                                    None
-                                };
-                                let message = (on_input)(parsed);
-                                shell.publish(message);
-                                state.is_empty = false;
-                                state.is_empty_neg = false;
-                            } else {
-                                if self.value.is_empty() {
-                                    state.is_empty = true;
-                                    state.is_empty_neg = false;
-                                    state.display_override = None;
-                                    // Field was cleared, publish 0 (clamped to bounds).
-                                    let mut zero = T::default();
-                                    if zero > self.max {
-                                        zero = self.max.clone();
-                                    } else if zero < self.min {
-                                        zero = self.min.clone();
-                                    }
-                                    shell.publish((on_input)(zero));
-                                } else if self.value.to_string() == *"-" {
-                                    state.is_empty = false;
-                                    state.is_empty_neg = true;
-                                    state.display_override = None;
-                                } else {
-                                    state.display_override = None;
-                                }
-                                shell.request_redraw();
-                            }
-                            shell.capture_event();
-
-                            focus.updated_at = Instant::now();
-                            update_cache(state, &self.value);
-                        }
-                        keyboard::Key::Named(key::Named::Home) => {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.shift() {
-                                state
-                                    .cursor
-                                    .select_range(state.cursor.start(&self.value), 0);
-                            } else {
-                                state.cursor.move_to(0);
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::End) => {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.shift() {
-                                state.cursor.select_range(
-                                    state.cursor.start(&self.value),
-                                    self.value.len(),
-                                );
-                            } else {
-                                state.cursor.move_to(self.value.len());
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::ArrowLeft)
-                            if modifiers.macos_command() =>
-                        {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.shift() {
-                                state
-                                    .cursor
-                                    .select_range(state.cursor.start(&self.value), 0);
-                            } else {
-                                state.cursor.move_to(0);
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::ArrowRight)
-                            if modifiers.macos_command() =>
-                        {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.shift() {
-                                state.cursor.select_range(
-                                    state.cursor.start(&self.value),
-                                    self.value.len(),
-                                );
-                            } else {
-                                state.cursor.move_to(self.value.len());
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::ArrowLeft) => {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.jump() && !self.is_secure {
-                                if modifiers.shift() {
-                                    state.cursor.select_left_by_words(&self.value);
-                                } else {
-                                    state.cursor.move_left_by_words(&self.value);
-                                }
-                            } else if modifiers.shift() {
-                                state.cursor.select_left(&self.value);
-                            } else {
-                                state.cursor.move_left(&self.value);
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::ArrowRight) => {
-                            let cursor_before = state.cursor;
-
-                            if modifiers.jump() && !self.is_secure {
-                                if modifiers.shift() {
-                                    state.cursor.select_right_by_words(&self.value);
-                                } else {
-                                    state.cursor.move_right_by_words(&self.value);
-                                }
-                            } else if modifiers.shift() {
-                                state.cursor.select_right(&self.value);
-                            } else {
-                                state.cursor.move_right(&self.value);
-                            }
-
-                            if cursor_before != state.cursor {
-                                focus.updated_at = Instant::now();
-
-                                shell.request_redraw();
-                            }
-
-                            shell.capture_event();
-                        }
-                        keyboard::Key::Named(key::Named::Escape) => {
-                            state.is_focused = None;
-                            state.is_dragging = false;
-                            state.is_pasting = None;
-
-                            state.keyboard_modifiers = keyboard::Modifiers::default();
-
-                            self.on_unfocus(state, shell);
-                            shell.capture_event();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                if state.is_focused.is_some()
-                    && let keyboard::Key::Character("v") = key.as_ref()
-                {
-                    state.is_pasting = None;
-                    shell.capture_event();
-                }
-
-                state.is_pasting = None;
-            }
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                state.keyboard_modifiers = *modifiers;
-            }
-            Event::Clipboard(clipboard::Event::Read(Ok(content))) => {
-                let Some(on_input) = &self.on_input else {
-                    return;
-                };
-
-                let Some(focus) = &mut state.is_focused else {
-                    return;
-                };
-
-                if let clipboard::Content::Text(text) = content.as_ref()
-                    && let Some(Paste::Reading) = state.is_pasting
-                {
-                    let content: String = text.chars().filter(|c| !c.is_control()).collect();
-
-                    let value = if content.parse::<T>().is_ok() {
-                        Value::new(&content)
-                    } else {
-                        Value::new("")
-                    };
-
-                    state.is_pasting = Some(Paste::Pasting(value.clone()));
-
-                    let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                    if !value.is_empty() {
-                        editor.paste(value.clone());
-                    }
-
-                    if let Ok(mut parsed) = editor.contents().parse() {
-                        if parsed > self.max {
-                            parsed = self.max.clone();
-                        } else if parsed < self.min {
-                            parsed = self.min.clone();
-                        }
-                        let message = if let Some(paste) = &self.on_paste {
-                            (paste)(parsed)
-                        } else {
-                            (on_input)(parsed)
-                        };
-                        shell.publish(message);
-                        shell.capture_event();
-
-                        state.is_empty = false;
-                        state.is_empty_neg = false;
-                        state.display_override = None;
-                        state.is_pasting = Some(Paste::Pasting(value));
-                        focus.updated_at = Instant::now();
-                        update_cache(state, &self.value);
-                    } else {
-                        for _ in 0..content.len() {
-                            editor.backspace();
-                        }
-                        state.display_override = None;
-                    }
-                    return;
-                }
-            }
-            Event::InputMethod(event) => match event {
-                input_method::Event::Opened | input_method::Event::Closed => {
-                    state.preedit = matches!(event, input_method::Event::Opened)
-                        .then(input_method::Preedit::new);
-
-                    shell.request_redraw();
-                }
-                input_method::Event::Preedit(content, selection) => {
-                    if state.is_focused.is_some() {
-                        state.preedit = Some(input_method::Preedit {
-                            content: content.to_owned(),
-                            selection: selection.clone(),
-                            text_size: self.size,
-                        });
-
-                        shell.request_redraw();
-                    }
-                }
-                input_method::Event::Commit(text) => {
-                    if let Some(focus) = &mut state.is_focused {
-                        let Some(on_input) = &self.on_input else {
-                            return;
-                        };
-
-                        let mut editor = Editor::new(&mut self.value, &mut state.cursor);
-                        if text.parse::<T>().is_ok() {
-                            editor.paste(Value::new(text));
-                        }
-
-                        focus.updated_at = Instant::now();
-                        state.is_pasting = None;
-
-                        if let Ok(mut parsed) = editor.contents().parse() {
-                            if parsed > self.max {
-                                parsed = self.max.clone();
-                            } else if parsed < self.min {
-                                parsed = self.min.clone();
-                            }
-                            let message = (on_input)(parsed);
-                            shell.publish(message);
-                            shell.capture_event();
-                            state.is_empty = false;
-                            state.is_empty_neg = false;
-                            state.display_override = None;
-
-                            update_cache(state, &self.value);
-                        } else {
-                            for _ in 0..text.len() {
-                                editor.backspace();
-                            }
-                            if self.value.is_empty() {
-                                state.is_empty = true;
-                                state.is_empty_neg = false;
-                                state.display_override = None;
-                            } else if self.value.to_string() == *"-" {
-                                state.is_empty = false;
-                                state.is_empty_neg = true;
-                                state.display_override = None;
-                            } else {
-                                state.display_override = None;
-                            }
-                            shell.request_redraw();
-                            update_cache(state, &self.value);
-                        }
-                    }
-                }
+            input_layout.bounds(),
+            *viewport,
+            text::input::Style {
+                value: style.value,
+                selection: style.selection,
+                placeholder: style.placeholder,
             },
-            Event::Window(window::Event::Unfocused) => {
-                if let Some(focus) = &mut state.is_focused {
-                    focus.is_window_focused = false;
-                }
-            }
-            Event::Window(window::Event::Focused) => {
-                if let Some(focus) = &mut state.is_focused {
-                    focus.is_window_focused = true;
-                    focus.updated_at = Instant::now();
-
-                    shell.request_redraw();
-                }
-            }
-            Event::Window(window::Event::RedrawRequested(now)) => {
-                if let Some(focus) = &mut state.is_focused
-                    && focus.is_window_focused
-                {
-                    if matches!(state.cursor.state(&self.value), cursor::State::Index(_)) {
-                        focus.now = *now;
-
-                        let millis_until_redraw = CURSOR_BLINK_INTERVAL_MILLIS
-                            - (*now - focus.updated_at).as_millis() % CURSOR_BLINK_INTERVAL_MILLIS;
-
-                        shell.request_redraw_at(
-                            *now + Duration::from_millis(millis_until_redraw as u64),
-                        );
-                    }
-
-                    shell.request_input_method(&self.input_method(state, layout, &self.value));
-                }
-            }
-            _ => {}
-        }
-
-        let is_disabled = self.on_input.is_none();
-
-        let status = if is_disabled {
-            Status::Disabled
-        } else if state.is_focused() {
-            Status::Focused {
-                is_hovered: cursor.is_over(layout.bounds()),
-            }
-        } else if cursor.is_over(layout.bounds()) {
-            Status::Hovered
-        } else {
-            Status::Active
-        };
-
-        if let Event::Window(window::Event::RedrawRequested(_now)) = event {
-            self.last_status = Some(status);
-        } else if self
-            .last_status
-            .is_some_and(|last_status| status != last_status)
-        {
-            shell.request_redraw();
-        }
-
-        if state.is_empty && !self.value.is_empty() {
-            self.value = Value::new("");
-            shell.request_redraw();
-        } else if state.is_empty_neg && self.value.to_string() != *"-" {
-            self.value = Value::new("-");
-            replace_paragraph(
-                renderer,
-                state,
-                layout,
-                &self.value,
-                self.font,
-                self.size,
-                self.line_height,
-            );
-            shell.request_redraw();
-        } else if let Some(display) = &state.display_override {
-            // The parent re-rendered with the canonical (shorter) value, e.g. "5" when
-            // the user had typed "5.", "5.0", or "5.50".  Restore the exact typed string
-            // so the display stays stable while the user continues editing.
-            let display = display.clone();
-            if self.value.to_string() != display {
-                self.value = Value::new(&display);
-                replace_paragraph(
-                    renderer,
-                    state,
-                    layout,
-                    &self.value,
-                    self.font,
-                    self.size,
-                    self.line_height,
-                );
-                shell.request_redraw();
-            }
-        }
-
-        // Record focus state so the next update() call can detect operation-driven unfocus.
-        state.was_focused = state.is_focused();
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.draw(tree, renderer, theme, style, layout, cursor, None, viewport);
+        );
     }
 
     fn mouse_interaction(
@@ -2026,17 +906,8 @@ where
             if self.on_input.is_none() {
                 mouse::Interaction::Idle
             } else {
-                let (increment_layout, decrement_layout) = if self.icon.is_some() {
-                    (
-                        layout.children().nth(2).unwrap(),
-                        layout.children().nth(3).unwrap(),
-                    )
-                } else {
-                    (
-                        layout.children().nth(1).unwrap(),
-                        layout.children().nth(2).unwrap(),
-                    )
-                };
+                let (increment_layout, decrement_layout) = self.button_layouts(layout);
+
                 if cursor.is_over(increment_layout.bounds())
                     || cursor.is_over(decrement_layout.bounds())
                 {
@@ -2051,12 +922,55 @@ where
     }
 }
 
+impl<'a, T, Message, Theme, Renderer> NumberInput<'a, T, Message, Theme, Renderer>
+where
+    Message: Clone,
+    Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
+    Renderer: text::Renderer + 'static,
+    T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
+{
+    /// Steps the value when the wheel is scrolled over the widget, returning whether
+    /// the event was consumed.
+    fn wheel_step(
+        &self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
+            return false;
+        };
+
+        if !cursor.is_over(layout.bounds()) {
+            return false;
+        }
+
+        let y = match delta {
+            mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => *y,
+        };
+
+        if y == 0.0 {
+            return false;
+        }
+
+        if let Some(message) = self.step(y > 0.0) {
+            shell.publish(message);
+            shell.request_redraw();
+        }
+
+        shell.capture_event();
+
+        true
+    }
+}
+
 impl<'a, T, Message, Theme, Renderer> From<NumberInput<'a, T, Message, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
     Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer + 'static,
     T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
 {
     fn from(
@@ -2068,7 +982,7 @@ where
 
 /// The content of the [`Icon`].
 #[derive(Debug, Clone)]
-pub struct Icon<Font> {
+pub struct Icon {
     /// The font that will be used to display the `code_point`.
     pub font: Font,
     /// The unicode code point that will be used as the icon.
@@ -2091,245 +1005,86 @@ pub enum Side {
 }
 
 /// The state of a [`NumberInput`].
-#[derive(Debug, Default, Clone)]
-pub struct State<P: text::Paragraph> {
-    value: paragraph::Plain<P>,
-    placeholder: paragraph::Plain<P>,
-    icon: paragraph::Plain<P>,
-    is_focused: Option<Focus>,
-    /// Mirrors `is_focused.is_some()` as of the previous `update()` call.
-    /// Used to detect when focus was revoked by an operation (e.g. Tab
-    /// navigation) between frames rather than by a handled event.
+struct State<R: text::Renderer> {
+    input: text::Input<R>,
+    icon: paragraph::Plain<R::Paragraph>,
+    transaction: Option<shell::Tracking>,
+    /// Mirrors `input.is_focused()` as of the previous `update()` call, so focus
+    /// revoked by an operation between frames can be told apart from focus that is
+    /// still held.
     was_focused: bool,
-    is_dragging: bool,
-    is_pasting: Option<Paste>,
-    is_empty: bool,
-    is_empty_neg: bool,
-    /// Stores the exact string the user has typed when it differs from the canonical
-    /// `T::to_string()` representation, e.g. `"5."`, `"5.0"`, `"5.50"`. Restored each
-    /// update call so the display does not collapse to the shorter canonical form while
-    /// the user is still editing.  Cleared on unfocus, Escape, or when the typed and
-    /// canonical strings agree again.
-    display_override: Option<String>,
-    preedit: Option<input_method::Preedit>,
-    last_click: Option<mouse::Click>,
-    cursor: Cursor,
-    keyboard_modifiers: keyboard::Modifiers,
-    // TODO: Add stateful horizontal scrolling offset
 }
 
-fn state<Renderer: text::Renderer>(tree: &mut Tree) -> &mut State<Renderer::Paragraph> {
-    tree.state.downcast_mut::<State<Renderer::Paragraph>>()
-}
-
-#[derive(Debug, Clone)]
-struct Focus {
-    updated_at: Instant,
-    now: Instant,
-    is_window_focused: bool,
-}
-
-#[derive(Debug, Clone)]
-enum Paste {
-    Reading,
-    Pasting(Value),
-}
-
-impl<P: text::Paragraph> State<P> {
+impl<R: text::Renderer> State<R> {
     /// Creates a new [`State`], representing an unfocused [`NumberInput`].
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns whether the [`NumberInput`] is currently focused or not.
-    pub fn is_focused(&self) -> bool {
-        self.is_focused.is_some()
-    }
-
-    /// Returns the [`Cursor`] of the [`NumberInput`].
-    pub fn cursor(&self) -> Cursor {
-        self.cursor
-    }
-
-    /// Focuses the [`NumberInput`].
-    pub fn focus(&mut self) {
-        let now = Instant::now();
-
-        self.is_focused = Some(Focus {
-            updated_at: now,
-            now,
-            is_window_focused: true,
-        });
-
-        self.select_all();
-    }
-
-    /// Unfocuses the [`NumberInput`].
-    pub fn unfocus(&mut self) {
-        self.is_focused = None;
-    }
-
-    /// Moves the [`Cursor`] of the [`NumberInput`] to the front of the input value.
-    pub fn move_cursor_to_front(&mut self) {
-        self.cursor.move_to(0);
-    }
-
-    /// Moves the [`Cursor`] of the [`NumberInput`] to the end of the input value.
-    pub fn move_cursor_to_end(&mut self) {
-        self.cursor.move_to(usize::MAX);
-    }
-
-    /// Moves the [`Cursor`] of the [`NumberInput`] to an arbitrary location.
-    pub fn move_cursor_to(&mut self, position: usize) {
-        self.cursor.move_to(position);
-    }
-
-    /// Selects all the content of the [`NumberInput`].
-    pub fn select_all(&mut self) {
-        self.cursor.select_range(0, usize::MAX);
-    }
-
-    /// Selects the given range of the content of the [`NumberInput`].
-    pub fn select_range(&mut self, start: usize, end: usize) {
-        self.cursor.select_range(start, end);
-    }
-}
-
-impl<P: text::Paragraph> operation::Focusable for State<P> {
-    fn is_focused(&self) -> bool {
-        State::is_focused(self)
-    }
-
-    fn focus(&mut self) {
-        State::focus(self);
-    }
-
-    fn unfocus(&mut self) {
-        State::unfocus(self);
-    }
-}
-
-impl<P: text::Paragraph> operation::TextInput for State<P> {
-    fn text(&self) -> &str {
-        if self.value.content().is_empty() {
-            self.placeholder.content()
-        } else {
-            self.value.content()
+    fn new() -> Self {
+        Self {
+            input: text::Input::new(),
+            icon: paragraph::Plain::default(),
+            transaction: None,
+            was_focused: false,
         }
     }
-
-    fn move_cursor_to_front(&mut self) {
-        State::move_cursor_to_front(self);
-    }
-
-    fn move_cursor_to_end(&mut self) {
-        State::move_cursor_to_end(self);
-    }
-
-    fn move_cursor_to(&mut self, position: usize) {
-        State::move_cursor_to(self, position);
-    }
-
-    fn select_all(&mut self) {
-        State::select_all(self);
-    }
-
-    fn select_range(&mut self, start: usize, end: usize) {
-        State::select_range(self, start, end);
-    }
 }
 
-fn offset<P: text::Paragraph>(text_bounds: Rectangle, value: &Value, state: &State<P>) -> f32 {
-    if state.is_focused() {
-        let cursor = state.cursor();
-
-        let focus_position = match cursor.state(value) {
-            cursor::State::Index(i) => i,
-            cursor::State::Selection { end, .. } => end,
-        };
-
-        let (_, offset) =
-            measure_cursor_and_scroll_offset(state.value.raw(), text_bounds, focus_position);
-
-        offset
-    } else {
-        0.0
-    }
-}
-
-fn measure_cursor_and_scroll_offset(
-    paragraph: &impl text::Paragraph,
-    text_bounds: Rectangle,
-    cursor_index: usize,
-) -> (f32, f32) {
-    let grapheme_position = paragraph
-        .grapheme_position(0, cursor_index)
-        .unwrap_or(Point::ORIGIN);
-
-    let offset = ((grapheme_position.x + 5.0) - text_bounds.width).max(0.0);
-
-    (grapheme_position.x, offset)
-}
-
-/// Computes the position of the cursor at the given X coordinate of
-/// a [`NumberInput`].
-fn find_cursor_position<P: text::Paragraph>(
-    text_bounds: Rectangle,
-    value: &Value,
-    state: &State<P>,
-    x: f32,
-) -> Option<usize> {
-    let offset = offset(text_bounds, value, state);
-    let value = value.to_string();
-
-    let char_offset = state
-        .value
-        .raw()
-        .hit_test(Point::new(x + offset, text_bounds.height / 2.0))
-        .map(text::Hit::cursor)?;
-
-    Some(
-        unicode_segmentation::UnicodeSegmentation::graphemes(
-            &value[..char_offset.min(value.len())],
-            true,
-        )
-        .count(),
-    )
-}
-
-fn replace_paragraph<Renderer>(
-    renderer: &Renderer,
-    state: &mut State<Renderer::Paragraph>,
-    layout: Layout<'_>,
-    value: &Value,
-    font: Option<Renderer::Font>,
-    text_size: Option<Pixels>,
-    line_height: text::LineHeight,
-) where
-    Renderer: text::Renderer,
+/// Parses the text an editing session can hold, including the partial states `""`,
+/// `"-"`, `"5."` and `".5"`, into a `T`.
+fn parse_number<T>(text: &str) -> Option<T>
+where
+    T: Num + FromStr,
 {
-    let font = font.unwrap_or_else(|| renderer.default_font());
-    let text_size = text_size.unwrap_or_else(|| renderer.default_size());
+    if text.is_empty() || text == "-" {
+        return Some(T::zero());
+    }
 
-    let mut children_layout = layout.children();
-    let text_bounds = children_layout.next().unwrap().bounds();
+    let mut probe = String::with_capacity(text.len() + 2);
+    probe.push_str(text);
 
-    state.value = paragraph::Plain::new(Text {
-        font,
-        line_height,
-        content: value.to_string(),
-        bounds: Size::new(f32::INFINITY, text_bounds.height),
-        size: text_size,
-        align_x: text::Alignment::Default,
-        align_y: alignment::Vertical::Center,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::default(),
-        ellipsis: text::Ellipsis::None,
-        hint_factor: renderer.scale_factor(),
-    });
+    if probe.starts_with('.') {
+        probe.insert(0, '0');
+    } else if probe.starts_with("-.") {
+        probe.insert(1, '0');
+    }
+
+    if probe.ends_with('.') {
+        probe.push('0');
+    }
+
+    probe.parse().ok()
 }
 
-const CURSOR_BLINK_INTERVAL_MILLIS: u128 = 500;
+/// Returns whether `text` is a number still being typed rather than a finished one.
+fn is_partial_number(text: &str) -> bool {
+    text.is_empty() || text == "-" || text.ends_with('.')
+}
+
+/// Returns whether `text` is something the user can keep typing towards a `T`.
+///
+/// A decimal point is rejected on integer types because the probe parse in
+/// [`parse_number`] fails for them.
+fn is_number_text<T>(text: &str) -> bool
+where
+    T: Num + FromStr + Bounded + PartialOrd,
+{
+    let body = match text.strip_prefix('-') {
+        Some(body) => {
+            if T::min_value() >= T::zero() {
+                return false;
+            }
+
+            body
+        }
+        None => text,
+    };
+
+    if !body.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || body.chars().filter(|c| *c == '.').count() > 1
+    {
+        return false;
+    }
+
+    body.is_empty() || parse_number::<T>(text).is_some()
+}
 
 /// The possible status of a [`NumberInput`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2482,22 +1237,6 @@ pub fn bottom_button(theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
         border: border::rounded(border::bottom(2)),
         ..base
-    }
-}
-
-fn alignment_offset(
-    text_bounds_width: f32,
-    text_min_width: f32,
-    alignment: alignment::Horizontal,
-) -> f32 {
-    if text_min_width > text_bounds_width {
-        0.0
-    } else {
-        match alignment {
-            alignment::Horizontal::Left => 0.0,
-            alignment::Horizontal::Center => (text_bounds_width - text_min_width) / 2.0,
-            alignment::Horizontal::Right => text_bounds_width - text_min_width,
-        }
     }
 }
 

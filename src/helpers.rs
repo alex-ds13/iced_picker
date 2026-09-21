@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-use crate::text_input::TextInput;
 use iced::widget::{
-    Button, Row, Rule, Text, button, container, row, rule,
+    Button, Row, Rule, Text, TextInput, button, container, row, rule,
     text::{self, IntoFragment},
     tooltip,
 };

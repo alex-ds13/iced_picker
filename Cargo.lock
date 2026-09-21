@@ -1275,7 +1275,6 @@ dependencies = [
  "log",
  "num-traits",
  "smol",
- "unicode-segmentation",
 ]
 
 [[package]]
