@@ -16,5 +16,5 @@ smol = "2.0.2"
 unicode-segmentation = "1"
 
 [patch.crates-io]
-iced = { git = "https://github.com/alex-ds13/iced.git", branch = "bless-component-with-fixes" }
-iced_core = { git = "https://github.com/alex-ds13/iced.git", branch = "bless-component-with-fixes" }
+iced = { git = "https://github.com/alex-ds13/iced.git", branch = "master-with-fixes" }
+iced_core = { git = "https://github.com/alex-ds13/iced.git", branch = "master-with-fixes" }

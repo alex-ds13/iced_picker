@@ -239,10 +239,11 @@ where
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        operation.container(None, layout.bounds());
+        operation.container(None, layout.bounds(), viewport);
         operation.traverse(&mut |operation| {
             self.children
                 .iter_mut()
@@ -251,7 +252,7 @@ where
                 .for_each(|((child, state), layout)| {
                     child
                         .as_widget_mut()
-                        .operate(state, layout, renderer, operation);
+                        .operate(state, layout, viewport, renderer, operation);
                 });
         });
     }
@@ -335,6 +336,7 @@ where
                             cursor: position,
                         };
                         shell.capture_event();
+                        shell.invalidate_overlay();
                         shell.request_redraw();
                     }
                     Action::Dragging {
@@ -404,6 +406,7 @@ where
                         }
                     }
                     shell.capture_event();
+                    shell.invalidate_overlay();
                     shell.request_redraw();
                 }
             }
@@ -541,19 +544,21 @@ where
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
         if let Action::Dragging {
             index, grab_offset, ..
         } = tree.state.downcast_ref::<State>().action
             && index < self.children.len()
             && let Some(child_layout) = layout.children().nth(index)
         {
-            return Some(overlay::Element::new(Box::new(PickedRow {
+            return vec![overlay::Element::new(Box::new(PickedRow {
                 content: &self.children[index],
                 tree: &tree.children[index],
-                layout: child_layout,
+                layout: child_layout.move_to(child_layout.position() + translation),
                 grab_offset,
-            })));
+                window,
+            }))];
         }
 
         overlay::from_children(
@@ -563,6 +568,7 @@ where
             renderer,
             viewport,
             translation,
+            window,
         )
     }
 }
@@ -573,6 +579,7 @@ struct PickedRow<'a, 'b, Message, Theme, Renderer> {
     tree: &'b Tree,
     layout: Layout<'b>,
     grab_offset: Vector,
+    window: Size,
 }
 
 impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
@@ -580,17 +587,11 @@ impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer
 where
     Renderer: iced::advanced::Renderer,
 {
-    fn layout(&mut self, _renderer: &Renderer, _bounds: Size) -> layout::Node {
-        let bounds = self.layout.bounds();
-        layout::Node::new(bounds.size()).move_to(bounds.position())
-    }
-
     fn draw(
         &self,
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        _layout: Layout<'_>,
         cursor: mouse::Cursor,
     ) {
         // Place the row so it keeps its grab offset under the cursor, even
@@ -600,16 +601,18 @@ where
             .map(|position| (position - self.grab_offset) - self.layout.bounds().position())
             .unwrap_or(Vector::ZERO);
 
-        renderer.with_translation(translation, |renderer| {
-            self.content.as_widget().draw(
-                self.tree,
-                renderer,
-                theme,
-                style,
-                self.layout,
-                mouse::Cursor::Unavailable,
-                &Rectangle::INFINITE,
-            );
+        renderer.with_layer(Rectangle::with_size(self.window), |renderer| {
+            renderer.with_translation(translation, |renderer| {
+                self.content.as_widget().draw(
+                    self.tree,
+                    renderer,
+                    theme,
+                    style,
+                    self.layout,
+                    mouse::Cursor::Unavailable,
+                    &Rectangle::INFINITE,
+                );
+            });
         });
     }
 }

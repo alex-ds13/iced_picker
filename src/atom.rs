@@ -2,9 +2,13 @@ use crate::core::layout::{self, Layout};
 use crate::core::mouse;
 use crate::core::overlay;
 use crate::core::renderer;
+use crate::core::shell;
 use crate::core::widget;
 use crate::core::widget::tree::{self, Tree};
 use crate::core::{self, Element, Event, Length, Rectangle, Shell, Size, Vector, Widget};
+
+use std::cell::RefCell;
+
 use iced::widget::space;
 
 pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Renderer> {
@@ -56,7 +60,7 @@ pub struct Atom<'a, T, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
     T: Component<'a, Message, Theme, Renderer> + 'a,
 {
-    pub component: T,
+    component: RefCell<T>,
     pub width: Length,
     pub height: Length,
     pub content: Element<'a, T::Event, Theme, Renderer>,
@@ -70,7 +74,7 @@ where
     /// Creates a new [`Atom`] widget that encapsulates a [`Component`]
     pub fn new(component: T) -> Self {
         Self {
-            component,
+            component: RefCell::new(component),
             width: Length::Shrink,
             height: Length::Shrink,
             content: Element::new(space()),
@@ -98,17 +102,16 @@ where
     Renderer: core::Renderer,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<T::State>()
+        tree::Tag::of::<RefCell<T::State>>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(T::State::default())
+        tree::State::new(RefCell::new(T::State::default()))
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        // The Tree diff is deferred to layout, here we simply call the component diff function to
-        // diff the `State`
-        self.component.diff(tree.state.downcast_mut());
+        let state = tree.state.downcast_ref::<RefCell<T::State>>();
+        self.component.borrow().diff(&mut state.borrow_mut());
     }
 
     fn size(&self) -> Size<Length> {
@@ -121,8 +124,10 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let state = tree.state.downcast_mut::<T::State>();
-        self.content = self.component.view(state);
+        let state = tree.state.downcast_ref::<RefCell<T::State>>().borrow();
+        self.content = self.component.borrow().view(&state);
+        drop(state);
+
         tree.diff_children(std::slice::from_mut(&mut self.content));
 
         let node = self
@@ -144,7 +149,7 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let mut local_messages = Vec::new();
+        let mut local_messages = shell::Bus::new();
         let mut local_shell = shell.local(&mut local_messages);
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -160,17 +165,20 @@ where
             shell.capture_event();
         }
 
-        local_shell.revalidate_layout(|diff| shell.invalidate_layout_with(diff));
+        shell.invalidate(local_shell.invalidation());
         shell.request_redraw_at(local_shell.redraw_request());
         shell.request_input_method(local_shell.input_method());
+        shell.clipboard_mut().merge(local_shell.clipboard_mut());
+        drop(local_shell);
 
         if !local_messages.is_empty() {
-            let state = tree.state.downcast_mut::<T::State>();
-            for message in local_messages
-                .into_iter()
-                .filter_map(|message| self.component.update(state, message))
-            {
-                shell.publish(message);
+            let mut state = tree.state.downcast_ref::<RefCell<T::State>>().borrow_mut();
+            let mut component = self.component.borrow_mut();
+
+            for (event, receipt) in local_messages.drain() {
+                if let Some(message) = component.update(&mut state, event) {
+                    shell.forward(message, receipt);
+                }
             }
 
             shell.request_redraw();
@@ -220,15 +228,20 @@ where
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
-        let state = tree.state.downcast_mut::<T::State>();
-        self.component.operate(layout.bounds(), state, operation);
+        let mut state = tree.state.downcast_ref::<RefCell<T::State>>().borrow_mut();
+        self.component
+            .borrow()
+            .operate(layout.bounds(), &mut state, operation);
+        drop(state);
 
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
             layout.children().next().unwrap(),
+            viewport,
             renderer,
             operation,
         );
@@ -241,20 +254,22 @@ where
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.content
-            .as_widget_mut()
-            .overlay(
-                &mut tree.children[0],
-                layout.children().next().unwrap(),
-                renderer,
-                viewport,
-                translation,
-            )
-            .map(|element| {
-                let state = tree.state.downcast_mut::<T::State>();
-                Overlay::overlay(element, &mut self.component, state)
-            })
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
+        let overlays = self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.children().next().unwrap(),
+            renderer,
+            viewport,
+            translation,
+            window,
+        );
+        let state = tree.state.downcast_ref::<RefCell<T::State>>();
+
+        overlays
+            .into_iter()
+            .map(|element| Overlay::overlay(element, &self.component, state))
+            .collect()
     }
 }
 
@@ -263,8 +278,8 @@ where
     T: Component<'a, Message, Theme, Renderer>,
 {
     element: overlay::Element<'b, T::Event, Theme, Renderer>,
-    component: &'b mut T,
-    state: &'b mut T::State,
+    component: &'b RefCell<T>,
+    state: &'b RefCell<T::State>,
 }
 
 impl<'a, 'b, T, Message, Theme, Renderer> Overlay<'a, 'b, T, Message, Theme, Renderer>
@@ -276,8 +291,8 @@ where
 {
     pub fn overlay(
         element: overlay::Element<'b, T::Event, Theme, Renderer>,
-        component: &'b mut T,
-        state: &'b mut T::State,
+        component: &'b RefCell<T>,
+        state: &'b RefCell<T::State>,
     ) -> overlay::Element<'b, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Overlay {
             element,
@@ -293,93 +308,82 @@ where
     T: Component<'a, Message, Theme, Renderer>,
     Renderer: core::Renderer,
 {
-    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
-        self.element.as_overlay_mut().layout(renderer, bounds)
-    }
-
     fn draw(
         &self,
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
         cursor: mouse::Cursor,
     ) {
         self.element
             .as_overlay()
-            .draw(renderer, theme, style, layout, cursor);
+            .draw(renderer, theme, style, cursor);
     }
 
     fn update(
         &mut self,
         event: &Event,
-        layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
     ) {
-        let mut local_messages = Vec::new();
+        let mut local_messages = shell::Bus::new();
         let mut local_shell = shell.local(&mut local_messages);
         self.element
             .as_overlay_mut()
-            .update(event, layout, cursor, renderer, &mut local_shell);
+            .update(event, cursor, renderer, &mut local_shell);
 
         if local_shell.is_event_captured() {
             shell.capture_event();
         }
 
-        local_shell.revalidate_layout(|diff| shell.invalidate_layout_with(diff));
+        shell.invalidate(local_shell.invalidation());
         shell.request_redraw_at(local_shell.redraw_request());
         shell.request_input_method(local_shell.input_method());
+        shell.clipboard_mut().merge(local_shell.clipboard_mut());
+        drop(local_shell);
 
         if !local_messages.is_empty() {
-            for message in local_messages
-                .into_iter()
-                .filter_map(|message| self.component.update(self.state, message))
-            {
-                shell.publish(message);
+            let mut component = self.component.borrow_mut();
+            let mut state = self.state.borrow_mut();
+
+            for (event, receipt) in local_messages.drain() {
+                if let Some(message) = component.update(&mut state, event) {
+                    shell.forward(message, receipt);
+                }
             }
 
             shell.request_redraw();
+            // The view is only rebuilt in `Widget::layout`, so an overlay
+            // alone is not enough to reflect the new state
             shell.invalidate_layout();
         }
     }
 
-    fn mouse_interaction(
-        &self,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-    ) -> mouse::Interaction {
+    fn mouse_interaction(&self, cursor: mouse::Cursor, renderer: &Renderer) -> mouse::Interaction {
         self.element
             .as_overlay()
-            .mouse_interaction(layout, cursor, renderer)
+            .mouse_interaction(cursor, renderer)
     }
 
     fn index(&self) -> f32 {
         self.element.as_overlay().index()
     }
 
-    fn operate(
-        &mut self,
-        layout: Layout<'_>,
-        renderer: &Renderer,
-        operation: &mut dyn widget::Operation,
-    ) {
-        self.element
-            .as_overlay_mut()
-            .operate(layout, renderer, operation);
+    fn operate(&mut self, renderer: &Renderer, operation: &mut dyn widget::Operation) {
+        self.element.as_overlay_mut().operate(renderer, operation);
     }
 
     fn overlay<'c>(
         &'c mut self,
-        layout: Layout<'c>,
         renderer: &Renderer,
-    ) -> Option<overlay::Element<'c, Message, Theme, Renderer>> {
+    ) -> Vec<overlay::Element<'c, Message, Theme, Renderer>> {
         self.element
             .as_overlay_mut()
-            .overlay(layout, renderer)
+            .overlay(renderer)
+            .into_iter()
             .map(|element| Overlay::overlay(element, self.component, self.state))
+            .collect()
     }
 }
 

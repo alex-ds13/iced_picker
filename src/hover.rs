@@ -122,6 +122,7 @@ where
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn operation::Operation,
     ) {
@@ -132,7 +133,7 @@ where
         for (child, (layout, tree)) in children {
             child
                 .as_widget_mut()
-                .operate(tree, layout, renderer, operation);
+                .operate(tree, layout, viewport, renderer, operation);
         }
     }
 
@@ -158,6 +159,7 @@ where
             self.top.as_widget_mut().operate(
                 top_tree,
                 top_layout,
+                viewport,
                 renderer,
                 &mut operation::black_box(&mut count_focused),
             );
@@ -234,24 +236,38 @@ where
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: core::Vector,
-    ) -> Option<core::overlay::Element<'b, Message, Theme, Renderer>> {
-        let mut overlays = [&mut self.base, &mut self.top]
+        window: Size,
+    ) -> Vec<core::overlay::Element<'b, Message, Theme, Renderer>> {
+        let mut children = [&mut self.base, &mut self.top]
             .into_iter()
-            .zip(layout.children().zip(tree.children.iter_mut()))
-            .map(|(child, (layout, tree))| {
-                child
-                    .as_widget_mut()
-                    .overlay(tree, layout, renderer, viewport, translation)
-            });
+            .zip(layout.children().zip(tree.children.iter_mut()));
 
-        if let Some(base_overlay) = overlays.next()? {
-            return Some(base_overlay);
+        let (base, (base_layout, base_tree)) = children.next().unwrap();
+        let base_overlays = base.as_widget_mut().overlay(
+            base_tree,
+            base_layout,
+            renderer,
+            viewport,
+            translation,
+            window,
+        );
+
+        if !base_overlays.is_empty() {
+            return base_overlays;
         }
 
-        let top_overlay = overlays.next()?;
-        self.is_top_overlay_active = top_overlay.is_some();
+        let (top, (top_layout, top_tree)) = children.next().unwrap();
+        let top_overlays = top.as_widget_mut().overlay(
+            top_tree,
+            top_layout,
+            renderer,
+            viewport,
+            translation,
+            window,
+        );
+        self.is_top_overlay_active = !top_overlays.is_empty();
 
-        top_overlay
+        top_overlays
     }
 }
 

@@ -1,8 +1,9 @@
 use iced::{
     Alignment, Element, Fill, Length, Shrink, Task, Theme,
     widget::{
-        button, center, checkbox, column, container, operation::AbsoluteOffset, pick_list, row,
-        scrollable, space, text, text_input,
+        button, center, checkbox, column, container,
+        operation::{AbsoluteOffset, Animation},
+        pick_list, row, scrollable, space, text, text_input,
     },
 };
 use iced_picker::listview::listview;
@@ -71,6 +72,7 @@ impl List {
                     return iced::widget::operation::scroll_to(
                         "SCROLLABLE",
                         AbsoluteOffset { x: 0.0, y: offset },
+                        Animation::Auto,
                     );
                 }
             }
@@ -118,7 +120,7 @@ impl List {
 
         let filter_input = row![
             text("Show IDs ≥"),
-            text_input("0", &self.filter.to_string())
+            text_input("0", self.filter.to_string())
                 .on_input(Message::FilterChanged)
                 .width(80),
         ]

@@ -286,7 +286,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
     }
 
     fn update(
-        &mut self,
+        &self,
         state: &mut Self::State,
         event: Self::Event,
         _renderer: &Renderer,
@@ -413,14 +413,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                 }
             });
 
-        content.into()
-    }
-
-    fn size(&self) -> iced::Size<iced::Length> {
-        iced::Size {
-            width: Fill,
-            height: Fit,
-        }
+        content.width(Fill).height(Fit).into()
     }
 
     fn diff(&mut self, state: &mut Self::State) {

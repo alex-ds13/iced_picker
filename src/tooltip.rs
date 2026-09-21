@@ -228,6 +228,7 @@ where
     Renderer: text::Renderer,
 {
     fn diff(&mut self, tree: &mut widget::Tree) {
+        tree.state.downcast_mut::<State>().layout = None;
         tree.diff_children(&mut [self.content.as_widget_mut(), self.tooltip.as_widget_mut()]);
     }
 
@@ -276,33 +277,33 @@ where
         if let Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_)) = event {
             let state = tree.state.downcast_mut::<State>();
             let now = Instant::now();
-            let previous_state = *state;
-            let was_idle = matches!(*state, State::Idle { .. });
+            let previous_mode = state.mode;
+            let was_idle = matches!(state.mode, Mode::Idle { .. });
             let is_over = cursor.is_over(layout.bounds());
 
-            *state = if self.disabled {
-                State::default()
-            } else if let State::Opened {
+            state.mode = if self.disabled {
+                Mode::default()
+            } else if let Mode::Opened {
                 cursor_position,
                 over_overlay,
-            } = *state
+            } = state.mode
             {
                 if over_overlay {
-                    *state
+                    state.mode
                 } else {
                     match self.open {
                         Open::Hovered => cursor
                             .position_over(layout.bounds())
-                            .map(|_| State::Opened {
+                            .map(|_| Mode::Opened {
                                 cursor_position,
                                 over_overlay: false,
                             })
                             .unwrap_or_default(),
                         Open::LeftPointer => {
                             if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
-                                State::default()
+                                Mode::default()
                             } else {
-                                *state
+                                state.mode
                             }
                         }
                         Open::RightPointer => {
@@ -311,7 +312,7 @@ where
                             {
                                 cursor
                                     .position_over(layout.bounds())
-                                    .map(|cursor_position| State::Opened {
+                                    .map(|cursor_position| Mode::Opened {
                                         cursor_position,
                                         over_overlay: false,
                                     })
@@ -320,9 +321,9 @@ where
                                 mouse::Button::Left,
                             )) = event
                             {
-                                State::default()
+                                Mode::default()
                             } else {
-                                *state
+                                state.mode
                             }
                         }
                     }
@@ -330,109 +331,106 @@ where
             } else if self.open == Open::Hovered {
                 let cursor_position = cursor.position_over(layout.bounds());
 
-                match (*state, cursor_position) {
+                match (state.mode, cursor_position) {
                     (
-                        State::Idle {
+                        Mode::Idle {
                             pressed,
                             hovered_at: None,
                         },
                         Some(cursor_position),
                     ) => {
                         if self.delay == Duration::ZERO {
-                            State::Opened {
+                            Mode::Opened {
                                 cursor_position,
                                 over_overlay: false,
                             }
                         } else {
                             shell.request_redraw_at(now + self.delay);
 
-                            State::Idle {
+                            Mode::Idle {
                                 pressed,
                                 hovered_at: Some(now),
                             }
                         }
                     }
                     (
-                        State::Idle {
+                        Mode::Idle {
                             hovered_at: Some(at),
                             ..
                         },
                         _,
                     ) if at.elapsed() < self.delay => {
                         shell.request_redraw_at(now + self.delay - at.elapsed());
-                        *state
+                        state.mode
                     }
                     (
-                        State::Idle {
+                        Mode::Idle {
                             hovered_at: Some(_),
                             ..
                         },
                         Some(cursor_position),
-                    ) => {
-                        shell.invalidate_layout();
-                        State::Opened {
-                            cursor_position,
-                            over_overlay: false,
-                        }
-                    }
-                    _ => *state,
+                    ) => Mode::Opened {
+                        cursor_position,
+                        over_overlay: false,
+                    },
+                    _ => state.mode,
                 }
+            } else if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = event
+                && self.open == Open::LeftPointer
+                && matches!(state.mode, Mode::Idle { pressed, .. } if pressed)
+            {
+                cursor
+                    .position_over(layout.bounds())
+                    .map(|cursor_position| Mode::Opened {
+                        cursor_position,
+                        over_overlay: false,
+                    })
+                    .unwrap_or_default()
+            } else if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) = event
+                && self.open == Open::RightPointer
+                && matches!(state.mode, Mode::Idle { pressed, .. } if pressed)
+            {
+                cursor
+                    .position_over(layout.bounds())
+                    .map(|cursor_position| Mode::Opened {
+                        cursor_position,
+                        over_overlay: false,
+                    })
+                    .unwrap_or_default()
+            } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+                && self.open == Open::LeftPointer
+            {
+                cursor
+                    .position_over(layout.bounds())
+                    .map(|_| Mode::Idle {
+                        pressed: true,
+                        hovered_at: None,
+                    })
+                    .unwrap_or_default()
+            } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
+                && self.open == Open::RightPointer
+            {
+                cursor
+                    .position_over(layout.bounds())
+                    .map(|_| Mode::Idle {
+                        pressed: true,
+                        hovered_at: None,
+                    })
+                    .unwrap_or_default()
             } else {
-                if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = event
-                    && self.open == Open::LeftPointer
-                    && matches!(*state, State::Idle { pressed, .. } if pressed)
-                {
-                    cursor
-                        .position_over(layout.bounds())
-                        .map(|cursor_position| State::Opened {
-                            cursor_position,
-                            over_overlay: false,
-                        })
-                        .unwrap_or_default()
-                } else if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) =
-                    event
-                    && self.open == Open::RightPointer
-                    && matches!(*state, State::Idle { pressed, .. } if pressed)
-                {
-                    cursor
-                        .position_over(layout.bounds())
-                        .map(|cursor_position| State::Opened {
-                            cursor_position,
-                            over_overlay: false,
-                        })
-                        .unwrap_or_default()
-                } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
-                    && self.open == Open::LeftPointer
-                {
-                    cursor
-                        .position_over(layout.bounds())
-                        .map(|_| State::Idle {
-                            pressed: true,
-                            hovered_at: None,
-                        })
-                        .unwrap_or_default()
-                } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) =
-                    event
-                    && self.open == Open::RightPointer
-                {
-                    cursor
-                        .position_over(layout.bounds())
-                        .map(|_| State::Idle {
-                            pressed: true,
-                            hovered_at: None,
-                        })
-                        .unwrap_or_default()
-                } else {
-                    *state
-                }
+                state.mode
             };
 
-            let is_idle = matches!(*state, State::Idle { .. });
+            let is_idle = matches!(state.mode, Mode::Idle { .. });
 
             if was_idle != is_idle {
-                shell.invalidate_layout();
+                if was_idle {
+                    state.layout = None;
+                }
+
+                shell.invalidate_overlay();
                 shell.request_redraw();
-            } else if self.position == Position::FollowCursor && *state != previous_state {
+            } else if self.position == Position::FollowCursor && state.mode != previous_mode {
                 shell.request_redraw();
             }
 
@@ -440,24 +438,21 @@ where
             if self.disabled {
                 self.status = Status::Disabled;
             } else {
-                match state {
-                    State::Idle { pressed, .. } => {
-                        let status = if *pressed {
+                match state.mode {
+                    Mode::Idle { pressed, .. } => {
+                        self.status = if pressed {
                             match self.open {
                                 Open::Hovered => Status::Idle,
                                 Open::LeftPointer => Status::LeftPressed,
                                 Open::RightPointer => Status::RightPressed,
                             }
+                        } else if is_over {
+                            Status::Hovered
                         } else {
-                            if is_over {
-                                Status::Hovered
-                            } else {
-                                Status::Idle
-                            }
+                            Status::Idle
                         };
-                        self.status = status;
                     }
-                    State::Opened { .. } => {
+                    Mode::Opened { .. } => {
                         self.status = Status::Opened;
                     }
                 }
@@ -554,16 +549,18 @@ where
         &mut self,
         tree: &mut widget::Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
         let state = tree.state.downcast_mut::<State>();
 
-        operation.container(self.id.as_ref(), layout.bounds());
+        operation.container(self.id.as_ref(), layout.bounds(), viewport);
         operation.traverse(&mut |operation| {
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout.children().next().unwrap(),
+                viewport,
                 renderer,
                 operation,
             );
@@ -578,8 +575,13 @@ where
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State>();
+        let State {
+            mode,
+            layout: tooltip_layout,
+        } = state;
 
         let mut children = tree.children.iter_mut();
 
@@ -589,38 +591,125 @@ where
             renderer,
             viewport,
             translation,
+            window,
         );
 
-        let tooltip = match *state {
-            State::Idle { .. } => None,
-            State::Opened {
-                cursor_position,
-                over_overlay: _,
-            } => Some(overlay::Element::new(Box::new(Overlay {
-                position: layout.position() + translation,
-                tooltip: &mut self.tooltip,
-                state: children.next().unwrap(),
-                tooltip_state: state,
-                cursor_position,
-                content_bounds: layout.bounds(),
-                snap_within_viewport: self.snap_within_viewport,
-                positioning: self.position,
-                gap: self.gap,
-                padding: self.padding,
-                class: &self.tooltip_class,
-            }))),
-        };
+        let tooltip_tree = children.next().unwrap();
 
-        if content.is_some() && tooltip.is_some() {
-            Some(
-                overlay::Group::with_children(content.into_iter().chain(tooltip).collect())
-                    .overlay(),
-            )
-        } else if tooltip.is_some() {
-            tooltip
+        if matches!(mode, Mode::Opened { .. }) && tooltip_layout.is_none() {
+            let layout = self.tooltip.as_widget_mut().layout(
+                tooltip_tree,
+                renderer,
+                &layout::Limits::new(
+                    Size::ZERO,
+                    if self.snap_within_viewport {
+                        window
+                    } else {
+                        Size::INFINITE
+                    },
+                )
+                .shrink(Padding::new(self.padding)),
+            );
+            let padded_size = layout.size().expand(Padding::new(self.padding));
+
+            *tooltip_layout = Some(layout::Node::with_children(
+                padded_size,
+                vec![layout.translate(Vector::new(self.padding, self.padding))],
+            ));
+        }
+
+        let tooltip = if let Mode::Opened {
+            cursor_position,
+            over_overlay: _,
+        } = *mode
+        {
+            let tooltip_layout = tooltip_layout
+                .as_ref()
+                .expect("the tooltip's node was computed above");
+            let position = layout.position() + translation;
+            let content_bounds = layout.bounds();
+            let tooltip_size = tooltip_layout.size();
+            let content_size = tooltip_layout.children()[0].size();
+            let viewport = Rectangle::with_size(window);
+            let x_center = position.x + (content_bounds.width - content_size.width) / 2.0;
+            let y_center = position.y + (content_bounds.height - content_size.height) / 2.0;
+
+            let offset = match self.position {
+                Position::Top => Point::new(
+                    x_center,
+                    position.y - content_size.height - self.gap - self.padding,
+                ),
+                Position::Bottom => Point::new(
+                    x_center,
+                    position.y + content_bounds.height + self.gap + self.padding,
+                ),
+                Position::Left => Point::new(
+                    position.x - content_size.width - self.gap - self.padding,
+                    y_center,
+                ),
+                Position::Right => Point::new(
+                    position.x + content_bounds.width + self.gap + self.padding,
+                    y_center,
+                ),
+                Position::FollowCursor => {
+                    let translation = position - content_bounds.position();
+
+                    Point::new(cursor_position.x, cursor_position.y - content_size.height)
+                        + translation
+                }
+                Position::TopRight => Point::new(
+                    position.x + content_bounds.width - content_size.width,
+                    position.y - content_size.height - self.gap - self.padding,
+                ),
+                Position::TopLeft => Point::new(
+                    position.x,
+                    position.y - content_size.height - self.gap - self.padding,
+                ),
+                Position::BottomRight => Point::new(
+                    position.x + content_bounds.width - content_size.width,
+                    position.y + content_bounds.height + self.gap + self.padding,
+                ),
+                Position::BottomLeft => Point::new(
+                    position.x,
+                    position.y + content_bounds.height + self.gap + self.padding,
+                ),
+            };
+
+            let mut tooltip_bounds = Rectangle {
+                x: offset.x - self.padding,
+                y: offset.y - self.padding,
+                width: tooltip_size.width,
+                height: tooltip_size.height,
+            };
+
+            if self.snap_within_viewport {
+                if tooltip_bounds.x < viewport.x {
+                    tooltip_bounds.x = viewport.x;
+                } else if viewport.x + viewport.width < tooltip_bounds.x + tooltip_bounds.width {
+                    tooltip_bounds.x = viewport.x + viewport.width - tooltip_bounds.width;
+                }
+
+                if tooltip_bounds.y < viewport.y {
+                    tooltip_bounds.y = viewport.y;
+                } else if viewport.y + viewport.height < tooltip_bounds.y + tooltip_bounds.height {
+                    tooltip_bounds.y = viewport.y + viewport.height - tooltip_bounds.height;
+                }
+            }
+
+            Some(overlay::Element::new(Box::new(Overlay {
+                layout: Layout::new(tooltip_layout).move_to(tooltip_bounds.position()),
+                tooltip: &mut self.tooltip,
+                state: tooltip_tree,
+                tooltip_state: mode,
+                positioning: self.position,
+                class: &self.tooltip_class,
+                window,
+            })))
         } else {
             None
-        }
+        };
+
+        content.into_iter().chain(tooltip).collect()
     }
 }
 
@@ -674,8 +763,14 @@ pub enum Open {
     RightPointer,
 }
 
+#[derive(Debug, Default)]
+struct State {
+    mode: Mode,
+    layout: Option<layout::Node>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum State {
+enum Mode {
     Idle {
         pressed: bool,
         hovered_at: Option<Instant>,
@@ -686,9 +781,9 @@ enum State {
     },
 }
 
-impl Default for State {
+impl Default for Mode {
     fn default() -> Self {
-        State::Idle {
+        Mode::Idle {
             pressed: false,
             hovered_at: None,
         }
@@ -938,17 +1033,13 @@ where
     Theme: container::Catalog,
     Renderer: text::Renderer,
 {
-    position: Point,
+    layout: Layout<'b>,
     tooltip: &'b mut Element<'a, Message, Theme, Renderer>,
     state: &'b mut widget::Tree,
-    tooltip_state: &'b mut State,
-    cursor_position: Point,
-    content_bounds: Rectangle,
-    snap_within_viewport: bool,
+    tooltip_state: &'b mut Mode,
     positioning: Position,
-    gap: f32,
-    padding: f32,
     class: &'b Theme::Class<'a>,
+    window: Size,
 }
 
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
@@ -957,104 +1048,25 @@ where
     Theme: container::Catalog,
     Renderer: text::Renderer,
 {
-    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
-        let viewport = Rectangle::with_size(bounds);
+    fn operate(&mut self, renderer: &Renderer, operation: &mut dyn widget::Operation) {
+        let bounds = self.layout.bounds();
+        let viewport = Rectangle::with_size(self.window);
 
-        let tooltip_layout = self.tooltip.as_widget_mut().layout(
-            self.state,
-            renderer,
-            &layout::Limits::new(
-                Size::ZERO,
-                if self.snap_within_viewport {
-                    viewport.size()
-                } else {
-                    Size::INFINITE
-                },
-            )
-            .shrink(Padding::new(self.padding)),
-        );
-
-        let text_bounds = tooltip_layout.bounds();
-        let x_center = self.position.x + (self.content_bounds.width - text_bounds.width) / 2.0;
-        let y_center = self.position.y + (self.content_bounds.height - text_bounds.height) / 2.0;
-
-        let mut tooltip_bounds = {
-            let offset = match self.positioning {
-                Position::Top => Vector::new(
-                    x_center,
-                    self.position.y - text_bounds.height - self.gap - self.padding,
-                ),
-                Position::Bottom => Vector::new(
-                    x_center,
-                    self.position.y + self.content_bounds.height + self.gap + self.padding,
-                ),
-                Position::Left => Vector::new(
-                    self.position.x - text_bounds.width - self.gap - self.padding,
-                    y_center,
-                ),
-                Position::Right => Vector::new(
-                    self.position.x + self.content_bounds.width + self.gap + self.padding,
-                    y_center,
-                ),
-                Position::FollowCursor => {
-                    let translation = self.position - self.content_bounds.position();
-
-                    Vector::new(
-                        self.cursor_position.x,
-                        self.cursor_position.y - text_bounds.height,
-                    ) + translation
-                }
-                Position::TopRight => Vector::new(
-                    self.position.x + (self.content_bounds.width - text_bounds.width),
-                    self.position.y - text_bounds.height - self.gap - self.padding,
-                ),
-                Position::TopLeft => Vector::new(
-                    self.position.x,
-                    self.position.y - text_bounds.height - self.gap - self.padding,
-                ),
-                Position::BottomRight => Vector::new(
-                    self.position.x + (self.content_bounds.width - text_bounds.width),
-                    self.position.y + self.content_bounds.height + self.gap + self.padding,
-                ),
-                Position::BottomLeft => Vector::new(
-                    self.position.x,
-                    self.position.y + self.content_bounds.height + self.gap + self.padding,
-                ),
-            };
-
-            Rectangle {
-                x: offset.x - self.padding,
-                y: offset.y - self.padding,
-                width: text_bounds.width + self.padding * 2.0,
-                height: text_bounds.height + self.padding * 2.0,
-            }
-        };
-
-        if self.snap_within_viewport {
-            if tooltip_bounds.x < viewport.x {
-                tooltip_bounds.x = viewport.x;
-            } else if viewport.x + viewport.width < tooltip_bounds.x + tooltip_bounds.width {
-                tooltip_bounds.x = viewport.x + viewport.width - tooltip_bounds.width;
-            }
-
-            if tooltip_bounds.y < viewport.y {
-                tooltip_bounds.y = viewport.y;
-            } else if viewport.y + viewport.height < tooltip_bounds.y + tooltip_bounds.height {
-                tooltip_bounds.y = viewport.y + viewport.height - tooltip_bounds.height;
-            }
-        }
-
-        layout::Node::with_children(
-            tooltip_bounds.size(),
-            vec![tooltip_layout.translate(Vector::new(self.padding, self.padding))],
-        )
-        .translate(Vector::new(tooltip_bounds.x, tooltip_bounds.y))
+        operation.container(None, bounds, &bounds);
+        operation.traverse(&mut |operation| {
+            self.tooltip.as_widget_mut().operate(
+                self.state,
+                self.layout.children().next().unwrap(),
+                &viewport,
+                renderer,
+                operation,
+            );
+        });
     }
 
     fn update(
         &mut self,
         event: &Event,
-        layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -1062,12 +1074,12 @@ where
         if let Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_)) = event {
             let state = &mut *self.tooltip_state;
             let previous_state = *state;
-            let was_idle = matches!(*state, State::Idle { .. });
+            let was_idle = matches!(*state, Mode::Idle { .. });
 
             *state = cursor
-                .position_over(layout.bounds())
-                .map(|_| State::Opened {
-                    cursor_position: if let State::Opened {
+                .position_over(self.layout.bounds())
+                .map(|_| Mode::Opened {
+                    cursor_position: if let Mode::Opened {
                         cursor_position, ..
                     } = *state
                     {
@@ -1077,8 +1089,8 @@ where
                     },
                     over_overlay: true,
                 })
-                .unwrap_or(State::Opened {
-                    cursor_position: if let State::Opened {
+                .unwrap_or(Mode::Opened {
+                    cursor_position: if let Mode::Opened {
                         cursor_position, ..
                     } = *state
                     {
@@ -1089,27 +1101,29 @@ where
                     over_overlay: false,
                 });
 
-            let is_idle = matches!(*state, State::Idle { .. });
+            let is_idle = matches!(*state, Mode::Idle { .. });
 
             if was_idle != is_idle {
-                shell.invalidate_layout();
+                shell.invalidate_overlay();
                 shell.request_redraw();
             } else if self.positioning == Position::FollowCursor && *state != previous_state {
                 shell.request_redraw();
             }
         }
 
+        let viewport = Rectangle::with_size(self.window);
+
         self.tooltip.as_widget_mut().update(
             self.state,
             event,
-            layout.children().next().unwrap(),
+            self.layout.children().next().unwrap(),
             cursor,
             renderer,
             shell,
-            &Rectangle::with_size(Size::INFINITE),
+            &viewport,
         );
 
-        if cursor.is_over(layout.bounds()) && matches!(event, Event::Mouse(_)) {
+        if cursor.is_over(self.layout.bounds()) && matches!(event, Event::Mouse(_)) {
             shell.capture_event();
         }
     }
@@ -1119,43 +1133,42 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         inherited_style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor_position: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) {
+        let viewport = Rectangle::with_size(self.window);
+        let bounds = self.layout.bounds();
         let style = theme.style(self.class);
 
-        container::draw_background(renderer, &style, layout.bounds());
+        renderer.with_layer(viewport, |renderer| {
+            container::draw_background(renderer, &style, bounds);
 
-        let defaults = renderer::Style {
-            text_color: style.text_color.unwrap_or(inherited_style.text_color),
-        };
+            let defaults = renderer::Style {
+                text_color: style.text_color.unwrap_or(inherited_style.text_color),
+            };
 
-        self.tooltip.as_widget().draw(
-            self.state,
-            renderer,
-            theme,
-            &defaults,
-            layout.children().next().unwrap(),
-            cursor_position,
-            &Rectangle::with_size(Size::INFINITE),
-        );
+            self.tooltip.as_widget().draw(
+                self.state,
+                renderer,
+                theme,
+                &defaults,
+                self.layout.children().next().unwrap(),
+                cursor,
+                &viewport,
+            );
+        });
     }
 
-    fn mouse_interaction(
-        &self,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-    ) -> mouse::Interaction {
+    fn mouse_interaction(&self, cursor: mouse::Cursor, renderer: &Renderer) -> mouse::Interaction {
+        let viewport = Rectangle::with_size(self.window);
         let interaction = self.tooltip.as_widget().mouse_interaction(
             self.state,
-            layout.children().next().unwrap(),
+            self.layout.children().next().unwrap(),
             cursor,
-            &Rectangle::with_size(Size::INFINITE),
+            &viewport,
             renderer,
         );
 
-        if cursor.is_over(layout.bounds()) && interaction == mouse::Interaction::None {
+        if cursor.is_over(self.layout.bounds()) && interaction == mouse::Interaction::None {
             mouse::Interaction::Idle
         } else {
             interaction
@@ -1173,7 +1186,7 @@ fn close_all_operation<T>() -> impl widget::Operation<T> {
 
         fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
             if let Some(state) = state.downcast_mut::<State>() {
-                *state = State::default();
+                state.mode = Mode::default();
             }
         }
     }
@@ -1195,7 +1208,7 @@ fn close_operation<T>(id: Id) -> impl widget::Operation<T> {
             if id == Some(&self.target)
                 && let Some(state) = state.downcast_mut::<State>()
             {
-                *state = State::default();
+                state.mode = Mode::default();
             }
         }
     }

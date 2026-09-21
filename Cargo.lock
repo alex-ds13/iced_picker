@@ -602,8 +602,7 @@ dependencies = [
 [[package]]
 name = "cosmic-text"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
+source = "git+https://github.com/hecrj/cosmic-text.git?rev=1cdc3e0fcda67e38946db57df777181e4569d7c0#1cdc3e0fcda67e38946db57df777181e4569d7c0"
 dependencies = [
  "bitflags 2.11.1",
  "fontdb",
@@ -638,7 +637,7 @@ checksum = "43da5946c66ffcc7745f48db692ffbb10a83bfe0afd96235c5c2a4fb23994929"
 [[package]]
 name = "cryoglyph"
 version = "0.1.0"
-source = "git+https://github.com/iced-rs/cryoglyph.git?rev=53ba3e879539d19ed8162942126a977ec896cc3b#53ba3e879539d19ed8162942126a977ec896cc3b"
+source = "git+https://github.com/iced-rs/cryoglyph.git?rev=b4576782d7c22ecef973d32cf5b18881ad14fe89#b4576782d7c22ecef973d32cf5b18881ad14fe89"
 dependencies = [
  "cosmic-text",
  "etagere",
@@ -1165,7 +1164,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 [[package]]
 name = "iced"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_core",
  "iced_debug",
@@ -1181,7 +1180,7 @@ dependencies = [
 [[package]]
 name = "iced_beacon"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bincode",
  "futures",
@@ -1196,7 +1195,7 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bitflags 2.11.1",
  "bytes",
@@ -1209,13 +1208,14 @@ dependencies = [
  "serde",
  "smol_str 0.2.2",
  "thiserror 2.0.12",
+ "unicode-segmentation",
  "web-time",
 ]
 
 [[package]]
 name = "iced_debug"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_beacon",
  "iced_core",
@@ -1226,7 +1226,7 @@ dependencies = [
 [[package]]
 name = "iced_devtools"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_debug",
  "iced_program",
@@ -1237,7 +1237,7 @@ dependencies = [
 [[package]]
 name = "iced_futures"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "futures",
  "iced_core",
@@ -1251,7 +1251,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
@@ -1264,7 +1264,6 @@ dependencies = [
  "raw-window-handle",
  "rustc-hash 2.1.1",
  "thiserror 2.0.12",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -1282,7 +1281,7 @@ dependencies = [
 [[package]]
 name = "iced_program"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_graphics",
  "iced_runtime",
@@ -1291,7 +1290,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -1303,7 +1302,7 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bytes",
  "iced_core",
@@ -1314,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1330,7 +1329,7 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
@@ -1348,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "iced_renderer",
  "iced_runtime",
@@ -1362,7 +1361,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.15.0-dev"
-source = "git+https://github.com/alex-ds13/iced.git?branch=bless-component-with-fixes#db5ee77eab28751529edfc49daa80a0b6f36772e"
+source = "git+https://github.com/alex-ds13/iced.git?branch=master-with-fixes#0223ec7f5576bdc63ad724cfa39303fbfdcbd304"
 dependencies = [
  "arboard",
  "iced_debug",
