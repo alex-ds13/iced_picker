@@ -5,7 +5,9 @@ use core::mouse;
 use core::renderer;
 use core::widget::operation::{self, Operation};
 use core::widget::tree::{self, Tree};
-use core::{Element, Event, Length, Rectangle, Shell, Size, Widget, window};
+use core::{Element, Event, Length, Rectangle, Shell, Size, Vector, Widget, window};
+
+use iced::Widget as _;
 
 pub struct Hover<'a, Message, Theme, Renderer> {
     base: Element<'a, Message, Theme, Renderer>,
@@ -18,12 +20,12 @@ pub struct Hover<'a, Message, Theme, Renderer> {
 
 impl<'a, Message, Theme, Renderer> Hover<'a, Message, Theme, Renderer> {
     pub fn new(
-        base: impl Into<Element<'a, Message, Theme, Renderer>>,
-        top: impl Into<Element<'a, Message, Theme, Renderer>>,
+        base: impl Widget<Message, Theme, Renderer> + 'a,
+        top: impl Widget<Message, Theme, Renderer> + 'a,
     ) -> Hover<'a, Message, Theme, Renderer> {
         Hover {
-            base: base.into(),
-            top: top.into(),
+            base: base.boxed(),
+            top: top.boxed(),
             is_top_focused: false,
             is_top_overlay_active: false,
             is_hovered: false,
@@ -36,6 +38,8 @@ impl<'a, Message, Theme, Renderer> Hover<'a, Message, Theme, Renderer> {
         self
     }
 }
+
+impl<Message, Theme, Renderer> core::widget::Meta for Hover<'_, Message, Theme, Renderer> {}
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for Hover<'_, Message, Theme, Renderer>
@@ -52,27 +56,23 @@ where
     }
 
     fn size(&self) -> Size<Length> {
-        self.base.as_widget().size()
+        self.base.size()
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let base = self
-            .base
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits);
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
+        self.base.layout(&mut tree.children[0], renderer, limits);
 
-        let top = self.top.as_widget_mut().layout(
+        let size = tree.children[0].size;
+
+        self.top.layout(
             &mut tree.children[1],
             renderer,
-            &layout::Limits::new(Size::ZERO, base.size()),
+            &layout::Limits::new(Size::ZERO, size),
         );
 
-        layout::Node::with_children(base.size(), vec![base, top])
+        tree.children[0].translation = Vector::ZERO;
+        tree.children[1].translation = Vector::ZERO;
+        tree.size = size;
     }
 
     fn draw(
@@ -81,7 +81,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -91,11 +91,11 @@ where
             } else {
                 *viewport
             };
-            let mut children = layout.children().zip(&tree.children);
+            let mut children = layout.iter(&tree.children);
 
             let (base_layout, base_tree) = children.next().unwrap();
 
-            self.base.as_widget().draw(
+            self.base.draw(
                 base_tree,
                 renderer,
                 theme,
@@ -110,7 +110,7 @@ where
                 let (top_layout, top_tree) = children.next().unwrap();
 
                 renderer.with_layer(bounds, |renderer| {
-                    self.top.as_widget().draw(
+                    self.top.draw(
                         top_tree, renderer, theme, style, top_layout, cursor, viewport,
                     );
                 });
@@ -121,19 +121,17 @@ where
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn operation::Operation,
     ) {
         let children = [&mut self.base, &mut self.top]
             .into_iter()
-            .zip(layout.children().zip(&mut tree.children));
+            .zip(layout.iter_mut(&mut tree.children));
 
         for (child, (layout, tree)) in children {
-            child
-                .as_widget_mut()
-                .operate(tree, layout, viewport, renderer, operation);
+            child.operate(tree, layout, viewport, renderer, operation);
         }
     }
 
@@ -141,13 +139,13 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let mut children = layout.children().zip(&mut tree.children);
+        let mut children = layout.iter_mut(&mut tree.children);
         let (base_layout, base_tree) = children.next().unwrap();
         let (top_layout, top_tree) = children.next().unwrap();
 
@@ -156,7 +154,7 @@ where
         if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
             let mut count_focused = operation::focusable::count();
 
-            self.top.as_widget_mut().operate(
+            self.top.operate(
                 top_tree,
                 top_layout,
                 viewport,
@@ -183,7 +181,7 @@ where
         {
             let redraw_request = shell.redraw_request();
 
-            self.top.as_widget_mut().update(
+            self.top.update(
                 top_tree, event, top_layout, cursor, renderer, shell, viewport,
             );
 
@@ -197,7 +195,7 @@ where
             return;
         }
 
-        self.base.as_widget_mut().update(
+        self.base.update(
             base_tree,
             event,
             base_layout,
@@ -211,7 +209,7 @@ where
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
@@ -219,11 +217,9 @@ where
         [&self.base, &self.top]
             .into_iter()
             .rev()
-            .zip(layout.children().rev().zip(tree.children.iter().rev()))
+            .zip(layout.iter(&tree.children).rev())
             .map(|(child, (layout, tree))| {
-                child
-                    .as_widget()
-                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                child.mouse_interaction(tree, layout, cursor, viewport, renderer)
             })
             .find(|&interaction| interaction != mouse::Interaction::None)
             .unwrap_or_default()
@@ -232,7 +228,7 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut core::widget::Tree,
-        layout: core::Layout<'b>,
+        layout: core::Layout,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: core::Vector,
@@ -240,10 +236,10 @@ where
     ) -> Vec<core::overlay::Element<'b, Message, Theme, Renderer>> {
         let mut children = [&mut self.base, &mut self.top]
             .into_iter()
-            .zip(layout.children().zip(tree.children.iter_mut()));
+            .zip(layout.iter_mut(&mut tree.children));
 
         let (base, (base_layout, base_tree)) = children.next().unwrap();
-        let base_overlays = base.as_widget_mut().overlay(
+        let base_overlays = base.overlay(
             base_tree,
             base_layout,
             renderer,
@@ -257,7 +253,7 @@ where
         }
 
         let (top, (top_layout, top_tree)) = children.next().unwrap();
-        let top_overlays = top.as_widget_mut().overlay(
+        let top_overlays = top.overlay(
             top_tree,
             top_layout,
             renderer,
@@ -271,21 +267,9 @@ where
     }
 }
 
-impl<'a, Message, Theme, Renderer> From<Hover<'a, Message, Theme, Renderer>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    Message: 'a,
-    Theme: 'a,
-    Renderer: core::Renderer + 'a,
-{
-    fn from(value: Hover<'a, Message, Theme, Renderer>) -> Self {
-        Element::new(value)
-    }
-}
-
 pub fn hover<'a, Message, Theme, Renderer>(
-    base: impl Into<Element<'a, Message, Theme, Renderer>>,
-    top: impl Into<Element<'a, Message, Theme, Renderer>>,
+    base: impl Widget<Message, Theme, Renderer> + 'a,
+    top: impl Widget<Message, Theme, Renderer> + 'a,
 ) -> Hover<'a, Message, Theme, Renderer>
 where
     Message: 'a,

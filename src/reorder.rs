@@ -9,12 +9,12 @@
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
-use iced::advanced::widget::{Operation, Tree, tree};
+use iced::advanced::widget::{Meta, Operation, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::alignment::Alignment;
 use iced::{
-    Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size, Vector, mouse,
-    touch,
+    Border, Color, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size, Vector,
+    Widget as _, mouse, touch,
 };
 
 /// How far the cursor must travel from the press point before a press turns
@@ -57,18 +57,17 @@ where
 
     /// Creates a [`Reorder`] from the given rows.
     pub fn with_children(
-        children: impl IntoIterator<Item = Element<'a, Message, Theme, Renderer>>,
+        children: impl IntoIterator<Item = impl Widget<Message, Theme, Renderer> + 'a>,
     ) -> Self {
-        let mut list = Self::new();
-        for child in children {
-            list = list.push(child);
+        Self {
+            children: children.into_iter().map(|child| child.boxed()).collect(),
+            ..Self::new()
         }
-        list
     }
 
     /// Adds a row to the end of the list.
-    pub fn push(mut self, child: impl Into<Element<'a, Message, Theme, Renderer>>) -> Self {
-        self.children.push(child.into());
+    pub fn push(mut self, child: impl Widget<Message, Theme, Renderer> + 'a) -> Self {
+        self.children.push(child.boxed());
         self
     }
 
@@ -140,6 +139,7 @@ where
 #[derive(Default)]
 struct State {
     action: Action,
+    layout: layout::flex::Cache,
 }
 
 #[derive(Default)]
@@ -168,21 +168,28 @@ impl Action {
 }
 
 /// The index of the row whose bounds contain `point`, if any.
-fn row_at(layout: Layout<'_>, point: Point) -> Option<usize> {
+fn row_at(layout: Layout, children: &[Tree], point: Point) -> Option<usize> {
     layout
-        .children()
-        .position(|row| row.bounds().contains(point))
+        .iter(children)
+        .position(|(row, _)| row.bounds().contains(point))
 }
 
 /// The target index for a row dragged to `cursor`: the slot whose row the
 /// cursor is over (the count of rows fully above it), clamped to the last row.
 /// It is the `to` of a `remove(from)` then `insert(to, item)`.
-fn drop_index(layout: Layout<'_>, cursor: Point) -> usize {
+fn drop_index(layout: Layout, children: &[Tree], cursor: Point) -> usize {
     let ins = layout
-        .children()
-        .filter(|row| row.bounds().y + row.bounds().height < cursor.y)
+        .iter(children)
+        .filter(|(row, _)| row.bounds().y + row.bounds().height < cursor.y)
         .count();
-    ins.min(layout.children().len().saturating_sub(1))
+    ins.min(children.len().saturating_sub(1))
+}
+
+impl<Message, Theme, Renderer> Meta for Reorder<'_, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: iced::advanced::Renderer,
+{
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -215,13 +222,10 @@ where
         }
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        layout::flex::resolve(
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
+        let state = tree.state.downcast_mut::<State>();
+
+        tree.size = layout::flex::resolve(
             layout::flex::Axis::Vertical,
             renderer,
             limits,
@@ -230,15 +234,16 @@ where
             self.padding,
             self.spacing,
             Alignment::Start,
-            &mut self.children,
             &mut tree.children,
-        )
+            &mut self.children,
+            &mut state.layout,
+        );
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn Operation,
@@ -247,12 +252,9 @@ where
         operation.traverse(&mut |operation| {
             self.children
                 .iter_mut()
-                .zip(&mut tree.children)
-                .zip(layout.children())
-                .for_each(|((child, state), layout)| {
-                    child
-                        .as_widget_mut()
-                        .operate(state, layout, viewport, renderer, operation);
+                .zip(layout.iter_mut(&mut tree.children))
+                .for_each(|(child, (layout, state))| {
+                    child.operate(state, layout, viewport, renderer, operation);
                 });
         });
     }
@@ -261,7 +263,7 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -292,15 +294,12 @@ where
                 Event::Window(iced::window::Event::RedrawRequested(_))
             )
         {
-            for ((child, tree), layout) in self
+            for (child, (layout, tree)) in self
                 .children
                 .iter_mut()
-                .zip(&mut tree.children)
-                .zip(layout.children())
+                .zip(layout.iter_mut(&mut tree.children))
             {
-                child
-                    .as_widget_mut()
-                    .update(tree, event, layout, cursor, renderer, shell, viewport);
+                child.update(tree, event, layout, cursor, renderer, shell, viewport);
             }
         }
 
@@ -312,7 +311,7 @@ where
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
                 if let Some(origin) = cursor.position()
-                    && let Some(index) = row_at(layout, origin)
+                    && let Some(index) = row_at(layout, &tree.children, origin)
                 {
                     tree.state.downcast_mut::<State>().action = Action::Pending { index, origin };
                 }
@@ -326,9 +325,9 @@ where
                 match state.action {
                     Action::Pending { index, origin } if position.distance(origin) > DEADBAND => {
                         let row = layout
-                            .children()
+                            .iter(&tree.children)
                             .nth(index)
-                            .map(|row| row.bounds().position())
+                            .map(|(row, _)| row.bounds().position())
                             .unwrap_or(origin);
                         state.action = Action::Dragging {
                             index,
@@ -343,7 +342,7 @@ where
                         index, grab_offset, ..
                     } => {
                         let index = if self.live {
-                            let to = drop_index(layout, position);
+                            let to = drop_index(layout, &tree.children, position);
                             if to != index
                                 && let Some(on_reorder) = &self.on_reorder
                             {
@@ -385,20 +384,17 @@ where
                     // Forward the release once so the source row's button clears
                     // its pressed state. Levitate the cursor so it publishes nothing.
                     let cursor = cursor.levitate();
-                    for ((child, tree), layout) in self
+                    for (child, (layout, tree)) in self
                         .children
                         .iter_mut()
-                        .zip(&mut tree.children)
-                        .zip(layout.children())
+                        .zip(layout.iter_mut(&mut tree.children))
                     {
-                        child
-                            .as_widget_mut()
-                            .update(tree, event, layout, cursor, renderer, shell, viewport);
+                        child.update(tree, event, layout, cursor, renderer, shell, viewport);
                     }
 
                     // A live drag already emitted every move while it happened.
                     if !self.live {
-                        let to = drop_index(layout, drop_cursor);
+                        let to = drop_index(layout, &tree.children, drop_cursor);
                         if to != index
                             && let Some(on_reorder) = &self.on_reorder
                         {
@@ -417,7 +413,7 @@ where
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
@@ -430,12 +426,9 @@ where
         }
         self.children
             .iter()
-            .zip(&tree.children)
-            .zip(layout.children())
-            .map(|((child, tree), layout)| {
-                child
-                    .as_widget()
-                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+            .zip(layout.iter(&tree.children))
+            .map(|(child, (layout, tree))| {
+                child.mouse_interaction(tree, layout, cursor, viewport, renderer)
             })
             .max()
             .unwrap_or_default()
@@ -447,7 +440,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -456,11 +449,10 @@ where
             _ => None,
         };
 
-        for (i, ((child, tree), layout)) in self
+        for (i, (child, (layout, tree))) in self
             .children
             .iter()
-            .zip(&tree.children)
-            .zip(layout.children())
+            .zip(layout.iter(&tree.children))
             .enumerate()
         {
             // The dragged row only appears in the overlay, so its slot stays
@@ -468,9 +460,7 @@ where
             if Some(i) == dragged {
                 continue;
             }
-            child
-                .as_widget()
-                .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            child.draw(tree, renderer, theme, style, layout, cursor, viewport);
         }
 
         let Action::Dragging {
@@ -483,7 +473,10 @@ where
         };
 
         let appearance = <Theme as Catalog>::style(theme, &self.class, Status::Dragging);
-        let rows: Vec<Rectangle> = layout.children().map(|l| l.bounds()).collect();
+        let rows: Vec<Rectangle> = layout
+            .iter(&tree.children)
+            .map(|(layout, _)| layout.bounds())
+            .collect();
 
         if let Some(bounds) = rows.get(index) {
             renderer.fill_quad(
@@ -502,7 +495,7 @@ where
         }
 
         // The insertion line sits at the gap the row would drop into.
-        let ins = drop_index(layout, drop_cursor);
+        let ins = drop_index(layout, &tree.children, drop_cursor);
 
         // If hovering over the same place it was grabbed don't draw insertion line.
         if ins == index {
@@ -540,7 +533,7 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
@@ -550,12 +543,15 @@ where
             index, grab_offset, ..
         } = tree.state.downcast_ref::<State>().action
             && index < self.children.len()
-            && let Some(child_layout) = layout.children().nth(index)
+            && index < tree.children.len()
         {
+            let child_tree = &tree.children[index];
+            let position = layout.position() + child_tree.translation + translation;
+
             return vec![overlay::Element::new(Box::new(PickedRow {
                 content: &self.children[index],
-                tree: &tree.children[index],
-                layout: child_layout.move_to(child_layout.position() + translation),
+                tree: child_tree,
+                layout: Layout::new(child_tree.size).move_to(position),
                 grab_offset,
                 window,
             }))];
@@ -577,7 +573,7 @@ where
 struct PickedRow<'a, 'b, Message, Theme, Renderer> {
     content: &'b Element<'a, Message, Theme, Renderer>,
     tree: &'b Tree,
-    layout: Layout<'b>,
+    layout: Layout,
     grab_offset: Vector,
     window: Size,
 }
@@ -603,7 +599,7 @@ where
 
         renderer.with_layer(Rectangle::with_size(self.window), |renderer| {
             renderer.with_translation(translation, |renderer| {
-                self.content.as_widget().draw(
+                self.content.draw(
                     self.tree,
                     renderer,
                     theme,
@@ -617,21 +613,9 @@ where
     }
 }
 
-impl<'a, Message, Theme, Renderer> From<Reorder<'a, Message, Theme, Renderer>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    Message: 'a,
-    Theme: Catalog + 'a,
-    Renderer: iced::advanced::Renderer + 'a,
-{
-    fn from(reorder: Reorder<'a, Message, Theme, Renderer>) -> Self {
-        Self::new(reorder)
-    }
-}
-
 /// Creates a [`Reorder`] from the given rows.
 pub fn reorder<'a, Message, Theme, Renderer>(
-    children: impl IntoIterator<Item = Element<'a, Message, Theme, Renderer>>,
+    children: impl IntoIterator<Item = impl Widget<Message, Theme, Renderer> + 'a>,
 ) -> Reorder<'a, Message, Theme, Renderer>
 where
     Theme: Catalog,
@@ -708,5 +692,264 @@ pub fn default(theme: &iced::Theme, _status: Status) -> Style {
             width: 1.0,
             radius: 2.0.into(),
         },
+    }
+}
+
+// iced's null renderer is only available in debug builds.
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    use iced::widget::Space;
+    use iced_core::shell::{Bus, Waker};
+    use iced_core::window;
+
+    type TestReorder = Reorder<'static, (usize, usize), iced::Theme, ()>;
+
+    fn test_widget() -> TestReorder {
+        Reorder::new()
+            .push(Space::new().width(50).height(20))
+            .push(Space::new().width(70).height(30))
+            .push(Space::new().width(40).height(40))
+            .width(Length::Shrink)
+            .padding(4)
+            .spacing(6)
+            .on_reorder(|from, to| (from, to))
+    }
+
+    fn tree_for(reorder: &mut TestReorder) -> Tree {
+        let mut tree = Tree::new(reorder);
+        tree.diff(reorder);
+        reorder.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 200.0)),
+        );
+        tree
+    }
+
+    fn send_event(
+        reorder: &mut TestReorder,
+        tree: &mut Tree,
+        bus: &mut Bus<(usize, usize)>,
+        event: mouse::Event,
+        position: Point,
+    ) -> bool {
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), bus);
+        let layout = Layout::new(tree.size);
+        reorder.update(
+            tree,
+            &Event::Mouse(event),
+            layout,
+            mouse::Cursor::Available(position),
+            &(),
+            &mut shell,
+            &Rectangle::with_size(Size::new(200.0, 200.0)),
+        );
+        shell.is_event_captured()
+    }
+
+    #[test]
+    fn flex_layout_stores_row_geometry_and_preserves_drag_state() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        assert_eq!(tree.size, Size::new(78.0, 110.0));
+        assert_eq!(tree.children[0].translation, Vector::new(4.0, 4.0));
+        assert_eq!(tree.children[1].translation, Vector::new(4.0, 30.0));
+        assert_eq!(tree.children[2].translation, Vector::new(4.0, 66.0));
+        assert_eq!(tree.children[1].size, Size::new(70.0, 30.0));
+
+        tree.state.downcast_mut::<State>().action = Action::Pending {
+            index: 1,
+            origin: Point::new(8.0, 35.0),
+        };
+        reorder.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 200.0)),
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().action.index(), Some(1));
+    }
+
+    #[test]
+    fn hit_testing_and_drop_indices_include_tree_translations() {
+        let mut reorder = test_widget();
+        let tree = tree_for(&mut reorder);
+        let layout = Layout::new(tree.size).move_to(Point::new(100.0, 200.0));
+        assert_eq!(
+            row_at(layout, &tree.children, Point::new(105.0, 235.0)),
+            Some(1)
+        );
+        assert_eq!(
+            row_at(layout, &tree.children, Point::new(105.0, 226.0)),
+            None
+        );
+        assert_eq!(
+            drop_index(layout, &tree.children, Point::new(105.0, 190.0)),
+            0
+        );
+        assert_eq!(
+            drop_index(layout, &tree.children, Point::new(105.0, 235.0)),
+            1
+        );
+        assert_eq!(
+            drop_index(layout, &tree.children, Point::new(105.0, 500.0)),
+            2
+        );
+        assert_eq!(drop_index(layout, &[], Point::ORIGIN), 0);
+    }
+
+    #[test]
+    fn a_click_stays_pending_and_a_drag_emits_only_on_drop() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        let origin = Point::new(8.0, 8.0);
+        let pressed = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let released = mouse::Event::ButtonReleased(mouse::Button::Left);
+        assert!(!send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            pressed,
+            origin
+        ));
+        let within_deadband = Point::new(10.0, 8.0);
+        assert!(!send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved {
+                position: within_deadband
+            },
+            within_deadband
+        ));
+        assert!(!send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            released,
+            within_deadband
+        ));
+        assert!(bus.is_empty());
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Idle
+        ));
+
+        send_event(&mut reorder, &mut tree, &mut bus, pressed, origin);
+        let dragging = Point::new(20.0, 8.0);
+        assert!(send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved { position: dragging },
+            dragging
+        ));
+        let layout = Layout::new(tree.size).move_to(Point::new(30.0, 40.0));
+        let window = Size::new(200.0, 200.0);
+        assert_eq!(
+            reorder
+                .overlay(
+                    &mut tree,
+                    layout,
+                    &(),
+                    &Rectangle::with_size(window),
+                    Vector::new(10.0, 20.0),
+                    window
+                )
+                .len(),
+            1
+        );
+
+        let dropped = Point::new(20.0, 150.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved { position: dropped },
+            dropped,
+        );
+        assert!(bus.is_empty());
+        assert!(send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            released,
+            dropped
+        ));
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), vec![(0, 2)]);
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Idle
+        ));
+    }
+
+    #[test]
+    fn live_reordering_survives_diff_and_does_not_repeat_on_drop() {
+        let mut reorder = test_widget().live(true);
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        let origin = Point::new(8.0, 8.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            origin,
+        );
+        let dragging = Point::new(20.0, 8.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved { position: dragging },
+            dragging,
+        );
+        let dropped = Point::new(20.0, 90.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved { position: dropped },
+            dropped,
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().action.index(), Some(2));
+        assert_eq!(bus.len(), 1);
+
+        reorder.children.rotate_left(1);
+        tree.diff(&mut reorder);
+        reorder.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 200.0)),
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().action.index(), Some(2));
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            dropped,
+        );
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn a_changed_row_count_cancels_the_drag() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        tree.state.downcast_mut::<State>().action = Action::Dragging {
+            index: 1,
+            grab_offset: Vector::new(4.0, 5.0),
+            cursor: Point::new(20.0, 90.0),
+        };
+        reorder.children.pop();
+        tree.diff(&mut reorder);
+        assert_eq!(tree.children.len(), 2);
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Idle
+        ));
     }
 }

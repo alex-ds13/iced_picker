@@ -1,5 +1,5 @@
 use iced::{
-    Element, Fill, Theme,
+    Fill, Theme, Widget,
     widget::{button, center, checkbox, column, container, row, scrollable, space, text},
 };
 use iced_picker::reorder::reorder;
@@ -54,14 +54,13 @@ impl App {
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let rows = self.items.iter().enumerate().map(|(index, label)| {
             button(text(label).size(16))
                 .on_press(Message::Clicked(index))
                 .width(Fill)
                 .padding(12)
                 .style(button::subtle)
-                .into()
         });
 
         let list = reorder(rows)
@@ -87,6 +86,6 @@ impl App {
         .spacing(12)
         .width(iced::Fit.max(360));
 
-        center(container(content).padding(20)).into()
+        center(container(content).padding(20))
     }
 }

@@ -1,5 +1,5 @@
 use iced::{
-    Center, Color, Element, Fill, Length, Shrink, Theme,
+    Center, Color, Fill, Length, Shrink, Theme, Widget,
     widget::{Button, Column, Text, column, container, pick_list, row, space},
 };
 use iced_picker::color_picker::color_picker;
@@ -66,7 +66,7 @@ impl ColorPickerExample {
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let theme_picker = pick_list(Some(self.theme.clone()), Theme::ALL, |t: &Theme| {
             t.to_string()
         })
@@ -128,7 +128,7 @@ impl ColorPickerExample {
         let pickers_row = row![picker1, picker2].spacing(10).align_y(Center);
         let color_display = row![color_swatch, color_info].spacing(15).align_y(Center);
 
-        let content: Column<Message> = column![theme_picker, pickers_row, color_display]
+        let content: Column<_> = column![theme_picker, pickers_row, color_display]
             .spacing(20)
             .width(Shrink);
 
@@ -137,6 +137,5 @@ impl ColorPickerExample {
             .height(Length::Fill)
             .center_x(Fill)
             .center_y(Fill)
-            .into()
     }
 }

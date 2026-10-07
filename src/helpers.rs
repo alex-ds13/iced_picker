@@ -4,9 +4,9 @@ use iced::widget::{
     text::{self, IntoFragment},
     tooltip,
 };
-use iced::{Center, Color, Element, Fit, Task, Theme};
+use iced::{Center, Color, Fit, Task, Theme, Widget};
 
-pub fn label<'a, Message>(label: impl Into<Text<'a>>) -> Row<'a, Message> {
+pub fn label<'a>(label: impl Into<Text<'a>>) -> Row<Text<'a>> {
     Row::new().push(label.into()).align_y(Center).height(30.0)
 }
 
@@ -26,8 +26,8 @@ pub fn input<'a, Message: Clone>(
 pub fn button_with_icon<'a, Message: 'a>(
     icon: Text<'a>,
     text: impl Into<Text<'a>>,
-) -> Button<'a, Message> {
-    button(row![icon, text.into()].spacing(5).align_y(Center))
+) -> Button<'a, Message, Row<Text<'a>>> {
+    button(row([icon, text.into()]).spacing(5).align_y(Center))
 }
 
 pub fn button_separator<'a>() -> Rule<'a> {
@@ -39,9 +39,9 @@ pub fn button_separator<'a>() -> Rule<'a> {
 
 /// Wraps `element` in a tooltip with `description`, a gap, and a hover delay.
 pub fn tip<'a, Message: 'a>(
-    element: impl Into<Element<'a, Message>>,
+    element: impl Widget<Message> + 'a,
     description: impl text::IntoFragment<'a>,
-) -> Element<'a, Message> {
+) -> impl Widget<Message> + 'a {
     tooltip(
         element,
         container(iced::widget::text(description))
@@ -62,7 +62,6 @@ pub fn tip<'a, Message: 'a>(
     )
     .gap(5)
     .delay(iced::time::milliseconds(350))
-    .into()
 }
 
 /// Returns a task that removes focus from the currently focused widget.

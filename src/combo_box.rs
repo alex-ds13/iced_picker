@@ -2,7 +2,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use iced::widget::Column;
+//! use iced::Widget;
 //! use iced_picker::combo_box::{self, combo_box};
 //!
 //! struct State {
@@ -23,13 +23,13 @@
 //!     FruitSelected(Fruit),
 //! }
 //!
-//! fn view(state: &State) -> Column<'_, Message> {
-//!     Column::new().push(combo_box(
+//! fn view(state: &State) -> impl Widget<Message> + '_ {
+//!     combo_box(
 //!         &state.fruits,
 //!         "Select your favorite fruit...",
 //!         state.favorite.as_ref(),
 //!         Message::FruitSelected
-//!     ))
+//!     )
 //! }
 //!
 //! fn update(state: &mut State, message: Message) {
@@ -70,13 +70,13 @@ use iced::widget::overlay::menu::{self, Menu};
 use iced::widget::text::LineHeight;
 use iced::widget::text_input;
 use iced::window;
-use iced::{Element, Event, Font, Length, Padding, Pixels, Rectangle, Size, Theme, Vector};
+use iced::{Event, Font, Length, Padding, Pixels, Rectangle, Size, Theme, Vector};
 
 /// A widget for searching and selecting a single value from a list of options.
 ///
 /// # Example
 /// ```no_run
-/// use iced::widget::Column;
+/// use iced::Widget;
 /// use iced_picker::combo_box::{self, combo_box};
 ///
 /// struct State {
@@ -97,13 +97,13 @@ use iced::{Element, Event, Font, Length, Padding, Pixels, Rectangle, Size, Theme
 ///     FruitSelected(Fruit),
 /// }
 ///
-/// fn view(state: &State) -> Column<'_, Message> {
-///     Column::new().push(combo_box(
+/// fn view(state: &State) -> impl Widget<Message> + '_ {
+///     combo_box(
 ///         &state.fruits,
 ///         "Select your favorite fruit...",
 ///         state.favorite.as_ref(),
 ///         Message::FruitSelected
-///     ))
+///     )
 /// }
 ///
 /// fn update(state: &mut State, message: Message) {
@@ -404,6 +404,8 @@ struct Editor<R: text::Renderer> {
     selection: Option<String>,
 }
 
+impl<T, Message, Theme> widget::Meta for ComboBox<'_, T, Message, Theme> where Theme: Catalog {}
+
 impl<T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for ComboBox<'_, T, Message, Theme>
 where
@@ -419,15 +421,10 @@ where
         }
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut widget::Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut widget::Tree, renderer: &Renderer, limits: &layout::Limits) {
         let state = tree.state.downcast_mut::<Internal<T, Renderer>>();
 
-        state.editor.input.layout(
+        tree.size = state.editor.input.layout(
             renderer,
             limits,
             input::Layout {
@@ -442,7 +439,7 @@ where
                 multiline: None,
                 is_secure: false,
             },
-        )
+        );
     }
 
     fn tag(&self) -> widget::tree::Tag {
@@ -480,7 +477,7 @@ where
         &mut self,
         tree: &mut widget::Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -644,7 +641,7 @@ where
     fn mouse_interaction(
         &self,
         _tree: &widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
@@ -662,7 +659,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -699,7 +696,7 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         renderer: &Renderer,
         _viewport: &Rectangle,
         translation: Vector,
@@ -754,7 +751,7 @@ where
     fn operate(
         &mut self,
         tree: &mut widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         _viewport: &Rectangle,
         _renderer: &Renderer,
         operation: &mut dyn widget::Operation,
@@ -764,19 +761,6 @@ where
 
         operation.focusable(self.id.as_ref(), bounds, &mut state.editor.input);
         operation.text_input(self.id.as_ref(), bounds, &mut state.editor.input);
-    }
-}
-
-impl<'a, T, Message, Theme, Renderer> From<ComboBox<'a, T, Message, Theme>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    T: Display + Clone + 'static,
-    Message: Clone + 'a,
-    Theme: Catalog + 'a,
-    Renderer: text::Renderer + 'static,
-{
-    fn from(combo_box: ComboBox<'a, T, Message, Theme>) -> Self {
-        Self::new(combo_box)
     }
 }
 

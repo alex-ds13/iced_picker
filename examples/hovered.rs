@@ -1,5 +1,5 @@
 use iced::{
-    Center, Element, Theme,
+    Center, Theme, Widget,
     widget::{center, column, container, row, text},
 };
 use iced_picker::hovered::hovered;
@@ -24,7 +24,7 @@ impl App {
 
     fn update(&mut self, _: Message) {}
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let label_style = hovered(|is_hovered| {
             container(row!["foo", if is_hovered { "bar" } else { "baz" }, "qux"].spacing(10))
                 .width(260)
@@ -99,6 +99,6 @@ impl App {
             .style(container::bordered_box)
         });
 
-        center(column![label_style, text_size, nested].spacing(30)).into()
+        center(column![label_style, text_size, nested].spacing(30))
     }
 }

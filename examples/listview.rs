@@ -1,8 +1,11 @@
 use iced::{
-    Alignment, Element, Fill, Length, Shrink, Task, Theme,
+    Alignment, Fill, Length, Shrink, Task, Theme, Widget,
     widget::{
-        button, center, checkbox, column, container,
-        operation::{AbsoluteOffset, Animation},
+        button, center, checkbox, column, component, container,
+        operation::{
+            Animation,
+            scrollable::{AbsoluteOffset, scroll_to},
+        },
         pick_list, row, scrollable, space, text, text_input,
     },
 };
@@ -69,7 +72,7 @@ impl List {
                     self.selection.insert(pos);
                 }
                 if self.scroll_to_selected {
-                    return iced::widget::operation::scroll_to(
+                    return scroll_to(
                         "SCROLLABLE",
                         AbsoluteOffset { x: 0.0, y: offset },
                         Animation::Auto,
@@ -98,7 +101,7 @@ impl List {
         Task::none()
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let theme_picker = pick_list(Some(self.theme.clone()), Theme::ALL, |t: &Theme| {
             t.to_string()
         })
@@ -134,41 +137,38 @@ impl List {
             .filter_map(|(pos, (id, _))| (*id >= self.filter).then_some(pos));
 
         let list = {
-            let base = listview(
-                &self.content,
-                |pos, (id, state), _selected| -> Element<Message> {
-                    row![
-                        match state {
-                            ItemState::Closed => Element::from(text(format!("Item {id}"))),
-                            ItemState::Opened => center(
-                                column![
-                                    text(format!("Item {id} (expanded)")),
-                                    text("Extra detail row"),
-                                    text("Another detail row"),
-                                ]
-                                .spacing(8),
-                            )
-                            .height(120)
-                            .into(),
-                        },
-                        space::horizontal().width(Fill),
-                        button(match state {
-                            ItemState::Closed => "Expand",
-                            ItemState::Opened => "Collapse",
-                        })
-                        .on_press(Message::Toggle(pos)),
-                        button("Remove")
-                            .on_press(Message::Remove(pos))
-                            .style(button::danger),
-                    ]
-                    .spacing(10)
-                    .padding(5)
-                    .align_y(Alignment::Center)
-                    .height(Shrink)
-                    .width(Length::Fill)
-                    .into()
-                },
-            )
+            let base = listview(&self.content, |pos, (id, state), _selected| {
+                row![
+                    match state {
+                        ItemState::Closed => text(format!("Item {id}")).boxed(),
+                        ItemState::Opened => center(
+                            column![
+                                text(format!("Item {id} (expanded)")),
+                                text("Extra detail row"),
+                                text("Another detail row"),
+                            ]
+                            .spacing(8),
+                        )
+                        .height(120)
+                        .boxed(),
+                    },
+                    space::horizontal().width(Fill),
+                    button(match state {
+                        ItemState::Closed => "Expand",
+                        ItemState::Opened => "Collapse",
+                    })
+                    .on_press(Message::Toggle(pos)),
+                    button("Remove")
+                        .on_press(Message::Remove(pos))
+                        .style(button::danger),
+                ]
+                .spacing(10)
+                .padding(5)
+                .align_y(Alignment::Center)
+                .height(Shrink)
+                .width(Length::Fill)
+                .boxed()
+            })
             .on_selected(Message::Selected)
             .on_deselected(Message::Deselected)
             .filter(filtered_positions);
@@ -179,7 +179,7 @@ impl List {
                 base.multiple_selection()
             };
 
-            self.selection.iter().fold(base, |lv, &idx| lv.select(idx))
+            component(self.selection.iter().fold(base, |lv, &idx| lv.select(idx)))
         };
 
         let visible_count = self
@@ -224,7 +224,6 @@ impl List {
             .width(Fill)
             .height(Fill),
         )
-        .into()
     }
 }
 

@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use iced::{
-    Element, Fill, Fit, Renderer, Theme,
-    widget::{Action, Component, Id, button, column, component, container, sensor, space},
+    Element, Fill, Fit, Renderer, Theme, Widget,
+    widget::{Action, Component, Id, button, column, container, sensor, space},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +125,7 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
     pub fn new<F, E>(items: impl IntoIterator<Item = T>, view_item: F) -> Self
     where
         F: Fn(usize, T, bool) -> E + 'b,
-        E: Into<Element<'a, Message>>,
+        E: Widget<Message> + 'a,
     {
         Self {
             id: None,
@@ -134,7 +134,7 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
             selected: HashSet::new(),
             filtered_ids: None,
             highlights: None,
-            view_item: Box::new(move |idx, item, selected| view_item(idx, item, selected).into()),
+            view_item: Box::new(move |idx, item, selected| view_item(idx, item, selected).boxed()),
             on_selected: None,
             on_deselected: None,
             clear_selection_maybe: None,
@@ -354,7 +354,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
         None
     }
 
-    fn view(&self, state: &Self::State) -> Element<'a, Self::Event, Theme, Renderer> {
+    fn view(&self, state: &Self::State) -> impl Widget<Self::Event, Theme, Renderer> + 'a {
         let content = self
             .items
             .iter()
@@ -397,9 +397,9 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                                     },
                                 )
                             })
-                            .into()
+                            .boxed()
                     } else {
-                        space::horizontal().height(el_height).into()
+                        space::horizontal().height(el_height).boxed()
                     };
                     let s = sensor(el)
                         .on_show(move |size| Event::ShowItem(idx, size.height))
@@ -413,7 +413,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                 }
             });
 
-        content.width(Fill).height(Fit).into()
+        content.width(Fill).height(Fit)
     }
 
     fn diff(&mut self, state: &mut Self::State) {
@@ -493,21 +493,13 @@ impl From<f32> for Height {
     }
 }
 
-impl<'a, 'b: 'a, T: Clone + 'a, Message: Clone + 'static> From<ListView<'a, 'b, T, Message>>
-    for Element<'a, Message>
-{
-    fn from(value: ListView<'a, 'b, T, Message>) -> Self {
-        component(value)
-    }
-}
-
 pub fn listview<'a, 'b, T: 'a, Message, F, E>(
     items: impl IntoIterator<Item = T>,
     view_item: F,
 ) -> ListView<'a, 'b, T, Message>
 where
     F: Fn(usize, T, bool) -> E + 'b,
-    E: Into<Element<'a, Message>>,
+    E: Widget<Message> + 'a,
 {
     ListView::new(items, view_item)
 }

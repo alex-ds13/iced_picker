@@ -9,9 +9,13 @@ use crate::core::{self, Element, Event, Length, Rectangle, Shell, Size, Vector, 
 
 use std::cell::RefCell;
 
+use iced::Widget as _;
 use iced::widget::space;
 
-pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Renderer> {
+pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Renderer>
+where
+    Renderer: core::Renderer,
+{
     /// The internal state of this [`Component`].
     type State: Default;
 
@@ -25,7 +29,7 @@ pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Rende
 
     /// Produces the widgets of the [`Component`], which may trigger an [`InternalMessage`](Component::InternalMessage)
     /// on user interaction.
-    fn view(&self, state: &Self::State) -> Element<'a, Self::Event, Theme, Renderer>;
+    fn view(&self, state: &Self::State) -> impl iced::Widget<Self::Event, Theme, Renderer> + 'a;
 
     /// Update the [`Component`] state based on the provided [`Operation`](widget::Operation)
     ///
@@ -59,6 +63,7 @@ pub trait Component<'a, Message: 'a, Theme = iced::Theme, Renderer = iced::Rende
 pub struct Atom<'a, T, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
     T: Component<'a, Message, Theme, Renderer> + 'a,
+    Renderer: core::Renderer,
 {
     component: RefCell<T>,
     pub width: Length,
@@ -77,7 +82,7 @@ where
             component: RefCell::new(component),
             width: Length::Shrink,
             height: Length::Shrink,
-            content: Element::new(space()),
+            content: space().boxed(),
         }
     }
 
@@ -92,6 +97,13 @@ where
         self.height = height.into();
         self
     }
+}
+
+impl<'a, T, Message, Theme, Renderer> widget::Meta for Atom<'a, T, Message, Theme, Renderer>
+where
+    T: Component<'a, Message, Theme, Renderer>,
+    Renderer: core::Renderer,
+{
 }
 
 impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -115,35 +127,28 @@ where
     }
 
     fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
+        self.content.size()
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
         let state = tree.state.downcast_ref::<RefCell<T::State>>().borrow();
-        self.content = self.component.borrow().view(&state);
+        self.content = self.component.borrow().view(&state).boxed();
         drop(state);
 
         tree.diff_children(std::slice::from_mut(&mut self.content));
 
-        let node = self
-            .content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits);
-        let size = limits.resolve(self.width, self.height, node.size());
+        let content = &mut tree.children[0];
+        self.content.layout(content, renderer, limits);
+        content.translation = Vector::ZERO;
 
-        layout::Node::with_children(size, vec![node])
+        tree.size = limits.resolve(self.width, self.height, content.size);
     }
 
     fn update(
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -151,10 +156,11 @@ where
     ) {
         let mut local_messages = shell::Bus::new();
         let mut local_shell = shell.local(&mut local_messages);
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
+        let (layout, content) = layout.iter_mut(&mut tree.children).next().unwrap();
+        self.content.update(
+            content,
             event,
-            layout.children().next().unwrap(),
+            layout,
             cursor,
             renderer,
             &mut local_shell,
@@ -192,42 +198,32 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout.children().next().unwrap(),
-            cursor,
-            viewport,
-        );
+        let (layout, content) = layout.iter(&tree.children).next().unwrap();
+        self.content
+            .draw(content, renderer, theme, style, layout, cursor, viewport);
     }
 
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout.children().next().unwrap(),
-            cursor,
-            viewport,
-            renderer,
-        )
+        let (layout, content) = layout.iter(&tree.children).next().unwrap();
+        self.content
+            .mouse_interaction(content, layout, cursor, viewport, renderer)
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
@@ -238,32 +234,24 @@ where
             .operate(layout.bounds(), &mut state, operation);
         drop(state);
 
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            layout.children().next().unwrap(),
-            viewport,
-            renderer,
-            operation,
-        );
+        let (layout, content) = layout.iter_mut(&mut tree.children).next().unwrap();
+        self.content
+            .operate(content, layout, viewport, renderer, operation);
     }
 
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
         window: Size,
     ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
-        let overlays = self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout.children().next().unwrap(),
-            renderer,
-            viewport,
-            translation,
-            window,
-        );
+        let (layout, content) = layout.iter_mut(&mut tree.children).next().unwrap();
+        let overlays =
+            self.content
+                .overlay(content, layout, renderer, viewport, translation, window);
         let state = tree.state.downcast_ref::<RefCell<T::State>>();
 
         overlays
@@ -276,6 +264,7 @@ where
 pub struct Overlay<'a, 'b, T, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
     T: Component<'a, Message, Theme, Renderer>,
+    Renderer: core::Renderer,
 {
     element: overlay::Element<'b, T::Event, Theme, Renderer>,
     component: &'b RefCell<T>,
@@ -387,8 +376,7 @@ where
     }
 }
 
-impl<'a, T, Message, Theme, Renderer> From<Atom<'a, T, Message, Theme, Renderer>>
-    for Element<'a, Message, Theme, Renderer>
+pub fn atom<'a, T, Message, Theme, Renderer>(component: T) -> Atom<'a, T, Message, Theme, Renderer>
 where
     T: Component<'a, Message, Theme, Renderer> + 'a,
     T::State: 'static,
@@ -396,18 +384,5 @@ where
     Theme: 'a,
     Renderer: core::Renderer + 'a,
 {
-    fn from(atom: Atom<'a, T, Message, Theme, Renderer>) -> Self {
-        Self::new(atom)
-    }
-}
-
-pub fn atom<'a, T, Message, Theme, Renderer>(component: T) -> Element<'a, Message, Theme, Renderer>
-where
-    T: Component<'a, Message, Theme, Renderer> + 'a,
-    T::State: 'static,
-    Message: 'a,
-    Theme: 'a,
-    Renderer: core::Renderer + 'a,
-{
-    Element::from(Atom::new(component))
+    Atom::new(component)
 }

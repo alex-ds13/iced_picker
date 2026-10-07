@@ -39,8 +39,8 @@ use iced::keyboard::key;
 use iced::widget::{Button, button};
 use iced::window;
 use iced::{
-    Alignment, Background, Color, Element, Event, Font, Length, Padding, Pixels, Point, Rectangle,
-    Size, Theme,
+    Alignment, Background, Color, Element, Event, Font, Length, Padding, Pixels, Rectangle, Size,
+    Theme, Vector, Widget as _,
     border::{self, Border},
 };
 use num_traits::{Bounded, Num, NumAssignOps};
@@ -49,7 +49,7 @@ use num_traits::{Bounded, Num, NumAssignOps};
 ///
 /// # Example
 /// ```no_run
-/// use iced::Element;
+/// use iced::Widget;
 /// use iced_picker::number_input::NumberInput;
 ///
 /// struct State {
@@ -61,10 +61,9 @@ use num_traits::{Bounded, Num, NumAssignOps};
 ///     ContentChanged(i32)
 /// }
 ///
-/// fn view(state: &State) -> Element<'_, Message> {
+/// fn view(state: &State) -> impl Widget<Message> + '_ {
 ///     NumberInput::new("Type some number here...", state.content)
 ///         .on_input(Message::ContentChanged)
-///         .into()
 /// }
 ///
 /// fn update(state: &mut State, message: Message) {
@@ -99,8 +98,8 @@ where
     icon: Option<Icon>,
     class: <Theme as Catalog>::Class<'a>,
     last_status: Option<Status>,
-    increment_button: Button<'a, ButtonMessage, Theme, Renderer>,
-    decrement_button: Button<'a, ButtonMessage, Theme, Renderer>,
+    increment_button: Button<'a, ButtonMessage, Element<'a, ButtonMessage, Theme, Renderer>, Theme>,
+    decrement_button: Button<'a, ButtonMessage, Element<'a, ButtonMessage, Theme, Renderer>, Theme>,
     buttons_width: Pixels,
 }
 
@@ -123,18 +122,16 @@ where
         let text_size = Pixels(16.0);
         let line_height = text::LineHeight::default();
         let height = line_height.to_absolute(text_size) + DEFAULT_PADDING.y();
-        let increment_button: Button<ButtonMessage, Theme, Renderer> =
-            button(iced::widget::text("▲").size(8.0).center())
-                .width(DEFAULT_BUTTON_WIDTH)
-                .height(height)
-                .class(<Theme as Catalog>::default_increment_button())
-                .padding(0);
-        let decrement_button: Button<ButtonMessage, Theme, Renderer> =
-            button(iced::widget::text("▼").size(8.0).center())
-                .width(DEFAULT_BUTTON_WIDTH)
-                .height(height)
-                .class(<Theme as Catalog>::default_decrement_button())
-                .padding(0);
+        let increment_button = button(iced::widget::text("▲").size(8.0).center().boxed())
+            .width(DEFAULT_BUTTON_WIDTH)
+            .height(height)
+            .class(<Theme as Catalog>::default_increment_button())
+            .padding(0);
+        let decrement_button = button(iced::widget::text("▼").size(8.0).center().boxed())
+            .width(DEFAULT_BUTTON_WIDTH)
+            .height(height)
+            .class(<Theme as Catalog>::default_decrement_button())
+            .padding(0);
 
         NumberInput {
             id: None,
@@ -389,12 +386,10 @@ where
     }
 
     /// The layouts of the increment and decrement buttons.
-    fn button_layouts<'b>(&self, layout: Layout<'b>) -> (Layout<'b>, Layout<'b>) {
-        let mut children = layout
-            .children()
-            .skip(if self.icon.is_some() { 2 } else { 1 });
+    fn button_layouts(&self, tree: &Tree, layout: Layout) -> (Layout, Layout) {
+        let mut children = layout.iter(&tree.children).skip(1);
 
-        (children.next().unwrap(), children.next().unwrap())
+        (children.next().unwrap().0, children.next().unwrap().0)
     }
 
     /// Runs the cleanup that must happen whenever the widget loses focus, regardless
@@ -425,6 +420,13 @@ where
     }
 }
 
+impl<T, Message, Theme, Renderer> widget::Meta for NumberInput<'_, T, Message, Theme, Renderer>
+where
+    Theme: Catalog + button::Catalog + widget::text::Catalog,
+    Renderer: text::Renderer,
+{
+}
+
 impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for NumberInput<'a, T, Message, Theme, Renderer>
 where
@@ -442,10 +444,11 @@ where
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(&mut [
-            &mut self.increment_button as &mut dyn Widget<_, _, _>,
-            &mut self.decrement_button as &mut dyn Widget<_, _, _>,
-        ]);
+        // Keep button slots stable when the optional geometry-only icon changes.
+        tree.children
+            .resize_with(if self.icon.is_some() { 4 } else { 3 }, Tree::empty);
+        tree.children[1].diff(&mut self.increment_button);
+        tree.children[2].diff(&mut self.decrement_button);
     }
 
     fn size(&self) -> Size<Length> {
@@ -455,12 +458,7 @@ where
         }
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
         let state = tree.state.downcast_mut::<State<Renderer>>();
 
         if state
@@ -537,25 +535,23 @@ where
             _ => 0.0,
         };
 
-        let input_node = state
-            .input
-            .layout(
-                renderer,
-                &Limits::new(Size::ZERO, input_size),
-                text::input::Layout {
-                    width: Length::Fixed(input_size.width),
-                    height: Length::Fixed(input_size.height),
-                    padding,
-                    placeholder: self.placeholder.as_str(),
-                    font: self.font,
-                    size: self.size,
-                    line_height: Some(self.line_height),
-                    alignment: self.alignment.into(),
-                    multiline: None,
-                    is_secure: self.is_secure,
-                },
-            )
-            .move_to(Point::new(input_x, 0.0));
+        tree.children[0].size = state.input.layout(
+            renderer,
+            &Limits::new(Size::ZERO, input_size),
+            text::input::Layout {
+                width: Length::Fixed(input_size.width),
+                height: Length::Fixed(input_size.height),
+                padding,
+                placeholder: self.placeholder.as_str(),
+                font: self.font,
+                size: self.size,
+                line_height: Some(self.line_height),
+                alignment: self.alignment.into(),
+                multiline: None,
+                is_secure: self.is_secure,
+            },
+        );
+        tree.children[0].translation = Vector::new(input_x, 0.0);
 
         let button_padding = 1.0;
         let button_limits = Limits::new(
@@ -568,46 +564,34 @@ where
 
         let buttons_x = text_bounds.width + padding.x() + button_padding;
 
-        let increment_node = self
-            .increment_button
-            .layout(&mut tree.children[0], renderer, &button_limits)
-            .move_to(Point::new(buttons_x, button_padding));
+        self.increment_button
+            .layout(&mut tree.children[1], renderer, &button_limits);
+        tree.children[1].translation = Vector::new(buttons_x, button_padding);
 
-        let decrement_node = self
-            .decrement_button
-            .layout(&mut tree.children[1], renderer, &button_limits)
-            .move_to(Point::new(
-                buttons_x,
-                button_limits.max.height + button_padding,
-            ));
+        self.decrement_button
+            .layout(&mut tree.children[2], renderer, &button_limits);
+        tree.children[2].translation =
+            Vector::new(buttons_x, button_limits.max.height + button_padding);
 
-        let children = match (&self.icon, icon_width) {
-            (Some(icon), Some(icon_width)) => {
-                let icon_x = match icon.side {
-                    Side::Left => padding.left,
-                    Side::Right => padding.left + text_bounds.width - icon_width,
-                };
+        if let (Some(icon), Some(icon_width)) = (&self.icon, icon_width) {
+            let icon_x = match icon.side {
+                Side::Left => padding.left,
+                Side::Right => padding.left + text_bounds.width - icon_width,
+            };
 
-                let icon_node = layout::Node::new(Size::new(icon_width, text_bounds.height))
-                    .move_to(Point::new(icon_x, padding.top));
+            tree.children[3].size = Size::new(icon_width, text_bounds.height);
+            tree.children[3].translation = Vector::new(icon_x, padding.top);
+        }
 
-                vec![input_node, icon_node, increment_node, decrement_node]
-            }
-            _ => vec![input_node, increment_node, decrement_node],
-        };
-
-        layout::Node::with_children(
-            text_bounds
-                .expand(padding)
-                .expand(Size::new(buttons_width, 0.0)),
-            children,
-        )
+        tree.size = text_bounds
+            .expand(padding)
+            .expand(Size::new(buttons_width, 0.0));
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn Operation,
@@ -624,17 +608,17 @@ where
             state.input.select_all();
         }
 
-        let (increment_layout, decrement_layout) = self.button_layouts(layout);
+        let (increment_layout, decrement_layout) = self.button_layouts(tree, layout);
 
         self.increment_button.operate(
-            &mut tree.children[0],
+            &mut tree.children[1],
             increment_layout,
             viewport,
             renderer,
             operation,
         );
         self.decrement_button.operate(
-            &mut tree.children[1],
+            &mut tree.children[2],
             decrement_layout,
             viewport,
             renderer,
@@ -646,13 +630,13 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let (increment_layout, decrement_layout) = self.button_layouts(layout);
+        let (increment_layout, decrement_layout) = self.button_layouts(tree, layout);
         let mut buttons_messages = shell::Bus::<ButtonMessage>::new();
         {
             let mut buttons_shell = shell.local(&mut buttons_messages);
@@ -664,7 +648,7 @@ where
             buttons_shell.request_input_method(shell.input_method());
 
             self.increment_button.update(
-                &mut tree.children[0],
+                &mut tree.children[1],
                 event,
                 increment_layout,
                 cursor,
@@ -673,7 +657,7 @@ where
                 viewport,
             );
             self.decrement_button.update(
-                &mut tree.children[1],
+                &mut tree.children[2],
                 event,
                 decrement_layout,
                 cursor,
@@ -705,7 +689,7 @@ where
             return;
         }
 
-        let input_bounds = layout.children().next().unwrap().bounds();
+        let input_bounds = layout.iter(&tree.children).next().unwrap().0.bounds();
         let state = tree.state.downcast_mut::<State<Renderer>>();
 
         // Operations mutate focus directly instead of going through update(), so the
@@ -820,7 +804,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         renderer_style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -832,8 +816,10 @@ where
             self.last_status.unwrap_or(Status::Disabled),
         );
 
-        let mut children_layout = layout.children();
-        let input_layout = children_layout.next().unwrap();
+        let mut children_layout = layout.iter(&tree.children);
+        let (input_layout, _) = children_layout.next().unwrap();
+        let (increment_layout, increment_tree) = children_layout.next().unwrap();
+        let (decrement_layout, decrement_tree) = children_layout.next().unwrap();
 
         renderer.fill_quad(
             renderer::Quad {
@@ -845,7 +831,7 @@ where
         );
 
         if self.icon.is_some() {
-            let icon_layout = children_layout.next().unwrap();
+            let (icon_layout, _) = children_layout.next().unwrap();
             let icon = state.icon.raw();
 
             renderer.fill_paragraph(
@@ -860,9 +846,8 @@ where
             );
         }
 
-        let increment_layout = children_layout.next().unwrap();
         self.increment_button.draw(
-            &tree.children[0],
+            increment_tree,
             renderer,
             theme,
             renderer_style,
@@ -871,9 +856,8 @@ where
             viewport,
         );
 
-        let decrement_layout = children_layout.next().unwrap();
         self.decrement_button.draw(
-            &tree.children[1],
+            decrement_tree,
             renderer,
             theme,
             renderer_style,
@@ -896,8 +880,8 @@ where
 
     fn mouse_interaction(
         &self,
-        _state: &Tree,
-        layout: Layout<'_>,
+        tree: &Tree,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
@@ -906,7 +890,7 @@ where
             if self.on_input.is_none() {
                 mouse::Interaction::Idle
             } else {
-                let (increment_layout, decrement_layout) = self.button_layouts(layout);
+                let (increment_layout, decrement_layout) = self.button_layouts(tree, layout);
 
                 if cursor.is_over(increment_layout.bounds())
                     || cursor.is_over(decrement_layout.bounds())
@@ -934,7 +918,7 @@ where
     fn wheel_step(
         &self,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
@@ -962,21 +946,6 @@ where
         shell.capture_event();
 
         true
-    }
-}
-
-impl<'a, T, Message, Theme, Renderer> From<NumberInput<'a, T, Message, Theme, Renderer>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    Message: Clone + 'a,
-    Theme: Catalog + button::Catalog + widget::text::Catalog + 'a,
-    Renderer: text::Renderer + 'static,
-    T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
-{
-    fn from(
-        number_input: NumberInput<'a, T, Message, Theme, Renderer>,
-    ) -> Element<'a, Message, Theme, Renderer> {
-        Element::new(number_input)
     }
 }
 
@@ -1244,4 +1213,138 @@ pub fn bottom_button(theme: &Theme, status: button::Status) -> button::Style {
 enum ButtonMessage {
     Increment,
     Decrement,
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    use iced::Point;
+
+    #[test]
+    fn layout_preserves_input_icon_and_button_geometry() {
+        for side in [None, Some(Side::Left), Some(Side::Right)] {
+            let mut input = NumberInput::<i32, i32, Theme, ()>::new("Number", 5)
+                .on_input(|value| value)
+                .width(180.0)
+                .size(20.0)
+                .padding(Padding {
+                    top: 3.0,
+                    right: 7.0,
+                    bottom: 5.0,
+                    left: 9.0,
+                })
+                .buttons_width(24.0);
+            input.icon = side.map(|side| Icon {
+                font: Font::DEFAULT,
+                code_point: '#',
+                size: None,
+                spacing: 6.0,
+                side,
+            });
+
+            let mut tree = Tree::new(&input);
+            tree.diff(&mut input);
+            input.layout(
+                &mut tree,
+                &(),
+                &Limits::new(Size::ZERO, Size::new(300.0, 200.0)),
+            );
+
+            let height = f32::from(input.line_height.to_absolute(Pixels(20.0)));
+            let reserved = if input.icon.is_some() { 6.0 } else { 0.0 };
+            let input_x = if matches!(input.icon.as_ref().map(|icon| &icon.side), Some(Side::Left))
+            {
+                reserved
+            } else {
+                0.0
+            };
+
+            assert_eq!(tree.size, Size::new(180.0, height + 8.0));
+            assert_eq!(
+                tree.children[0].size,
+                Size::new(156.0 - reserved, height + 8.0)
+            );
+            assert_eq!(tree.children[0].translation, Vector::new(input_x, 0.0));
+            assert_eq!(
+                tree.children[1].size,
+                Size::new(22.0, (height + 8.0) / 2.0 - 1.0)
+            );
+            assert_eq!(tree.children[2].size, tree.children[1].size);
+            assert_eq!(tree.children[1].translation, Vector::new(157.0, 1.0));
+            assert_eq!(
+                tree.children[2].translation,
+                Vector::new(157.0, (height + 8.0) / 2.0)
+            );
+
+            if let Some(icon) = &input.icon {
+                let icon_x = match icon.side {
+                    Side::Left => 9.0,
+                    Side::Right => 149.0,
+                };
+                assert_eq!(tree.children[3].size, Size::new(0.0, height));
+                assert_eq!(tree.children[3].translation, Vector::new(icon_x, 3.0));
+            }
+
+            let layout = Layout::new(tree.size).move_to(Point::new(40.0, 60.0));
+            let (increment, decrement) = input.button_layouts(&tree, layout);
+            assert_eq!(increment.position(), Point::new(197.0, 61.0));
+            assert_eq!(
+                decrement.position(),
+                Point::new(197.0, 60.0 + (height + 8.0) / 2.0)
+            );
+            assert_eq!(
+                input.mouse_interaction(
+                    &tree,
+                    layout,
+                    mouse::Cursor::Available(increment.bounds().center()),
+                    &layout.bounds(),
+                    &(),
+                ),
+                mouse::Interaction::Pointer,
+            );
+            input.draw(
+                &tree,
+                &mut (),
+                &Theme::Dark,
+                &renderer::Style::default(),
+                layout,
+                mouse::Cursor::Unavailable,
+                &layout.bounds(),
+            );
+        }
+    }
+
+    #[test]
+    fn diff_keeps_button_slots_when_icon_appears_and_disappears() {
+        let mut input = NumberInput::<i32, i32, Theme, ()>::new("Number", 5);
+        let mut tree = Tree::new(&input);
+        assert!(tree.children.is_empty());
+        tree.diff(&mut input);
+        assert_eq!(tree.children.len(), 3);
+        assert_eq!(tree.children[0].tag, tree::Tag::stateless());
+        assert_eq!(tree.children[1].children.len(), 1);
+        assert_eq!(tree.children[2].children.len(), 1);
+
+        tree.children[1].translation = Vector::new(11.0, 12.0);
+        tree.children[2].translation = Vector::new(13.0, 14.0);
+        input.icon = Some(Icon {
+            font: Font::DEFAULT,
+            code_point: '#',
+            size: None,
+            spacing: 6.0,
+            side: Side::Left,
+        });
+        tree.diff(&mut input);
+        assert_eq!(tree.children.len(), 4);
+        assert_eq!(tree.children[3].tag, tree::Tag::stateless());
+        assert_eq!(tree.children[1].translation, Vector::new(11.0, 12.0));
+        assert_eq!(tree.children[2].translation, Vector::new(13.0, 14.0));
+
+        input.icon = None;
+        tree.diff(&mut input);
+        assert_eq!(tree.children.len(), 3);
+        assert_eq!(tree.children[1].translation, Vector::new(11.0, 12.0));
+        assert_eq!(tree.children[2].translation, Vector::new(13.0, 14.0));
+    }
 }

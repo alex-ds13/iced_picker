@@ -6,6 +6,8 @@ use core::renderer;
 use core::widget::tree::{self, Tree};
 use core::{Element, Event, Length, Rectangle, Shell, Size, Widget, widget::operation};
 
+use iced::Widget as _;
+
 /// Wraps the given widget and captures any mouse button events inside the bounds of
 /// the widget by lifting the mouse cursor as well — effectively making it _opaque_.
 ///
@@ -14,9 +16,9 @@ use core::{Element, Event, Length, Rectangle, Shell, Size, Widget, widget::opera
 ///
 /// [`Stack`]: crate::Stack
 pub fn opaque_maybe<'a, Message, Theme, Renderer>(
-    content: impl Into<Element<'a, Message, Theme, Renderer>>,
+    content: impl Widget<Message, Theme, Renderer> + 'a,
     opaque: bool,
-) -> Element<'a, Message, Theme, Renderer>
+) -> impl Widget<Message, Theme, Renderer> + 'a
 where
     Message: 'a,
     Theme: 'a,
@@ -27,34 +29,31 @@ where
         opaque: bool,
     }
 
+    impl<Message, Theme, Renderer> core::widget::Meta for Opaque<'_, Message, Theme, Renderer> {}
+
     impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
         for Opaque<'_, Message, Theme, Renderer>
     where
         Renderer: core::Renderer,
     {
         fn tag(&self) -> tree::Tag {
-            self.content.as_widget().tag()
+            self.content.tag()
         }
 
         fn state(&self) -> tree::State {
-            self.content.as_widget().state()
+            self.content.state()
         }
 
         fn diff(&mut self, tree: &mut Tree) {
-            self.content.as_widget_mut().diff(tree);
+            self.content.diff(tree);
         }
 
         fn size(&self) -> Size<Length> {
-            self.content.as_widget().size()
+            self.content.size()
         }
 
-        fn layout(
-            &mut self,
-            tree: &mut Tree,
-            renderer: &Renderer,
-            limits: &layout::Limits,
-        ) -> layout::Node {
-            self.content.as_widget_mut().layout(tree, renderer, limits)
+        fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
+            self.content.layout(tree, renderer, limits);
         }
 
         fn draw(
@@ -63,25 +62,23 @@ where
             renderer: &mut Renderer,
             theme: &Theme,
             style: &renderer::Style,
-            layout: Layout<'_>,
+            layout: Layout,
             cursor: mouse::Cursor,
             viewport: &Rectangle,
         ) {
             self.content
-                .as_widget()
                 .draw(tree, renderer, theme, style, layout, cursor, viewport);
         }
 
         fn operate(
             &mut self,
             state: &mut Tree,
-            layout: Layout<'_>,
+            layout: Layout,
             viewport: &Rectangle,
             renderer: &Renderer,
             operation: &mut dyn operation::Operation,
         ) {
             self.content
-                .as_widget_mut()
                 .operate(state, layout, viewport, renderer, operation);
         }
 
@@ -89,7 +86,7 @@ where
             &mut self,
             state: &mut Tree,
             event: &Event,
-            layout: Layout<'_>,
+            layout: Layout,
             cursor: mouse::Cursor,
             renderer: &Renderer,
             shell: &mut Shell<'_, Message>,
@@ -106,14 +103,13 @@ where
             }
 
             self.content
-                .as_widget_mut()
                 .update(state, event, layout, cursor, renderer, shell, viewport);
         }
 
         fn mouse_interaction(
             &self,
             state: &core::widget::Tree,
-            layout: core::Layout<'_>,
+            layout: core::Layout,
             cursor: core::mouse::Cursor,
             viewport: &core::Rectangle,
             renderer: &Renderer,
@@ -122,7 +118,6 @@ where
                 mouse::Interaction::Idle
             } else {
                 self.content
-                    .as_widget()
                     .mouse_interaction(state, layout, cursor, viewport, renderer)
             }
         }
@@ -130,25 +125,19 @@ where
         fn overlay<'b>(
             &'b mut self,
             state: &'b mut core::widget::Tree,
-            layout: core::Layout<'b>,
+            layout: core::Layout,
             renderer: &Renderer,
             viewport: &Rectangle,
             translation: core::Vector,
             window: Size,
         ) -> Vec<core::overlay::Element<'b, Message, Theme, Renderer>> {
-            self.content.as_widget_mut().overlay(
-                state,
-                layout,
-                renderer,
-                viewport,
-                translation,
-                window,
-            )
+            self.content
+                .overlay(state, layout, renderer, viewport, translation, window)
         }
     }
 
-    Element::new(Opaque {
-        content: content.into(),
+    Opaque {
+        content: content.boxed(),
         opaque,
-    })
+    }
 }

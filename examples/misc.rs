@@ -6,7 +6,7 @@ use iced_picker::{
 
 const SAVE_TIP_ID: &str = "save_dropdown_tooltip";
 use iced::{
-    Border, Center, Element, Fill, Shrink, Subscription, Task, Theme, keyboard,
+    Border, Center, Fill, Shrink, Subscription, Task, Theme, Widget, keyboard,
     widget::{TextInput, button, center, column, container, operation, row, text},
 };
 
@@ -103,7 +103,7 @@ impl App {
         })
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         let amount_row = row![
             text("Amount:").width(100),
             NumberInput::new("0.00", self.amount)
@@ -174,7 +174,7 @@ impl App {
     }
 }
 
-fn save_buttons_row() -> Element<'static, Message> {
+fn save_buttons_row() -> impl Widget<Message> {
     let save_btn = button("Save")
         .on_press(Message::Save)
         .style(|t: &Theme, s| iced::widget::button::Style {
@@ -218,8 +218,5 @@ fn save_buttons_row() -> Element<'static, Message> {
             ..tooltip::primary(t, s)
         });
 
-    row![save_btn, dropdown]
-        .align_y(Center)
-        .width(Shrink)
-        .into()
+    row![save_btn, dropdown].align_y(Center).width(Shrink)
 }

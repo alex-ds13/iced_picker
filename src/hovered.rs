@@ -1,10 +1,10 @@
-use crate::atom::{Component, atom};
-use iced::{Element, widget::mouse_area};
+use crate::atom::{Atom, Component};
+use iced::{Widget, widget::mouse_area};
 
 pub struct Hovered<'a, Message, F, I>
 where
     F: Fn(bool) -> I,
-    I: Into<Element<'a, Message>>,
+    I: Widget<Message> + 'a,
 {
     builder: Box<F>,
     message: std::marker::PhantomData<&'a Message>,
@@ -14,7 +14,7 @@ where
 impl<'a, Message, F, I> Hovered<'a, Message, F, I>
 where
     F: Fn(bool) -> I,
-    I: Into<Element<'a, Message>>,
+    I: Widget<Message> + 'a,
 {
     pub fn new(f: F) -> Self {
         Self {
@@ -45,9 +45,9 @@ pub enum Event<Message> {
 
 impl<'a, Message, F, I> Component<'a, Message> for Hovered<'a, Message, F, I>
 where
-    Message: Clone + std::fmt::Debug + 'a,
+    Message: Clone + std::fmt::Debug + 'static,
     F: Fn(bool) -> I,
-    I: Into<Element<'a, Message>>,
+    I: Widget<Message> + 'a,
 {
     type State = State;
     type Event = Event<Message>;
@@ -61,8 +61,8 @@ where
         None
     }
 
-    fn view(&self, state: &Self::State) -> Element<'a, Self::Event> {
-        let content = (self.builder)(state.is_hovered).into().map(Event::Message);
+    fn view(&self, state: &Self::State) -> impl Widget<Self::Event> + 'a {
+        let content = (self.builder)(state.is_hovered).map(Event::Message);
 
         let mut area = mouse_area(content)
             .interaction(iced::mouse::Interaction::Pointer)
@@ -73,26 +73,15 @@ where
             area = area.on_press(Event::Message(message.clone()));
         }
 
-        area.into()
+        area
     }
 }
 
-impl<'a, Message, F, I> From<Hovered<'a, Message, F, I>> for Element<'a, Message>
+pub fn hovered<'a, Message, F, I>(f: F) -> Atom<'a, Hovered<'a, Message, F, I>, Message>
 where
-    Message: Clone + std::fmt::Debug + 'a,
+    Message: Clone + std::fmt::Debug + 'static,
     F: Fn(bool) -> I + 'a,
-    I: Into<Element<'a, Message>> + 'a,
+    I: Widget<Message> + 'a,
 {
-    fn from(value: Hovered<'a, Message, F, I>) -> Self {
-        atom(value)
-    }
-}
-
-pub fn hovered<'a, Message, F, I>(f: F) -> Element<'a, Message>
-where
-    Message: Clone + std::fmt::Debug + 'a,
-    F: Fn(bool) -> I + 'a,
-    I: Into<Element<'a, Message>> + 'a,
-{
-    Hovered::new(f).into()
+    Atom::new(Hovered::new(f))
 }
