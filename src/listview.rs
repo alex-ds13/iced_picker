@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use iced::{
-    Element, Fill, Fit, Renderer, Theme, Widget,
+    Element, Fill, Fit, Pixels, Renderer, Theme, Widget,
     widget::{Action, Component, Id, button, column, container, sensor, space},
 };
 
@@ -105,6 +105,7 @@ fn listview_item_style(
     }
 }
 
+/// The default estimated height of an item that has not been measured yet.
 pub static ITEM_HEIGHT: f32 = 40.8;
 
 pub struct ListView<'a, 'b, T, Message> {
@@ -119,6 +120,7 @@ pub struct ListView<'a, 'b, T, Message> {
     on_deselected: Option<Box<dyn Fn(usize) -> Message + 'b>>,
     clear_selection_maybe: Option<Message>,
     class: <Theme as Catalog>::Class<'a>,
+    estimated_item_height: f32,
 }
 
 impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
@@ -139,6 +141,7 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
             on_deselected: None,
             clear_selection_maybe: None,
             class: <Theme as Catalog>::default(),
+            estimated_item_height: ITEM_HEIGHT,
         }
     }
 
@@ -204,6 +207,19 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
         self
     }
 
+    /// Sets the height assumed for items that have not been measured yet.
+    ///
+    /// Unmeasured items are laid out with this height (which sizes the
+    /// scroller and the offsets passed to `on_selected`) until they come
+    /// into view and report their real height. It also scales the distance
+    /// at which items start being rendered before they become visible.
+    ///
+    /// Defaults to [`ITEM_HEIGHT`].
+    pub fn estimated_item_height(mut self, height: impl Into<Pixels>) -> Self {
+        self.estimated_item_height = height.into().0;
+        self
+    }
+
     pub fn highlight(mut self, highlights: impl IntoIterator<Item = &'a usize>) -> Self {
         self.highlights = Some(HashSet::from_iter(highlights));
         self
@@ -232,7 +248,7 @@ impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
         filtered_heights_until_idx.fold(0.0, |offset, (i, eh)| {
             let h = eh.height(state.selected.contains(i));
             let height = match h {
-                Height::Unknown => ITEM_HEIGHT,
+                Height::Unknown => self.estimated_item_height,
                 Height::Known(height) => height,
             };
             offset + height
@@ -371,10 +387,10 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                         .heights
                         .get(&idx)
                         .map(|eh| match eh.height(selected) {
-                            Height::Unknown => ITEM_HEIGHT,
+                            Height::Unknown => self.estimated_item_height,
                             Height::Known(height) => height,
                         })
-                        .unwrap_or(ITEM_HEIGHT);
+                        .unwrap_or(self.estimated_item_height);
                     let el: Element<_> = if state.visible.contains(&idx) {
                         let item = container(
                             (self.view_item)(idx, item.clone(), selected).map(Event::Content),
@@ -406,7 +422,7 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
                         .on_hide(Event::HideItem(idx))
                         .on_resize(move |size| Event::ItemResize(idx, size.height))
                         .key(state.hash)
-                        .anticipate(ITEM_HEIGHT * 5.0);
+                        .anticipate(self.estimated_item_height * 5.0);
                     col.push(s)
                 } else {
                     col
@@ -502,4 +518,22 @@ where
     E: Widget<Message> + 'a,
 {
     ListView::new(items, view_item)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmeasured_items_use_the_estimated_height() {
+        let mut list = ListView::<_, ()>::new(0..10, |_, _, _| space::horizontal())
+            .estimated_item_height(50.0);
+        let mut state = State::default();
+        list.diff(&mut state);
+
+        assert_eq!(list.offset(&state, 3), 150.0);
+
+        state.heights.get_mut(&1).unwrap().unselected(20.0);
+        assert_eq!(list.offset(&state, 3), 120.0);
+    }
 }
