@@ -22,14 +22,13 @@
 //!     .position(tooltip::Position::Bottom)
 //! }
 //! ```
-use iced_core as core;
-
 use core::layout::{self, Layout};
 use core::mouse;
 use core::overlay;
 use core::renderer;
 use core::text;
 use core::time::{Duration, Instant};
+use core::touch;
 use core::widget::{self, Id, Widget};
 use core::window;
 use core::{
@@ -40,6 +39,7 @@ use core::{
 };
 use iced::widget::container;
 use iced::{Task, Widget as _};
+use iced_core as core;
 
 /// An element to display a widget over another.
 ///
@@ -284,7 +284,11 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_)) = event {
+        if let Event::Mouse(_)
+        | Event::Touch(_)
+        | Event::Window(window::Event::RedrawRequested(_)) = event
+        {
+            let pointer_event = pointer_event(event);
             let state = tree.state.downcast_mut::<State>();
             let now = Instant::now();
             let previous_mode = state.mode;
@@ -314,15 +318,15 @@ where
                             })
                             .unwrap_or_default(),
                         Open::LeftPointer => {
-                            if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
+                            if let Some(mouse::Event::ButtonPressed(_)) = pointer_event {
                                 Mode::default()
                             } else {
                                 state.mode
                             }
                         }
                         Open::RightPointer => {
-                            if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) =
-                                event
+                            if let Some(mouse::Event::ButtonPressed(mouse::Button::Right)) =
+                                pointer_event
                             {
                                 cursor
                                     .position_over(layout.bounds())
@@ -331,9 +335,8 @@ where
                                         over_overlay: false,
                                     })
                                     .unwrap_or_default()
-                            } else if let Event::Mouse(mouse::Event::ButtonPressed(
-                                mouse::Button::Left,
-                            )) = event
+                            } else if let Some(mouse::Event::ButtonPressed(mouse::Button::Left)) =
+                                pointer_event
                             {
                                 Mode::default()
                             } else {
@@ -396,7 +399,7 @@ where
                     },
                     _ => state.mode,
                 }
-            } else if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = event
+            } else if let Some(mouse::Event::ButtonReleased(mouse::Button::Left)) = pointer_event
                 && self.open == Open::LeftPointer
                 && matches!(state.mode, Mode::Idle { pressed, .. } if pressed)
             {
@@ -407,7 +410,7 @@ where
                         over_overlay: false,
                     })
                     .unwrap_or_default()
-            } else if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) = event
+            } else if let Some(mouse::Event::ButtonReleased(mouse::Button::Right)) = pointer_event
                 && self.open == Open::RightPointer
                 && matches!(state.mode, Mode::Idle { pressed, .. } if pressed)
             {
@@ -418,7 +421,7 @@ where
                         over_overlay: false,
                     })
                     .unwrap_or_default()
-            } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+            } else if let Some(mouse::Event::ButtonPressed(mouse::Button::Left)) = pointer_event
                 && self.open == Open::LeftPointer
             {
                 cursor
@@ -428,7 +431,7 @@ where
                         hovered_at: None,
                     })
                     .unwrap_or_default()
-            } else if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
+            } else if let Some(mouse::Event::ButtonPressed(mouse::Button::Right)) = pointer_event
                 && self.open == Open::RightPointer
             {
                 cursor
@@ -640,75 +643,16 @@ where
             over_overlay: _,
         } = *mode
         {
-            let position = layout.position() + translation;
-            let content_bounds = layout.bounds();
-            let content_size = tooltip_tree.size;
-            let tooltip_size = content_size.expand(Padding::new(self.padding));
-            let viewport = Rectangle::with_size(window);
-            let x_center = position.x + (content_bounds.width - content_size.width) / 2.0;
-            let y_center = position.y + (content_bounds.height - content_size.height) / 2.0;
-
-            let offset = match self.position {
-                Position::Top => Point::new(
-                    x_center,
-                    position.y - content_size.height - self.gap - self.padding,
-                ),
-                Position::Bottom => Point::new(
-                    x_center,
-                    position.y + content_bounds.height + self.gap + self.padding,
-                ),
-                Position::Left => Point::new(
-                    position.x - content_size.width - self.gap - self.padding,
-                    y_center,
-                ),
-                Position::Right => Point::new(
-                    position.x + content_bounds.width + self.gap + self.padding,
-                    y_center,
-                ),
-                Position::FollowCursor => {
-                    let translation = position - content_bounds.position();
-
-                    Point::new(cursor_position.x, cursor_position.y - content_size.height)
-                        + translation
-                }
-                Position::TopRight => Point::new(
-                    position.x + content_bounds.width - content_size.width,
-                    position.y - content_size.height - self.gap - self.padding,
-                ),
-                Position::TopLeft => Point::new(
-                    position.x,
-                    position.y - content_size.height - self.gap - self.padding,
-                ),
-                Position::BottomRight => Point::new(
-                    position.x + content_bounds.width - content_size.width,
-                    position.y + content_bounds.height + self.gap + self.padding,
-                ),
-                Position::BottomLeft => Point::new(
-                    position.x,
-                    position.y + content_bounds.height + self.gap + self.padding,
-                ),
-            };
-
-            let mut tooltip_bounds = Rectangle {
-                x: offset.x - self.padding,
-                y: offset.y - self.padding,
-                width: tooltip_size.width,
-                height: tooltip_size.height,
-            };
-
-            if self.snap_within_viewport {
-                if tooltip_bounds.x < viewport.x {
-                    tooltip_bounds.x = viewport.x;
-                } else if viewport.x + viewport.width < tooltip_bounds.x + tooltip_bounds.width {
-                    tooltip_bounds.x = viewport.x + viewport.width - tooltip_bounds.width;
-                }
-
-                if tooltip_bounds.y < viewport.y {
-                    tooltip_bounds.y = viewport.y;
-                } else if viewport.y + viewport.height < tooltip_bounds.y + tooltip_bounds.height {
-                    tooltip_bounds.y = viewport.y + viewport.height - tooltip_bounds.height;
-                }
-            }
+            let tooltip_bounds = resolve_tooltip_bounds(
+                self.position,
+                layout.bounds() + translation,
+                tooltip_tree.size,
+                self.padding,
+                self.gap,
+                cursor_position + translation,
+                Rectangle::with_size(window),
+                self.snap_within_viewport,
+            );
 
             Some(overlay::Element::new(Box::new(Overlay {
                 layout: Layout::new(tooltip_tree.size)
@@ -718,6 +662,7 @@ where
                 state: tooltip_tree,
                 tooltip_state: mode,
                 positioning: self.position,
+                open: self.open,
                 class: &self.tooltip_class,
                 window,
             })))
@@ -730,8 +675,20 @@ where
 }
 
 /// The position of the tooltip. Defaults to following the cursor.
+///
+/// When snapping within the viewport, fixed directional positions flip to the
+/// opposite side if the padded tooltip does not fit on the requested side and
+/// the opposite side has strictly more room. Corner positions retain their
+/// left or right content alignment. [`Position::FollowCursor`] never flips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Position {
+    /// The tooltip will appear on the preferred side if the padded tooltip
+    /// fits there, or on the side with the most available space otherwise.
+    /// This side selection also applies when viewport snapping is disabled.
+    Auto {
+        /// The side to prefer when the padded tooltip fits there.
+        preference: Side,
+    },
     /// The tooltip will appear on the top of the widget.
     Top,
     /// The tooltip will appear on the bottom of the widget.
@@ -751,6 +708,176 @@ pub enum Position {
     BottomRight,
     /// The tooltip will appear aligned to the bottom left of the widget.
     BottomLeft,
+}
+
+/// A side that a tooltip can appear on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Side {
+    /// The top side.
+    Top,
+    /// The bottom side.
+    #[default]
+    Bottom,
+    /// The left side.
+    Left,
+    /// The right side.
+    Right,
+}
+
+impl Side {
+    fn available_space(self, anchor: Rectangle, viewport: Rectangle, popup: Size, gap: f32) -> f32 {
+        match self {
+            Self::Top => anchor.y - viewport.y - popup.height - gap,
+            Self::Bottom => {
+                viewport.y + viewport.height - (anchor.y + anchor.height) - popup.height - gap
+            }
+            Self::Left => anchor.x - viewport.x - popup.width - gap,
+            Self::Right => {
+                viewport.x + viewport.width - (anchor.x + anchor.width) - popup.width - gap
+            }
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Top => Self::Bottom,
+            Self::Bottom => Self::Top,
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+
+    fn position(self) -> Position {
+        match self {
+            Self::Top => Position::Top,
+            Self::Bottom => Position::Bottom,
+            Self::Left => Position::Left,
+            Self::Right => Position::Right,
+        }
+    }
+}
+
+/// Resolves the padded tooltip rectangle. Anchor, cursor, and viewport are in
+/// screen coordinates. The caller translates the cursor stored in [`Mode`].
+#[allow(clippy::too_many_arguments)]
+fn resolve_tooltip_bounds(
+    position: Position,
+    anchor: Rectangle,
+    content: Size,
+    padding: f32,
+    gap: f32,
+    cursor_position: Point,
+    viewport: Rectangle,
+    snap_within_viewport: bool,
+) -> Rectangle {
+    let popup = content.expand(Padding::new(padding));
+    let available = |side: Side| side.available_space(anchor, viewport, popup, gap);
+    let position = match position {
+        Position::Auto { preference } => {
+            let side = if available(preference) >= 0.0 {
+                preference
+            } else {
+                [Side::Top, Side::Left, Side::Right, Side::Bottom]
+                    .into_iter()
+                    .max_by(|a, b| available(*a).total_cmp(&available(*b)))
+                    .unwrap_or_default()
+            };
+            side.position()
+        }
+        position if snap_within_viewport => {
+            let side = match position {
+                Position::Top | Position::TopLeft | Position::TopRight => Some(Side::Top),
+                Position::Bottom | Position::BottomLeft | Position::BottomRight => {
+                    Some(Side::Bottom)
+                }
+                Position::Left => Some(Side::Left),
+                Position::Right => Some(Side::Right),
+                _ => None,
+            };
+
+            if side.is_some_and(|side| {
+                available(side) < 0.0 && available(side.opposite()) > available(side)
+            }) {
+                match position {
+                    Position::Top => Position::Bottom,
+                    Position::Bottom => Position::Top,
+                    Position::Left => Position::Right,
+                    Position::Right => Position::Left,
+                    Position::TopLeft => Position::BottomLeft,
+                    Position::TopRight => Position::BottomRight,
+                    Position::BottomLeft => Position::TopLeft,
+                    Position::BottomRight => Position::TopRight,
+                    _ => position,
+                }
+            } else {
+                position
+            }
+        }
+        position => position,
+    };
+
+    let x_center = anchor.x + (anchor.width - content.width) / 2.0;
+    let y_center = anchor.y + (anchor.height - content.height) / 2.0;
+    // Corners align the content edge, not the outer padded box.
+    let offset = match position {
+        Position::Top => Point::new(x_center, anchor.y - content.height - gap - padding),
+        Position::Bottom => Point::new(x_center, anchor.y + anchor.height + gap + padding),
+        Position::Left => Point::new(anchor.x - content.width - gap - padding, y_center),
+        Position::Right => Point::new(anchor.x + anchor.width + gap + padding, y_center),
+        Position::FollowCursor => Point::new(cursor_position.x, cursor_position.y - content.height),
+        Position::TopRight => Point::new(
+            anchor.x + anchor.width - content.width,
+            anchor.y - content.height - gap - padding,
+        ),
+        Position::TopLeft => Point::new(anchor.x, anchor.y - content.height - gap - padding),
+        Position::BottomRight => Point::new(
+            anchor.x + anchor.width - content.width,
+            anchor.y + anchor.height + gap + padding,
+        ),
+        Position::BottomLeft => Point::new(anchor.x, anchor.y + anchor.height + gap + padding),
+        Position::Auto { .. } => unreachable!(),
+    };
+
+    let mut bounds = Rectangle {
+        x: offset.x - padding,
+        y: offset.y - padding,
+        width: popup.width,
+        height: popup.height,
+    };
+
+    if snap_within_viewport {
+        if bounds.x < viewport.x {
+            bounds.x = viewport.x;
+        } else if viewport.x + viewport.width < bounds.x + bounds.width {
+            bounds.x = viewport.x + viewport.width - bounds.width;
+        }
+
+        if bounds.y < viewport.y {
+            bounds.y = viewport.y;
+        } else if viewport.y + viewport.height < bounds.y + bounds.height {
+            bounds.y = viewport.y + viewport.height - bounds.height;
+        }
+    }
+
+    bounds
+}
+
+fn pointer_event(event: &Event) -> Option<mouse::Event> {
+    match event {
+        Event::Mouse(event) => Some(*event),
+        Event::Touch(touch::Event::FingerPressed { .. }) => {
+            Some(mouse::Event::ButtonPressed(mouse::Button::Left))
+        }
+        Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
+            Some(mouse::Event::ButtonReleased(mouse::Button::Left))
+        }
+        Event::Touch(touch::Event::FingerMoved { position, .. }) => {
+            Some(mouse::Event::CursorMoved {
+                position: *position,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// How should the tooltip open. Defaults to hovered.
@@ -1041,6 +1168,7 @@ where
     state: &'b mut widget::Tree,
     tooltip_state: &'b mut Mode,
     positioning: Position,
+    open: Open,
     class: &'b Theme::Class<'a>,
     window: Size,
 }
@@ -1079,36 +1207,33 @@ where
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
     ) {
-        if let Event::Mouse(_) | Event::Window(window::Event::RedrawRequested(_)) = event {
+        if let Event::Mouse(_)
+        | Event::Touch(_)
+        | Event::Window(window::Event::RedrawRequested(_)) = event
+        {
             let bounds = self.bounds();
+            // Group hides the cursor from a parent while it is over a nested overlay.
+            let preserve_hover =
+                matches!(cursor, mouse::Cursor::Unavailable) && !self.overlay(renderer).is_empty();
             let state = &mut *self.tooltip_state;
             let previous_state = *state;
             let was_idle = matches!(*state, Mode::Idle { .. });
 
-            *state = cursor
-                .position_over(bounds)
-                .map(|_| Mode::Opened {
-                    cursor_position: if let Mode::Opened {
-                        cursor_position, ..
-                    } = *state
-                    {
-                        cursor_position
-                    } else {
-                        Point::default()
-                    },
-                    over_overlay: true,
-                })
-                .unwrap_or(Mode::Opened {
-                    cursor_position: if let Mode::Opened {
-                        cursor_position, ..
-                    } = *state
-                    {
-                        cursor_position
-                    } else {
-                        Point::default()
-                    },
-                    over_overlay: false,
-                });
+            let (cursor_position, over_overlay) = match *state {
+                Mode::Opened {
+                    cursor_position,
+                    over_overlay,
+                } => (cursor_position, over_overlay),
+                Mode::Idle { .. } => (Point::default(), false),
+            };
+            *state = Mode::Opened {
+                cursor_position,
+                over_overlay: if preserve_hover {
+                    over_overlay
+                } else {
+                    cursor.is_over(bounds)
+                },
+            };
 
             let is_idle = matches!(*state, Mode::Idle { .. });
 
@@ -1132,7 +1257,7 @@ where
             &viewport,
         );
 
-        if cursor.is_over(self.bounds()) && matches!(event, Event::Mouse(_)) {
+        if cursor.is_over(self.bounds()) && matches!(event, Event::Mouse(_) | Event::Touch(_)) {
             shell.capture_event();
         }
     }
@@ -1177,6 +1302,27 @@ where
             mouse::Interaction::Idle
         } else {
             interaction
+        }
+    }
+
+    fn overlay<'c>(
+        &'c mut self,
+        renderer: &Renderer,
+    ) -> Vec<overlay::Element<'c, Message, Theme, Renderer>> {
+        self.tooltip.overlay(
+            self.state,
+            self.layout,
+            renderer,
+            &Rectangle::with_size(self.window),
+            Vector::ZERO,
+            self.window,
+        )
+    }
+
+    fn index(&self) -> f32 {
+        match self.open {
+            Open::Hovered => 1.0,
+            Open::LeftPointer | Open::RightPointer => 2.0,
         }
     }
 }
@@ -1246,6 +1392,7 @@ mod tests {
     use super::*;
 
     use iced::widget::Space;
+    use iced_core::event;
     use iced_core::shell::{Bus, Invalidation, Waker};
     use iced_core::widget::Operation as _;
 
@@ -1287,6 +1434,821 @@ mod tests {
             &Rectangle::with_size(Size::new(200.0, 100.0)),
         );
         (shell.invalidation(), shell.redraw_request())
+    }
+
+    struct NestedContent {
+        has_nested: bool,
+    }
+
+    impl widget::Meta for NestedContent {}
+
+    impl Widget<(), Theme, ()> for NestedContent {
+        fn tag(&self) -> widget::tree::Tag {
+            widget::tree::Tag::of::<Vec<Event>>()
+        }
+
+        fn state(&self) -> widget::tree::State {
+            widget::tree::State::new(Vec::<Event>::new())
+        }
+
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fixed(40.0), Length::Fixed(20.0))
+        }
+
+        fn layout(&mut self, tree: &mut widget::Tree, _renderer: &(), _limits: &layout::Limits) {
+            tree.size = Size::new(40.0, 20.0);
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut widget::Tree,
+            event: &Event,
+            _layout: Layout,
+            _cursor: mouse::Cursor,
+            _renderer: &(),
+            _shell: &mut Shell<'_, ()>,
+            _viewport: &Rectangle,
+        ) {
+            tree.state.downcast_mut::<Vec<Event>>().push(event.clone());
+        }
+
+        fn draw(
+            &self,
+            _tree: &widget::Tree,
+            _renderer: &mut (),
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            _tree: &'a mut widget::Tree,
+            layout: Layout,
+            _renderer: &(),
+            viewport: &Rectangle,
+            translation: Vector,
+            window: Size,
+        ) -> Vec<overlay::Element<'a, (), Theme, ()>> {
+            assert_eq!(*viewport, Rectangle::with_size(window));
+            assert_eq!(translation, Vector::ZERO);
+            if !self.has_nested {
+                return Vec::new();
+            }
+            vec![overlay::Element::new(Box::new(NestedOverlay {
+                bounds: Rectangle::new(
+                    layout.position() + Vector::new(0.0, 20.0),
+                    Size::new(80.0, 40.0),
+                ),
+            }))]
+        }
+    }
+
+    struct NestedOverlay {
+        bounds: Rectangle,
+    }
+
+    impl overlay::Overlay<(), Theme, ()> for NestedOverlay {
+        fn update(
+            &mut self,
+            event: &Event,
+            cursor: mouse::Cursor,
+            _renderer: &(),
+            shell: &mut Shell<'_, ()>,
+        ) {
+            if cursor.is_over(self.bounds)
+                && matches!(pointer_event(event), Some(mouse::Event::ButtonPressed(_)))
+            {
+                shell.capture_event();
+            }
+        }
+
+        fn mouse_interaction(&self, cursor: mouse::Cursor, _renderer: &()) -> mouse::Interaction {
+            if cursor.is_over(self.bounds) {
+                mouse::Interaction::Idle
+            } else {
+                mouse::Interaction::None
+            }
+        }
+
+        fn draw(
+            &self,
+            _renderer: &mut (),
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _cursor: mouse::Cursor,
+        ) {
+        }
+    }
+
+    fn dispatch_event(
+        tooltip: &mut Tooltip<'_, (), Theme, ()>,
+        tree: &mut widget::Tree,
+        event: &Event,
+        cursor: mouse::Cursor,
+    ) -> event::Status {
+        let window = Size::new(200.0, 100.0);
+        let viewport = Rectangle::with_size(window);
+        let layout = Layout::new(tree.size);
+        let mut bus = Bus::new();
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+        let overlays = tooltip.overlay(tree, layout, &(), &viewport, Vector::ZERO, window);
+        let mut group = overlay::Group::new(overlays);
+        group.update(event, cursor, &(), &mut shell);
+        let base_cursor = if group.mouse_interaction(cursor, &()) == mouse::Interaction::None {
+            cursor
+        } else {
+            cursor.levitate()
+        };
+        drop(group);
+        if shell.event_status() == event::Status::Ignored {
+            tooltip.update(tree, event, layout, base_cursor, &(), &mut shell, &viewport);
+        }
+        shell.event_status()
+    }
+
+    #[test]
+    fn existing_positions_preserve_content_alignment_and_outer_padding() {
+        let anchor = Rectangle::new(Point::new(100.0, 100.0), Size::new(80.0, 30.0));
+        let content = Size::new(40.0, 20.0);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let cases = [
+            (Position::Top, Point::new(116.0, 65.0)),
+            (Position::Bottom, Point::new(116.0, 137.0)),
+            (Position::Left, Point::new(45.0, 101.0)),
+            (Position::Right, Point::new(187.0, 101.0)),
+            (Position::FollowCursor, Point::new(126.0, 96.0)),
+            (Position::TopRight, Point::new(136.0, 65.0)),
+            (Position::TopLeft, Point::new(96.0, 65.0)),
+            (Position::BottomRight, Point::new(136.0, 137.0)),
+            (Position::BottomLeft, Point::new(96.0, 137.0)),
+        ];
+
+        for snap in [false, true] {
+            for (position, origin) in cases {
+                assert_eq!(
+                    resolve_tooltip_bounds(
+                        position,
+                        anchor,
+                        content,
+                        4.0,
+                        7.0,
+                        Point::new(130.0, 120.0),
+                        viewport,
+                        snap,
+                    ),
+                    Rectangle::new(origin, Size::new(48.0, 28.0)),
+                    "{position:?}, snap = {snap}",
+                );
+            }
+        }
+        assert_eq!(Position::default(), Position::FollowCursor);
+        assert_eq!(Side::default(), Side::Bottom);
+    }
+
+    #[test]
+    fn auto_keeps_a_fitting_preference_even_when_another_side_has_more_room() {
+        let bounds = resolve_tooltip_bounds(
+            Position::Auto {
+                preference: Side::Bottom,
+            },
+            Rectangle::new(Point::new(100.0, 180.0), Size::new(80.0, 30.0)),
+            Size::new(40.0, 20.0),
+            4.0,
+            7.0,
+            Point::ORIGIN,
+            Rectangle::with_size(Size::new(400.0, 300.0)),
+            true,
+        );
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(116.0, 217.0), Size::new(48.0, 28.0)),
+        );
+    }
+
+    #[test]
+    fn auto_uses_padded_size_gap_and_viewport_origin_to_check_a_preference() {
+        let anchor = Rectangle::new(Point::new(150.0, 302.0), Size::new(80.0, 30.0));
+        let viewport = Rectangle::new(Point::new(50.0, 100.0), Size::new(400.0, 260.0));
+        let position = Position::Auto {
+            preference: Side::Bottom,
+        };
+        for (padding, gap, expected) in [
+            (4.0, 0.0, Point::new(166.0, 332.0)),
+            (4.0, 1.0, Point::new(166.0, 273.0)),
+            (5.0, 0.0, Point::new(165.0, 272.0)),
+        ] {
+            assert_eq!(
+                resolve_tooltip_bounds(
+                    position,
+                    anchor,
+                    Size::new(40.0, 20.0),
+                    padding,
+                    gap,
+                    Point::ORIGIN,
+                    viewport,
+                    false,
+                )
+                .position(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_side_with_the_most_space_without_snapping() {
+        let bounds = resolve_tooltip_bounds(
+            Position::Auto {
+                preference: Side::Bottom,
+            },
+            Rectangle::new(Point::new(0.0, 0.0), Size::new(50.0, 50.0)),
+            Size::new(80.0, 960.0),
+            4.0,
+            7.0,
+            Point::ORIGIN,
+            Rectangle::with_size(Size::new(1000.0, 1000.0)),
+            false,
+        );
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(57.0, -459.0), Size::new(88.0, 968.0)),
+        );
+    }
+
+    #[test]
+    fn auto_ties_choose_the_later_side_in_popover_order() {
+        let viewport = Rectangle::with_size(Size::new(220.0, 220.0));
+        let bounds = resolve_tooltip_bounds(
+            Position::Auto {
+                preference: Side::Top,
+            },
+            Rectangle::new(Point::new(100.0, 100.0), Size::new(20.0, 20.0)),
+            Size::new(240.0, 240.0),
+            4.0,
+            7.0,
+            Point::ORIGIN,
+            viewport,
+            false,
+        );
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(-14.0, 127.0), Size::new(248.0, 248.0)),
+        );
+
+        let bounds = resolve_tooltip_bounds(
+            Position::Auto {
+                preference: Side::Top,
+            },
+            Rectangle::new(Point::new(100.0, 10.0), Size::new(20.0, 200.0)),
+            Size::new(240.0, 240.0),
+            4.0,
+            7.0,
+            Point::ORIGIN,
+            viewport,
+            false,
+        );
+        assert_eq!(bounds.position(), Point::new(127.0, -14.0));
+    }
+
+    #[test]
+    fn fixed_directions_flip_and_preserve_cross_axis_alignment() {
+        let viewport = Rectangle::with_size(Size::new(200.0, 100.0));
+        let cases = [
+            (Position::Top, Point::new(80.0, 0.0), Point::new(96.0, 37.0)),
+            (
+                Position::TopLeft,
+                Point::new(80.0, 0.0),
+                Point::new(76.0, 37.0),
+            ),
+            (
+                Position::TopRight,
+                Point::new(80.0, 0.0),
+                Point::new(116.0, 37.0),
+            ),
+            (
+                Position::Bottom,
+                Point::new(80.0, 70.0),
+                Point::new(96.0, 35.0),
+            ),
+            (
+                Position::BottomLeft,
+                Point::new(80.0, 70.0),
+                Point::new(76.0, 35.0),
+            ),
+            (
+                Position::BottomRight,
+                Point::new(80.0, 70.0),
+                Point::new(116.0, 35.0),
+            ),
+            (
+                Position::Left,
+                Point::new(0.0, 30.0),
+                Point::new(87.0, 31.0),
+            ),
+            (
+                Position::Right,
+                Point::new(120.0, 30.0),
+                Point::new(65.0, 31.0),
+            ),
+        ];
+        for (position, anchor, expected) in cases {
+            let bounds = resolve_tooltip_bounds(
+                position,
+                Rectangle::new(anchor, Size::new(80.0, 30.0)),
+                Size::new(40.0, 20.0),
+                4.0,
+                7.0,
+                Point::ORIGIN,
+                viewport,
+                true,
+            );
+            assert_eq!(bounds.position(), expected, "{position:?}");
+            assert_eq!(bounds.size(), Size::new(48.0, 28.0));
+        }
+    }
+
+    #[test]
+    fn bottom_right_dropdown_flips_above_its_anchor_instead_of_over_it() {
+        let anchor = Rectangle::new(Point::new(50.0, 60.0), Size::new(30.0, 10.0));
+        let viewport = Rectangle::with_size(Size::new(100.0, 80.0));
+        for (snap, expected) in [
+            (true, Point::new(36.0, 29.0)),
+            (false, Point::new(36.0, 73.0)),
+        ] {
+            assert_eq!(
+                resolve_tooltip_bounds(
+                    Position::BottomRight,
+                    anchor,
+                    Size::new(40.0, 20.0),
+                    4.0,
+                    3.0,
+                    Point::ORIGIN,
+                    viewport,
+                    snap,
+                )
+                .position(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_fitting_side_does_not_flip_when_the_opposite_has_less_or_equal_room() {
+        for y in [10.0, 35.0] {
+            let bounds = resolve_tooltip_bounds(
+                Position::Bottom,
+                Rectangle::new(Point::new(50.0, y), Size::new(30.0, 30.0)),
+                Size::new(40.0, 80.0),
+                4.0,
+                3.0,
+                Point::ORIGIN,
+                Rectangle::with_size(Size::new(200.0, 100.0)),
+                true,
+            );
+            assert_eq!(bounds.position(), Point::new(41.0, 12.0));
+        }
+    }
+
+    #[test]
+    fn clamp_applies_after_flipping_and_follow_cursor_never_flips() {
+        let viewport = Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 80.0));
+        let anchor = Rectangle::new(Point::new(100.0, 80.0), Size::new(30.0, 10.0));
+        assert_eq!(
+            resolve_tooltip_bounds(
+                Position::BottomRight,
+                anchor,
+                Size::new(40.0, 20.0),
+                4.0,
+                3.0,
+                Point::ORIGIN,
+                viewport,
+                true,
+            ),
+            Rectangle::new(Point::new(62.0, 49.0), Size::new(48.0, 28.0)),
+        );
+        assert_eq!(
+            resolve_tooltip_bounds(
+                Position::FollowCursor,
+                anchor,
+                Size::new(40.0, 20.0),
+                4.0,
+                3.0,
+                Point::new(12.0, 22.0),
+                viewport,
+                true,
+            ),
+            Rectangle::new(Point::new(10.0, 20.0), Size::new(48.0, 28.0)),
+        );
+    }
+
+    #[test]
+    fn oversized_tooltip_retains_the_original_per_axis_clamp() {
+        let viewport = Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 80.0));
+        for (cursor, expected) in [
+            (Point::new(0.0, 0.0), Point::new(10.0, 20.0)),
+            (Point::new(100.0, 200.0), Point::new(-98.0, -8.0)),
+        ] {
+            assert_eq!(
+                resolve_tooltip_bounds(
+                    Position::FollowCursor,
+                    Rectangle::with_size(Size::new(30.0, 10.0)),
+                    Size::new(200.0, 100.0),
+                    4.0,
+                    3.0,
+                    cursor,
+                    viewport,
+                    true,
+                )
+                .position(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn touch_tap_opens_left_pointer_and_an_outside_tap_closes_it() {
+        let mut tooltip = test_widget()
+            .open(Open::LeftPointer)
+            .position(Position::Bottom);
+        let mut tree = tree_for(&mut tooltip);
+        let position = Point::new(10.0, 10.0);
+        for event in [
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position,
+            },
+            touch::Event::FingerLifted {
+                id: touch::Finger(1),
+                position,
+            },
+        ] {
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Touch(event),
+                mouse::Cursor::Available(position),
+            );
+        }
+        assert_eq!(
+            tree.state.downcast_ref::<State>().mode,
+            Mode::Opened {
+                cursor_position: position,
+                over_overlay: false
+            },
+        );
+
+        let outside = Point::new(190.0, 90.0);
+        for event in [
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: outside,
+            },
+            touch::Event::FingerLifted {
+                id: touch::Finger(1),
+                position: outside,
+            },
+        ] {
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Touch(event),
+                mouse::Cursor::Available(outside),
+            );
+            assert_eq!(tree.state.downcast_ref::<State>().mode, Mode::default());
+        }
+    }
+
+    #[test]
+    fn touch_cannot_open_right_pointer_but_an_outside_press_closes_it() {
+        let mut tooltip = test_widget()
+            .open(Open::RightPointer)
+            .position(Position::Bottom);
+        let mut tree = tree_for(&mut tooltip);
+        let position = Point::new(10.0, 10.0);
+        for event in [
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position,
+            },
+            touch::Event::FingerLifted {
+                id: touch::Finger(1),
+                position,
+            },
+        ] {
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Touch(event),
+                mouse::Cursor::Available(position),
+            );
+            assert_eq!(tree.state.downcast_ref::<State>().mode, Mode::default());
+        }
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Right),
+            mouse::Event::ButtonReleased(mouse::Button::Right),
+        ] {
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Mouse(event),
+                mouse::Cursor::Available(position),
+            );
+        }
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().mode,
+            Mode::Opened { .. }
+        ));
+        let outside = Point::new(190.0, 90.0);
+        dispatch_event(
+            &mut tooltip,
+            &mut tree,
+            &Event::Touch(touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: outside,
+            }),
+            mouse::Cursor::Available(outside),
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().mode, Mode::default());
+    }
+
+    #[test]
+    fn touch_normalization_preserves_mouse_events_and_maps_lost_to_release() {
+        let position = Point::new(10.0, 10.0);
+        let events = [
+            (
+                touch::Event::FingerPressed {
+                    id: touch::Finger(1),
+                    position,
+                },
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            ),
+            (
+                touch::Event::FingerLifted {
+                    id: touch::Finger(1),
+                    position,
+                },
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ),
+            (
+                touch::Event::FingerLost {
+                    id: touch::Finger(1),
+                    position,
+                },
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ),
+            (
+                touch::Event::FingerMoved {
+                    id: touch::Finger(1),
+                    position,
+                },
+                mouse::Event::CursorMoved { position },
+            ),
+        ];
+        for (touch, mouse) in events {
+            assert_eq!(pointer_event(&Event::Touch(touch)), Some(mouse));
+            assert_eq!(pointer_event(&Event::Mouse(mouse)), Some(mouse));
+        }
+    }
+
+    #[test]
+    fn tooltip_overlay_captures_touch_and_delivers_the_original_event_to_content() {
+        let mut tooltip = Tooltip::new(
+            Space::new().width(80).height(30),
+            NestedContent { has_nested: false },
+        )
+        .open(Open::LeftPointer)
+        .position(Position::Bottom);
+        let mut tree = tree_for(&mut tooltip);
+        tree.state.downcast_mut::<State>().mode = Mode::Opened {
+            cursor_position: Point::new(10.0, 10.0),
+            over_overlay: false,
+        };
+        let position = Point::new(30.0, 40.0);
+        for touch in [
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position,
+            },
+            touch::Event::FingerMoved {
+                id: touch::Finger(1),
+                position,
+            },
+            touch::Event::FingerLifted {
+                id: touch::Finger(1),
+                position,
+            },
+            touch::Event::FingerLost {
+                id: touch::Finger(1),
+                position,
+            },
+        ] {
+            let event = Event::Touch(touch);
+            assert_eq!(
+                dispatch_event(
+                    &mut tooltip,
+                    &mut tree,
+                    &event,
+                    mouse::Cursor::Available(position)
+                ),
+                event::Status::Captured,
+            );
+            assert_eq!(
+                tree.children[1].state.downcast_ref::<Vec<Event>>().last(),
+                Some(&event)
+            );
+            assert!(matches!(
+                tree.state.downcast_ref::<State>().mode,
+                Mode::Opened {
+                    over_overlay: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn unavailable_cursor_only_preserves_hover_when_content_has_nested_overlays() {
+        for has_nested in [false, true] {
+            for over_overlay in [false, true] {
+                let mut tooltip = Tooltip::new(
+                    Space::new().width(80).height(30),
+                    NestedContent { has_nested },
+                )
+                .position(Position::Bottom);
+                let mut tree = tree_for(&mut tooltip);
+                let cursor_position = Point::new(10.0, 10.0);
+                tree.state.downcast_mut::<State>().mode = Mode::Opened {
+                    cursor_position,
+                    over_overlay,
+                };
+                let mut bus = Bus::new();
+                let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+                let window = Size::new(200.0, 100.0);
+                let mut overlays = tooltip.overlay(
+                    &mut tree,
+                    Layout::new(Size::new(80.0, 30.0)),
+                    &(),
+                    &Rectangle::with_size(window),
+                    Vector::ZERO,
+                    window,
+                );
+                overlays[0].as_overlay_mut().update(
+                    &Event::Mouse(mouse::Event::CursorMoved {
+                        position: Point::new(70.0, 65.0),
+                    }),
+                    mouse::Cursor::Unavailable,
+                    &(),
+                    &mut shell,
+                );
+                drop(overlays);
+                assert_eq!(
+                    tree.state.downcast_ref::<State>().mode,
+                    Mode::Opened {
+                        cursor_position,
+                        over_overlay: has_nested && over_overlay,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_onto_a_nested_overlay_outside_the_tooltip_keeps_hovered_open() {
+        let mut tooltip = Tooltip::new(
+            Space::new().width(80).height(30),
+            NestedContent { has_nested: true },
+        )
+        .position(Position::Bottom);
+        let mut tree = tree_for(&mut tooltip);
+        for position in [
+            Point::new(10.0, 10.0),
+            Point::new(30.0, 40.0),
+            Point::new(70.0, 65.0),
+        ] {
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position }),
+                mouse::Cursor::Available(position),
+            );
+            assert!(matches!(
+                tree.state.downcast_ref::<State>().mode,
+                Mode::Opened { .. }
+            ));
+        }
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().mode,
+            Mode::Opened {
+                over_overlay: true,
+                ..
+            }
+        ));
+        let outside = Point::new(190.0, 90.0);
+        dispatch_event(
+            &mut tooltip,
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved { position: outside }),
+            mouse::Cursor::Available(outside),
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().mode, Mode::default());
+    }
+
+    #[test]
+    fn a_captured_nested_option_press_does_not_close_left_pointer() {
+        let mut tooltip = Tooltip::new(
+            Space::new().width(80).height(30),
+            NestedContent { has_nested: true },
+        )
+        .open(Open::LeftPointer)
+        .position(Position::Bottom);
+        let mut tree = tree_for(&mut tooltip);
+        let mode = Mode::Opened {
+            cursor_position: Point::new(10.0, 10.0),
+            over_overlay: true,
+        };
+        tree.state.downcast_mut::<State>().mode = mode;
+        assert_eq!(
+            dispatch_event(
+                &mut tooltip,
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                mouse::Cursor::Available(Point::new(70.0, 65.0)),
+            ),
+            event::Status::Captured,
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().mode, mode);
+        assert!(
+            tree.children[1]
+                .state
+                .downcast_ref::<Vec<Event>>()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pointer_overlays_draw_at_index_two_and_hovered_at_one() {
+        for (open, expected) in [
+            (Open::Hovered, 1.0),
+            (Open::LeftPointer, 2.0),
+            (Open::RightPointer, 2.0),
+        ] {
+            let mut tooltip = test_widget().open(open);
+            let mut tree = tree_for(&mut tooltip);
+            tree.state.downcast_mut::<State>().mode = Mode::Opened {
+                cursor_position: Point::new(10.0, 10.0),
+                over_overlay: false,
+            };
+            let window = Size::new(200.0, 100.0);
+            let overlays = tooltip.overlay(
+                &mut tree,
+                Layout::new(Size::new(80.0, 30.0)),
+                &(),
+                &Rectangle::with_size(window),
+                Vector::ZERO,
+                window,
+            );
+            assert_eq!(overlays[0].as_overlay().index(), expected);
+        }
+    }
+
+    #[test]
+    fn follow_cursor_translates_the_recorded_cursor_into_screen_coordinates() {
+        #[derive(Default)]
+        struct Bounds(Option<Rectangle>);
+
+        impl widget::Operation for Bounds {
+            fn traverse(&mut self, _operate: &mut dyn FnMut(&mut dyn widget::Operation)) {}
+
+            fn container(&mut self, _id: Option<&Id>, bounds: Rectangle, _viewport: &Rectangle) {
+                self.0 = Some(bounds);
+            }
+        }
+
+        let mut tooltip = test_widget().padding(4).snap_within_viewport(false);
+        let mut tree = tree_for(&mut tooltip);
+        move_cursor(&mut tooltip, &mut tree, Some(Point::new(10.0, 10.0)));
+        let layout = Layout::new(tree.size).move_to(Point::new(50.0, 50.0));
+        let window = Size::new(200.0, 100.0);
+        let mut overlays = tooltip.overlay(
+            &mut tree,
+            layout,
+            &(),
+            &Rectangle::with_size(window),
+            Vector::new(20.0, 30.0),
+            window,
+        );
+        let mut bounds = Bounds::default();
+        overlays[0].as_overlay_mut().operate(&(), &mut bounds);
+        assert_eq!(
+            bounds.0,
+            Some(Rectangle::new(
+                Point::new(26.0, 16.0),
+                Size::new(48.0, 28.0)
+            ))
+        );
     }
 
     #[test]

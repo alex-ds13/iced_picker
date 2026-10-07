@@ -1,3 +1,7 @@
+use iced::{
+    Border, Center, Fill, Shrink, Subscription, Task, Theme, Widget, keyboard,
+    widget::{TextInput, button, center, column, container, operation, pick_list, row, text},
+};
 use iced_picker::{
     modal::{self, modal},
     number_input::NumberInput,
@@ -5,10 +9,6 @@ use iced_picker::{
 };
 
 const SAVE_TIP_ID: &str = "save_dropdown_tooltip";
-use iced::{
-    Border, Center, Fill, Shrink, Subscription, Task, Theme, Widget, keyboard,
-    widget::{TextInput, button, center, column, container, operation, row, text},
-};
 
 fn main() -> iced::Result {
     iced::application(App::default, App::update, App::view)
@@ -23,6 +23,7 @@ struct App {
     amount: f64,
     show_modal: bool,
     last_action: Option<String>,
+    save_priority: Option<&'static str>,
 }
 
 impl Default for App {
@@ -31,6 +32,7 @@ impl Default for App {
             amount: 42.50,
             show_modal: false,
             last_action: None,
+            save_priority: None,
         }
     }
 }
@@ -45,6 +47,7 @@ enum Message {
     Save,
     SaveAs,
     Backup,
+    SavePriorityChanged(&'static str),
     TabPressed { shift: bool },
 }
 
@@ -78,6 +81,10 @@ impl App {
             Message::Backup => {
                 self.last_action = Some("Backup created".into());
                 return tooltip::close(SAVE_TIP_ID);
+            }
+            Message::SavePriorityChanged(priority) => {
+                self.save_priority = Some(priority);
+                self.last_action = Some(format!("Save priority: {priority}"));
             }
             Message::TabPressed { shift } => {
                 return if shift {
@@ -141,7 +148,7 @@ impl App {
             last_action,
             iced::widget::rule::horizontal(1.0),
             text("Save with Dropdown").size(18),
-            save_buttons_row(),
+            save_buttons_row(self.save_priority),
         ]
         .spacing(12)
         .padding(30)
@@ -174,7 +181,7 @@ impl App {
     }
 }
 
-fn save_buttons_row() -> impl Widget<Message> {
+fn save_buttons_row(save_priority: Option<&'static str>) -> impl Widget<Message> {
     let save_btn = button("Save")
         .on_press(Message::Save)
         .style(|t: &Theme, s| iced::widget::button::Style {
@@ -200,6 +207,13 @@ fn save_buttons_row() -> impl Widget<Message> {
                     button::Status::Active => button::text(t, s),
                     _ => button::background(t, s),
                 }),
+            pick_list(
+                save_priority,
+                ["Low", "Medium", "High"],
+                ToString::to_string
+            )
+            .on_select(Message::SavePriorityChanged)
+            .placeholder("Priority"),
         ]
         .width(Shrink),
     )
