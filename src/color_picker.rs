@@ -33,7 +33,7 @@ use iced::{
         overlay, renderer, shell,
         text::Renderer as _,
         widget::{
-            Meta,
+            Id, Meta, Operation, operation,
             tree::{self, Tag, Tree},
         },
     },
@@ -104,6 +104,28 @@ where
 #[derive(Debug, Clone)]
 enum InternalMessage {
     ChangeInput(String),
+}
+
+/// Builds the hex input showing `text`, which may be a partial edit of `color`.
+fn hex_text_input<'a, Theme>(
+    color: Color,
+    text: &str,
+) -> TextInput<'a, InternalMessage, InternalTheme<Theme>>
+where
+    Theme: text_input::Catalog + Clone + 'a,
+{
+    text_input(color.as_hex_string(), text.to_owned())
+        .on_input(InternalMessage::ChangeInput)
+        .padding(PADDING)
+        .align_x(iced::Alignment::Center)
+}
+
+/// Parses a hex color typed into the hex input.
+fn parse_hex(text: &str) -> Option<Color> {
+    // `Color::from_str` slices by byte index, which panics on multibyte characters.
+    text.is_ascii()
+        .then(|| Color::from_str(text).ok())
+        .flatten()
 }
 
 struct InternalTheme<Theme: text_input::Catalog + Clone> {
@@ -195,10 +217,7 @@ where
         .width(Length::Fill)
         .on_press(on_cancel.clone()) // Sending a fake message
         .boxed();
-        let hex_input = text_input(color.as_hex_string(), color.as_hex_string())
-            .on_input(InternalMessage::ChangeInput)
-            .padding(PADDING)
-            .align_x(iced::Alignment::Center);
+        let hex_input = hex_text_input(color, &color.as_hex_string());
 
         let overlay_el = overlay_element(color, on_cancel.clone()).boxed();
 
@@ -259,6 +278,7 @@ impl State {
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.overlay_state.color = Color::from_rgb(0.5, 0.25, 0.25);
+        self.overlay_state.hex_text = self.overlay_state.color.as_hex_string();
         self.overlay_state.color_bar_dragged = ColorBarDragged::None;
     }
 }
@@ -289,8 +309,14 @@ where
         } = tree.state.downcast_mut::<State>();
         *overlay_layout = None;
 
-        if color_picker_state.color != self.color {
+        // Rebuilding the view with an unchanged color must not discard an edit in progress,
+        // so the working color is only replaced by a new color or once the picker is closed.
+        if color_picker_state.external_color != self.color
+            || (!self.show_picker && color_picker_state.color != self.color)
+        {
+            color_picker_state.external_color = self.color;
             color_picker_state.color = self.color;
+            color_picker_state.hex_text = self.color.as_hex_string();
             if !matches!(self.color, Color::BLACK | Color::WHITE) {
                 // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
                 // was on those cases
@@ -300,11 +326,14 @@ where
             }
         }
 
-        if !self.show_picker
-            && color_picker_state.current_hue_degrees != color_picker_state.previous_hue_degrees
-        {
-            color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
+        if !self.show_picker {
+            color_picker_state.hex_text = color_picker_state.color.as_hex_string();
+            if color_picker_state.current_hue_degrees != color_picker_state.previous_hue_degrees {
+                color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
+            }
         }
+
+        self.hex_input = hex_text_input(color_picker_state.color, &color_picker_state.hex_text);
 
         tree.diff_children(&mut [&mut self.underlay, &mut self.overlay_el]);
     }
@@ -607,6 +636,50 @@ where
             class,
             tree,
         }
+    }
+
+    fn is_hex_input_focused(&mut self, layout: Layout, renderer: &Renderer) -> bool {
+        struct IsFocused(bool);
+
+        impl Operation for IsFocused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn focusable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                self.0 = state.is_focused();
+            }
+        }
+
+        let mut is_focused = IsFocused(false);
+        self.hex_input.operate(
+            &mut self.tree.children[3],
+            layout,
+            &layout.bounds(),
+            renderer,
+            &mut is_focused,
+        );
+        is_focused.0
+    }
+
+    /// Replaces the hex text with the formatted current color.
+    fn sync_hex_text(&mut self) {
+        self.state.hex_text = self.state.color.as_hex_string();
+        self.rebuild_hex_input();
+        // Upstream's text input only copies its value into the tree state during
+        // layout, and the overlay layout is cached, so force a recompute.
+        self.state.layout_stale = true;
+    }
+
+    fn rebuild_hex_input(&mut self) {
+        let mut hex_input = hex_text_input(self.state.color, &self.state.hex_text);
+        self.tree.children[3].diff::<_, _, Renderer>(&mut hex_input);
+        *self.hex_input = hex_input;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1395,7 +1468,11 @@ where
         shell: &mut Shell<Message>,
     ) {
         let layout = self.layout;
+        let color_before = self.state.color;
         if event::Status::Captured == self.on_event_keyboard(event) {
+            if self.state.color != color_before {
+                self.sync_hex_text();
+            }
             self.state.clear();
             shell.capture_event();
             shell.request_redraw();
@@ -1428,6 +1505,7 @@ where
 
         // ----------- Hex input ----------------------
         let hex_input_layout = hex_input_layout.for_widget(&self.tree.children[3]);
+        let was_editing_hex = self.is_hex_input_focused(hex_input_layout, renderer);
         let mut fake_input_messages = shell::Bus::new();
         let mut fake_input_shell = shell.local(&mut fake_input_messages);
 
@@ -1436,7 +1514,6 @@ where
             fake_input_shell.capture_event();
         }
 
-        let mut should_update_input = true;
         self.hex_input.update(
             &mut self.tree.children[3],
             event,
@@ -1458,11 +1535,9 @@ where
         }
         drop(fake_input_shell);
 
-        if let Some(InternalMessage::ChangeInput(color_str)) =
-            fake_input_messages.into_iter().next()
-        {
-            // Update the selected color if string can be parsed
-            if let Ok(color) = iced::Color::from_str(&color_str) {
+        let mut hex_edited = false;
+        for InternalMessage::ChangeInput(text) in fake_input_messages {
+            if let Some(color) = parse_hex(&text) {
                 self.state.color = color;
                 if !matches!(self.state.color, Color::BLACK | Color::WHITE) {
                     // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
@@ -1470,12 +1545,14 @@ where
                     let hue = Hsv::from(self.state.color).hue;
                     self.state.current_hue_degrees = hue;
                 }
-            } else {
-                should_update_input = false;
             }
+            self.state.hex_text = text;
+            hex_edited = true;
             shell.capture_event();
             shell.request_redraw();
         }
+        let hex_edit_ended =
+            was_editing_hex && !self.is_hex_input_focused(hex_input_layout, renderer);
         // ----------- Buttons -------------------------
         let cancel_button_layout = block2_children
             .next()
@@ -1535,22 +1612,18 @@ where
         }
         // ----------- Block 2 end ------------------
 
+        // Rewriting the hex text on every parseable keystroke would mix the formatted color
+        // into what the user is typing, so it is only re-synced once the edit ends or when
+        // another control changed the color.
+        if hex_edit_ended || (!hex_edited && self.state.color != color_before) {
+            self.sync_hex_text();
+        } else if hex_edited {
+            // The input already shows the typed text. Its value must match, or the next
+            // layout would overwrite the edit.
+            self.rebuild_hex_input();
+        }
+
         if shell.is_event_captured() {
-            if should_update_input {
-                let mut new_hex_input: TextInput<InternalMessage, InternalTheme<Theme>> =
-                    text_input(
-                        self.state.color.as_hex_string(),
-                        self.state.color.as_hex_string(),
-                    )
-                    .on_input(InternalMessage::ChangeInput)
-                    .padding(PADDING)
-                    .align_x(iced::Alignment::Center);
-                self.tree.children[3].diff::<_, _, Renderer>(&mut new_hex_input);
-                *self.hex_input = new_hex_input;
-                // Upstream's text input only copies its value into the tree state during
-                // layout, and the overlay layout is cached, so force a recompute.
-                self.state.layout_stale = true;
-            }
             self.state.clear();
         } else if matches!(
             event,
@@ -2510,6 +2583,10 @@ pub struct OverlayState {
     pub(crate) keyboard_modifiers: keyboard::Modifiers,
     /// Whether the cached overlay layout must be recomputed before the next use.
     pub(crate) layout_stale: bool,
+    /// The text of the hex input, kept as typed while it is being edited.
+    hex_text: String,
+    /// The last color given to the [`ColorPicker`] by the application.
+    external_color: Color,
     rgba_tree: Tree,
 }
 
@@ -2520,6 +2597,8 @@ impl OverlayState {
         let hue = Hsv::from(color).hue;
         Self {
             color,
+            hex_text: color.as_hex_string(),
+            external_color: color,
             previous_hue_degrees: hue,
             current_hue_degrees: hue,
             ..Self::default()
@@ -2535,8 +2614,11 @@ impl OverlayState {
 
 impl Default for OverlayState {
     fn default() -> Self {
+        let color = Color::from_rgb(0.5, 0.25, 0.25);
         Self {
-            color: Color::from_rgb(0.5, 0.25, 0.25),
+            color,
+            hex_text: color.as_hex_string(),
+            external_color: color,
             sat_value_canvas_cache: canvas::Cache::default(),
             hue_canvas_cache: canvas::Cache::default(),
             previous_hue_degrees: 0,
@@ -2915,8 +2997,6 @@ where
 mod tests {
     use super::*;
 
-    use iced::advanced::widget::{Id, Operation, operation};
-
     #[derive(Clone, Debug, PartialEq)]
     enum Message {
         Cancel,
@@ -3171,5 +3251,270 @@ mod tests {
             &mut input_text,
         );
         assert_eq!(input_text.0, expected);
+    }
+
+    const WINDOW: Size = Size::new(900.0, 700.0);
+    const ORIGINAL_HEX: &str = "#112233FF";
+
+    fn original() -> Color {
+        Color::from_rgb8(0x11, 0x22, 0x33)
+    }
+
+    fn picker_with(color: Color) -> ColorPicker<'static, Message> {
+        color_picker(
+            true,
+            color,
+            iced::widget::Space::new().width(80).height(30),
+            Message::Cancel,
+            Message::Submit,
+        )
+    }
+
+    /// Drives a picker the way the runtime does: the overlay is rebuilt for
+    /// every event and every redraw, and `rebuild` stands in for `view`.
+    struct Harness {
+        renderer: Renderer,
+        picker: ColorPicker<'static, Message>,
+        tree: Tree,
+        cursor: Cursor,
+    }
+
+    impl Harness {
+        fn new(color: Color) -> Self {
+            let mut picker = picker_with(color);
+            let mut tree = Tree::new(&picker);
+            tree.diff(&mut picker);
+            let mut harness = Self {
+                renderer: renderer(),
+                picker,
+                tree,
+                cursor: Cursor::Unavailable,
+            };
+            harness.relayout();
+            harness.redraw();
+            harness
+        }
+
+        fn layout(&self) -> Layout {
+            Layout::new(self.tree.size).move_to(Point::new(40.0, 30.0))
+        }
+
+        fn relayout(&mut self) {
+            self.picker.layout(
+                &mut self.tree,
+                &self.renderer,
+                &Limits::new(Size::ZERO, WINDOW),
+            );
+        }
+
+        fn rebuild(&mut self, color: Color) {
+            self.picker = picker_with(color);
+            self.tree.diff(&mut self.picker);
+            self.relayout();
+            self.redraw();
+        }
+
+        fn control_bounds(&mut self, index: usize) -> Rectangle {
+            self.redraw();
+            let state = self.tree.state.downcast_ref::<State>();
+            let (_, _, geometry) = state.overlay_layout.as_ref().unwrap();
+            GeometryLayout::new(geometry)
+                .children()
+                .nth(1)
+                .unwrap()
+                .children()
+                .nth(index)
+                .unwrap()
+                .bounds()
+        }
+
+        fn send(&mut self, event: Event) -> Vec<Message> {
+            let mut messages = shell::Bus::new();
+            let mut shell = Shell::new(
+                &iced_core::window::Headless,
+                shell::Waker::noop(),
+                &mut messages,
+            );
+            let layout = self.layout();
+            let mut overlays = self.picker.overlay(
+                &mut self.tree,
+                layout,
+                &self.renderer,
+                &Rectangle::with_size(WINDOW),
+                Vector::ZERO,
+                WINDOW,
+            );
+            overlays[0]
+                .as_overlay_mut()
+                .update(&event, self.cursor, &self.renderer, &mut shell);
+            drop(overlays);
+            drop(shell);
+            messages.into_iter().collect()
+        }
+
+        fn redraw(&mut self) {
+            let _ = self.send(Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )));
+            let layout = self.layout();
+            let mut overlays = self.picker.overlay(
+                &mut self.tree,
+                layout,
+                &self.renderer,
+                &Rectangle::with_size(WINDOW),
+                Vector::ZERO,
+                WINDOW,
+            );
+            overlays[0].as_overlay_mut().draw(
+                &mut self.renderer,
+                &Theme::Dark,
+                &renderer::Style::default(),
+                self.cursor,
+            );
+        }
+
+        fn click(&mut self, bounds: Rectangle) -> Vec<Message> {
+            self.cursor = Cursor::Available(bounds.center());
+            let mut messages = self.send(Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            )));
+            messages.extend(self.send(Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left,
+            ))));
+            self.redraw();
+            messages
+        }
+
+        fn key(&mut self, key: keyboard::Key, modifiers: keyboard::Modifiers, text: Option<&str>) {
+            let physical_key =
+                keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
+            let _ = self.send(Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key.clone(),
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: text.map(Into::into),
+                repeat: false,
+            }));
+            let _ = self.send(Event::Keyboard(keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers,
+            }));
+        }
+
+        fn select_all(&mut self) {
+            let _ = self.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::CTRL,
+            )));
+            self.key(
+                keyboard::Key::Character("a".into()),
+                keyboard::Modifiers::CTRL,
+                None,
+            );
+            let _ = self.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::empty(),
+            )));
+        }
+
+        fn type_text(&mut self, text: &str) {
+            for character in text.chars() {
+                let character = character.to_string();
+                self.key(
+                    keyboard::Key::Character(character.as_str().into()),
+                    keyboard::Modifiers::empty(),
+                    Some(&character),
+                );
+                self.redraw();
+            }
+        }
+
+        fn hex_text(&mut self) -> String {
+            let hex_tree = &mut self.tree.children[1].children[3];
+            let mut input_text = InputText(String::new());
+            self.picker.hex_input.operate(
+                hex_tree,
+                Layout::new(hex_tree.size),
+                &Rectangle::with_size(WINDOW),
+                &self.renderer,
+                &mut input_text,
+            );
+            input_text.0
+        }
+
+        fn color(&self) -> Color {
+            self.tree.state.downcast_ref::<State>().overlay_state.color
+        }
+    }
+
+    #[test]
+    fn typing_a_full_hex_value_keeps_the_typed_text_and_submits_it() {
+        let mut ui = Harness::new(original());
+        assert_eq!(ui.hex_text(), ORIGINAL_HEX);
+
+        let hex = ui.control_bounds(1);
+        assert!(ui.click(hex).is_empty());
+        ui.select_all();
+
+        let mut typed = String::new();
+        for character in ORIGINAL_HEX.chars() {
+            ui.type_text(&character.to_string());
+            typed.push(character);
+            assert_eq!(ui.hex_text(), typed, "the field rewrote the typed text");
+        }
+        assert_eq!(ui.color(), original());
+
+        let submit = ui.control_bounds(3);
+        assert_eq!(ui.click(submit), vec![Message::Submit(original())]);
+        assert_eq!(ui.hex_text(), ORIGINAL_HEX);
+    }
+
+    #[test]
+    fn hex_text_is_formatted_when_focus_is_lost() {
+        let mut ui = Harness::new(original());
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+        ui.type_text("#abc");
+        assert_eq!(ui.hex_text(), "#abc");
+        assert_eq!(ui.color(), Color::from_rgb8(0xAA, 0xBB, 0xCC));
+
+        // An unparseable draft keeps the last valid color. Multibyte text must not panic.
+        ui.select_all();
+        ui.type_text("#abé");
+        assert_eq!(ui.hex_text(), "#abé");
+        assert_eq!(ui.color(), Color::from_rgb8(0xAA, 0xBB, 0xCC));
+        let submit = ui.control_bounds(3);
+        assert_eq!(
+            ui.click(submit),
+            vec![Message::Submit(Color::from_rgb8(0xAA, 0xBB, 0xCC))]
+        );
+        assert_eq!(ui.hex_text(), "#AABBCCFF");
+    }
+
+    #[test]
+    fn rebuilding_the_view_keeps_the_draft_until_the_color_changes() {
+        let mut ui = Harness::new(original());
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+        ui.type_text("#4455");
+        ui.rebuild(original());
+        assert_eq!(ui.hex_text(), "#4455");
+        assert_eq!(
+            ui.color(),
+            Color::from_rgba8(0x44, 0x44, 0x55, 85.0 / 255.0)
+        );
+
+        ui.type_text("66");
+        assert_eq!(ui.hex_text(), "#445566");
+
+        let external = Color::from_rgb8(0x01, 0x02, 0x03);
+        ui.rebuild(external);
+        assert_eq!(ui.hex_text(), "#010203FF");
+        assert_eq!(ui.color(), external);
     }
 }
