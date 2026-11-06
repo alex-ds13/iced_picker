@@ -21,10 +21,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::{collections::HashMap, str::FromStr};
+use std::{cell::Cell, collections::HashMap, rc::Rc, str::FromStr};
 
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Padding, Pixels, Point,
+    Alignment, Background, Border, Color, Element, Event, Font, Length, Padding, Pixels, Point,
     Rectangle, Renderer, Shadow, Size, Theme, Vector, Widget as _,
     advanced::{
         Layout, Overlay, Renderer as _, Shell, Text, Widget,
@@ -42,7 +42,7 @@ use iced::{
     mouse::{self, Cursor},
     touch,
     widget::{
-        Button, Column, Row, TextInput,
+        Button, Column, Row, TextInput, button,
         canvas::{self, LineCap, Path, Stroke},
         container, row, text,
         text::Wrapping,
@@ -91,14 +91,279 @@ where
     on_submit: Box<dyn Fn(Color) -> Message + 'a>,
     /// The style of the [`ColorPickerOverlay`].
     class: <Theme as Catalog>::Class<'a>,
-    /// Overlay element to be used for the layout calculation only
-    overlay_el: Element<'a, Message, Theme, Renderer>,
+    appearance: Appearance<'a, Theme>,
     /// The cancel button of the [`ColorPickerOverlay`].
-    cancel_button: Element<'a, Message, Theme, Renderer>,
+    cancel_button: PickerButton<'a, Message, Theme>,
     /// The submit button of the [`ColorPickerOverlay`].
-    submit_button: Element<'a, Message, Theme, Renderer>,
+    submit_button: PickerButton<'a, Message, Theme>,
     /// The hex input of the [`ColorPickerOverlay`].
     hex_input: TextInput<'a, InternalMessage, InternalTheme<Theme>>,
+}
+
+type ButtonStyleFn<'a, Theme> = Rc<dyn Fn(&Theme, ButtonStatus) -> button::Style + 'a>;
+type HexStyleFn<'a, Theme> = Rc<dyn Fn(&Theme, HexInputStatus) -> text_input::Style + 'a>;
+type PickerButton<'a, Message, Theme> =
+    Button<'a, ButtonAction<Message>, ButtonContent<'a, Message, Theme>, ButtonTheme<Theme>>;
+
+#[derive(Clone, Debug)]
+enum ButtonAction<Message> {
+    Content(Message),
+    Press,
+}
+
+struct Appearance<'a, Theme> {
+    font: Option<Font>,
+    text_size: Option<Pixels>,
+    channel_labels: [String; 4],
+    cancel_label: String,
+    submit_label: String,
+    cancel_style: Option<ButtonStyleFn<'a, Theme>>,
+    submit_style: Option<ButtonStyleFn<'a, Theme>>,
+    hex_style: Option<HexStyleFn<'a, Theme>>,
+}
+
+impl<Theme> Default for Appearance<'_, Theme> {
+    fn default() -> Self {
+        Self {
+            font: None,
+            text_size: None,
+            channel_labels: ["R:", "G:", "B:", "A:"].map(String::from),
+            cancel_label: "Cancel".into(),
+            submit_label: "Submit".into(),
+            cancel_style: None,
+            submit_style: None,
+            hex_style: None,
+        }
+    }
+}
+
+/// The interaction state of a picker button. Pressed takes priority over focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonStatus {
+    /// The button is idle.
+    Active,
+    /// The pointer is over the button.
+    Hovered,
+    /// The button is being pressed.
+    Pressed,
+    /// The button has keyboard focus.
+    Focused {
+        /// Whether the pointer is also over the button.
+        is_hovered: bool,
+    },
+}
+
+/// The interaction state and working color of the hex input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HexInputStatus {
+    /// The iced text input's interaction state.
+    pub status: text_input::Status,
+    /// The current working color (the last valid edit).
+    pub color: Color,
+    /// Whether the text currently parses as a color.
+    pub is_valid: bool,
+}
+
+struct ButtonTheme<Theme> {
+    theme: Theme,
+    focused: bool,
+}
+
+impl<Theme: button::Catalog> button::Catalog for ButtonTheme<Theme> {
+    type Class<'a> = Option<ButtonStyleFn<'a, Theme>>;
+
+    fn default<'a>() -> Self::Class<'a> {
+        None
+    }
+
+    fn style(&self, class: &Self::Class<'_>, status: button::Status) -> button::Style {
+        let picker_status = if status == button::Status::Pressed {
+            ButtonStatus::Pressed
+        } else if self.focused {
+            ButtonStatus::Focused {
+                is_hovered: status == button::Status::Hovered,
+            }
+        } else if status == button::Status::Hovered {
+            ButtonStatus::Hovered
+        } else {
+            ButtonStatus::Active
+        };
+        if let Some(style) = class {
+            style(&self.theme, picker_status)
+        } else {
+            <Theme as button::Catalog>::style(
+                &self.theme,
+                &<Theme as button::Catalog>::default(),
+                match picker_status {
+                    ButtonStatus::Focused { is_hovered: true } => button::Status::Hovered,
+                    ButtonStatus::Focused { is_hovered: false } => button::Status::Active,
+                    _ => status,
+                },
+            )
+        }
+    }
+}
+
+struct ButtonContent<'a, Message, Theme>(Element<'a, Message, Theme, Renderer>);
+
+impl<Message, Theme> Meta for ButtonContent<'_, Message, Theme> {}
+
+impl<'a, Message: 'a, Theme: 'a> Widget<ButtonAction<Message>, ButtonTheme<Theme>, Renderer>
+    for ButtonContent<'a, Message, Theme>
+{
+    fn tag(&self) -> Tag {
+        self.0.tag()
+    }
+    fn state(&self) -> tree::State {
+        self.0.state()
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        self.0.diff(tree);
+    }
+    fn size(&self) -> Size<Length> {
+        self.0.size()
+    }
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &Limits) {
+        self.0.layout(tree, renderer, limits);
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.0.operate(tree, layout, viewport, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout,
+        cursor: Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<ButtonAction<Message>>,
+        viewport: &Rectangle,
+    ) {
+        let mut messages = shell::Bus::new();
+        let mut local = shell.local(&mut messages);
+        if shell.is_event_captured() {
+            local.capture_event();
+        }
+        self.0
+            .update(tree, event, layout, cursor, renderer, &mut local, viewport);
+        shell.merge(local, ButtonAction::Content);
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout,
+        cursor: Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.0
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &ButtonTheme<Theme>,
+        style: &renderer::Style,
+        layout: Layout,
+        cursor: Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.0.draw(
+            tree,
+            renderer,
+            &theme.theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+        window: Size,
+    ) -> Vec<overlay::Element<'b, ButtonAction<Message>, ButtonTheme<Theme>, Renderer>> {
+        self.0
+            .overlay(tree, layout, renderer, viewport, translation, window)
+            .into_iter()
+            .map(|inner| {
+                overlay::Element::new(Box::new(ButtonContentOverlay(
+                    inner.map(&ButtonAction::Content),
+                )))
+            })
+            .collect()
+    }
+}
+
+struct ButtonContentOverlay<'a, Message, Theme>(overlay::Element<'a, Message, Theme, Renderer>);
+
+impl<Message, Theme> Overlay<Message, ButtonTheme<Theme>, Renderer>
+    for ButtonContentOverlay<'_, Message, Theme>
+{
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &ButtonTheme<Theme>,
+        style: &renderer::Style,
+        cursor: Cursor,
+    ) {
+        self.0
+            .as_overlay()
+            .draw(renderer, &theme.theme, style, cursor);
+    }
+    fn operate(&mut self, renderer: &Renderer, operation: &mut dyn Operation) {
+        self.0.as_overlay_mut().operate(renderer, operation);
+    }
+    fn update(
+        &mut self,
+        event: &Event,
+        cursor: Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<Message>,
+    ) {
+        self.0
+            .as_overlay_mut()
+            .update(event, cursor, renderer, shell);
+    }
+    fn mouse_interaction(&self, cursor: Cursor, renderer: &Renderer) -> mouse::Interaction {
+        self.0.as_overlay().mouse_interaction(cursor, renderer)
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        renderer: &Renderer,
+    ) -> Vec<overlay::Element<'a, Message, ButtonTheme<Theme>, Renderer>> {
+        self.0
+            .as_overlay_mut()
+            .overlay(renderer)
+            .into_iter()
+            .map(|inner| overlay::Element::new(Box::new(ButtonContentOverlay(inner))))
+            .collect()
+    }
+    fn index(&self) -> f32 {
+        self.0.as_overlay().index()
+    }
+}
+
+fn picker_button<'a, Message: Clone + 'a, Theme: button::Catalog + 'a>(
+    content: impl Widget<Message, Theme, Renderer> + 'a,
+    style: Option<ButtonStyleFn<'a, Theme>>,
+) -> PickerButton<'a, Message, Theme> {
+    Button::new(ButtonContent(content.boxed()))
+        .width(Length::Fill)
+        .on_press(ButtonAction::Press)
+        .class(style)
 }
 
 #[derive(Debug, Clone)]
@@ -110,14 +375,23 @@ enum InternalMessage {
 fn hex_text_input<'a, Theme>(
     color: Color,
     text: &str,
+    appearance: &Appearance<'a, Theme>,
 ) -> TextInput<'a, InternalMessage, InternalTheme<Theme>>
 where
     Theme: text_input::Catalog + Clone + 'a,
 {
-    text_input(color.as_hex_string(), text.to_owned())
+    let mut input = text_input(color.as_hex_string(), text.to_owned())
         .on_input(InternalMessage::ChangeInput)
         .padding(PADDING)
         .align_x(iced::Alignment::Center)
+        .class(appearance.hex_style.clone());
+    if let Some(font) = appearance.font {
+        input = input.font(font);
+    }
+    if let Some(size) = appearance.text_size {
+        input = input.size(size);
+    }
+    input
 }
 
 /// Parses a hex color typed into the hex input.
@@ -131,17 +405,33 @@ fn parse_hex(text: &str) -> Option<Color> {
 struct InternalTheme<Theme: text_input::Catalog + Clone> {
     theme: Theme,
     color: Color,
+    is_valid: bool,
+    invalid_hex: Color,
 }
 impl<Theme: text_input::Catalog + Clone> text_input::Catalog for InternalTheme<Theme> {
-    type Class<'a> = <Theme as text_input::Catalog>::Class<'a>;
+    type Class<'a> = Option<HexStyleFn<'a, Theme>>;
 
     fn default<'a>() -> Self::Class<'a> {
-        <Theme as text_input::Catalog>::default()
+        None
     }
 
     fn style(&self, class: &Self::Class<'_>, status: text_input::Status) -> text_input::Style {
+        if let Some(style) = class {
+            return style(
+                &self.theme,
+                HexInputStatus {
+                    status,
+                    color: self.color,
+                    is_valid: self.is_valid,
+                },
+            );
+        }
         let hsv = Hsv::from(self.color);
-        let default = <Theme as text_input::Catalog>::style(&self.theme, class, status);
+        let default = <Theme as text_input::Catalog>::style(
+            &self.theme,
+            &<Theme as text_input::Catalog>::default(),
+            status,
+        );
         text_input::Style {
             background: self.color.into(),
             value: Color {
@@ -154,7 +444,11 @@ impl<Theme: text_input::Catalog + Clone> text_input::Catalog for InternalTheme<T
                 .into()
             },
             border: Border {
-                color: default.border.color,
+                color: if self.is_valid {
+                    default.border.color
+                } else {
+                    self.invalid_hex
+                },
                 width: 1.0,
                 radius: 5.0.into(),
             },
@@ -196,7 +490,8 @@ where
         U: Widget<Message, Theme, Renderer> + 'a,
         F: Fn(Color) -> Message + 'a,
     {
-        let cancel_button = Button::new(
+        let appearance = Appearance::default();
+        let cancel_button = picker_button(
             text("X")
                 .align_x(Horizontal::Center)
                 .font(iced::Font {
@@ -204,22 +499,16 @@ where
                     ..iced::Font::DEFAULT
                 })
                 .width(Length::Fill),
-        )
-        .width(Length::Fill)
-        .on_press(on_cancel.clone())
-        .boxed();
-        let submit_button = Button::new(
+            None,
+        );
+        let submit_button = picker_button(
             text(Renderer::CHECKMARK_ICON)
                 .font(Renderer::ICON_FONT)
                 .align_x(Horizontal::Center)
                 .width(Length::Fill),
-        )
-        .width(Length::Fill)
-        .on_press(on_cancel.clone()) // Sending a fake message
-        .boxed();
-        let hex_input = hex_text_input(color, &color.as_hex_string());
-
-        let overlay_el = overlay_element(color, on_cancel.clone()).boxed();
+            None,
+        );
+        let hex_input = hex_text_input(color, &color.as_hex_string(), &appearance);
 
         Self {
             show_picker,
@@ -228,11 +517,126 @@ where
             on_cancel,
             on_submit: Box::new(on_submit),
             class: <Theme as Catalog>::default(),
-            overlay_el,
+            appearance,
             cancel_button,
             submit_button,
             hex_input,
         }
+    }
+
+    /// Sets the font of channel labels, values, and the hex input.
+    /// Unset fonts retain each element's default font.
+    #[must_use]
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.appearance.font = Some(font.into());
+        self.hex_input = hex_text_input(self.color, &self.color.as_hex_string(), &self.appearance);
+        self
+    }
+
+    /// Sets the text size of channel labels, values, and the hex input.
+    #[must_use]
+    pub fn text_size(mut self, size: impl Into<Pixels>) -> Self {
+        self.appearance.text_size = Some(size.into());
+        self.hex_input = hex_text_input(self.color, &self.color.as_hex_string(), &self.appearance);
+        self
+    }
+
+    /// Sets the red, green, blue, and alpha channel labels.
+    #[must_use]
+    pub fn channel_labels(
+        mut self,
+        red: impl Into<String>,
+        green: impl Into<String>,
+        blue: impl Into<String>,
+        alpha: impl Into<String>,
+    ) -> Self {
+        self.appearance.channel_labels = [red.into(), green.into(), blue.into(), alpha.into()];
+        self
+    }
+
+    /// Replaces the cancel button's content without changing its action.
+    #[must_use]
+    pub fn cancel_content(mut self, content: impl Widget<Message, Theme, Renderer> + 'a) -> Self {
+        self.cancel_button = picker_button(content, self.appearance.cancel_style.clone());
+        self
+    }
+
+    /// Replaces the submit button's content without changing its action.
+    #[must_use]
+    pub fn submit_content(mut self, content: impl Widget<Message, Theme, Renderer> + 'a) -> Self {
+        self.submit_button = picker_button(content, self.appearance.submit_style.clone());
+        self
+    }
+
+    /// Sets the cancel label exposed through widget operations (for example iced_test selectors).
+    /// This is a hook for screen readers once iced supports them, not screen-reader support.
+    #[must_use]
+    pub fn cancel_label(mut self, label: impl Into<String>) -> Self {
+        self.appearance.cancel_label = label.into();
+        self
+    }
+
+    /// Sets the submit label exposed through widget operations (for example iced_test selectors).
+    /// This is a hook for screen readers once iced supports them, not screen-reader support.
+    #[must_use]
+    pub fn submit_label(mut self, label: impl Into<String>) -> Self {
+        self.appearance.submit_label = label.into();
+        self
+    }
+
+    /// Sets the cancel button style, including keyboard focus.
+    #[must_use]
+    pub fn cancel_button_style(
+        mut self,
+        style: impl Fn(&Theme, ButtonStatus) -> button::Style + 'a,
+    ) -> Self {
+        self.appearance.cancel_style = Some(Rc::new(style));
+        self.cancel_button = self
+            .cancel_button
+            .class(self.appearance.cancel_style.clone());
+        self
+    }
+
+    /// Sets the submit button style, including keyboard focus.
+    #[must_use]
+    pub fn submit_button_style(
+        mut self,
+        style: impl Fn(&Theme, ButtonStatus) -> button::Style + 'a,
+    ) -> Self {
+        self.appearance.submit_style = Some(Rc::new(style));
+        self.submit_button = self
+            .submit_button
+            .class(self.appearance.submit_style.clone());
+        self
+    }
+
+    /// Sets a shared style for both buttons, including keyboard focus.
+    #[must_use]
+    pub fn button_style(
+        mut self,
+        style: impl Fn(&Theme, ButtonStatus) -> button::Style + 'a,
+    ) -> Self {
+        let style: ButtonStyleFn<'a, Theme> = Rc::new(style);
+        self.appearance.cancel_style = Some(Rc::clone(&style));
+        self.appearance.submit_style = Some(style);
+        self.cancel_button = self
+            .cancel_button
+            .class(self.appearance.cancel_style.clone());
+        self.submit_button = self
+            .submit_button
+            .class(self.appearance.submit_style.clone());
+        self
+    }
+
+    /// Sets the hex input style using its interaction state, color, and draft validity.
+    #[must_use]
+    pub fn hex_input_style(
+        mut self,
+        style: impl Fn(&Theme, HexInputStatus) -> text_input::Style + 'a,
+    ) -> Self {
+        self.appearance.hex_style = Some(Rc::new(style));
+        self.hex_input = hex_text_input(self.color, &self.color.as_hex_string(), &self.appearance);
+        self
     }
 
     /// Sets the style of the [`ColorPicker`].
@@ -308,6 +712,10 @@ where
             overlay_layout,
         } = tree.state.downcast_mut::<State>();
         *overlay_layout = None;
+        let drawn = (
+            color_picker_state.color,
+            color_picker_state.current_hue_degrees,
+        );
 
         // Rebuilding the view with an unchanged color must not discard an edit in progress,
         // so the working color is only replaced by a new color or once the picker is closed.
@@ -333,9 +741,36 @@ where
             }
         }
 
-        self.hex_input = hex_text_input(color_picker_state.color, &color_picker_state.hex_text);
+        // Style changes clear the canvases while drawing, so only a new color needs it here.
+        if drawn
+            != (
+                color_picker_state.color,
+                color_picker_state.current_hue_degrees,
+            )
+        {
+            color_picker_state.clear();
+        }
+        self.hex_input = hex_text_input(
+            color_picker_state.color,
+            &color_picker_state.hex_text,
+            &self.appearance,
+        );
 
-        tree.diff_children(&mut [&mut self.underlay, &mut self.overlay_el]);
+        // The measured geometry is separate from the retained button and input trees.
+        // Diff real content so custom widgets keep their state across view rebuilds.
+        let mut diff_underlay = |tree: &mut Tree| tree.diff(&mut self.underlay);
+        let mut diff_overlay = |tree: &mut Tree| {
+            let mut children: [&mut dyn FnMut(&mut Tree); 4] = [
+                &mut |tree| tree.diff(&mut self.cancel_button),
+                &mut |tree| tree.diff(&mut self.submit_button),
+                // Reserve the old stand-in slot to keep retained input state at index 3.
+                &mut |_| {},
+                &mut |tree| tree.diff::<_, _, Renderer>(&mut self.hex_input),
+            ];
+            tree.diff_children_custom(&mut children, |tree, diff| diff(tree), |_| Tree::empty());
+        };
+        let mut children: [&mut dyn FnMut(&mut Tree); 2] = [&mut diff_underlay, &mut diff_overlay];
+        tree.diff_children_custom(&mut children, |tree, diff| diff(tree), |_| Tree::empty());
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -453,6 +888,7 @@ where
                         &mut self.cancel_button,
                         &mut self.submit_button,
                         &mut self.hex_input,
+                        &self.appearance,
                     ),
                 ));
             }
@@ -472,6 +908,7 @@ where
                 &mut self.cancel_button,
                 &mut self.submit_button,
                 &mut self.hex_input,
+                &mut self.appearance,
             )
             .overlay()
         });
@@ -493,6 +930,8 @@ const PADDING: Padding = Padding::new(10.0);
 const SPACING: Pixels = Pixels(15.0);
 /// The spacing between the buttons.
 const BUTTON_SPACING: Pixels = Pixels(5.0);
+const MARKER_STROKE_WIDTH: f32 = 3.0;
+const MAX_SIZE: Size = Size::new(600.0, 300.0);
 /// The offset to move the overlay above/below the underlay element.
 const OFFSET: f32 = 10.0;
 
@@ -514,11 +953,12 @@ where
     /// The state of the [`ColorPickerOverlay`].
     state: &'a mut OverlayState,
     /// The cancel button of the [`ColorPickerOverlay`].
-    cancel_button: &'a mut Element<'b, Message, Theme, Renderer>,
+    cancel_button: &'a mut PickerButton<'b, Message, Theme>,
     /// The submit button of the [`ColorPickerOverlay`].
-    submit_button: &'a mut Element<'b, Message, Theme, Renderer>,
+    submit_button: &'a mut PickerButton<'b, Message, Theme>,
     /// The hex input of the [`ColorPickerOverlay`].
     hex_input: &'a mut TextInput<'b, InternalMessage, InternalTheme<Theme>>,
+    appearance: &'a mut Appearance<'b, Theme>,
     /// The message that is sent if the cancel button of the [`ColorPickerOverlay`] is pressed or
     /// when pressed outside its bounds.
     on_cancel: Message,
@@ -591,16 +1031,17 @@ where
     Theme: Catalog + iced::widget::button::Catalog + text_input::Catalog + Clone,
     'b: 'a,
 {
-    cancel_button: &'a mut Element<'b, Message, Theme, Renderer>,
-    submit_button: &'a mut Element<'b, Message, Theme, Renderer>,
+    cancel_button: &'a mut PickerButton<'b, Message, Theme>,
+    submit_button: &'a mut PickerButton<'b, Message, Theme>,
     hex_input: &'a mut TextInput<'b, InternalMessage, InternalTheme<Theme>>,
     tree: &'a mut Tree,
     rgba_tree: &'a mut Tree,
+    appearance: &'a Appearance<'b, Theme>,
 }
 
 impl<'a, 'b, Message, Theme> ColorPickerOverlay<'a, 'b, Message, Theme>
 where
-    Message: 'a + Clone + std::fmt::Debug,
+    Message: 'b + Clone + std::fmt::Debug,
     Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
@@ -620,15 +1061,17 @@ where
         layout: GeometryLayout<'a>,
         window: Size,
         class: &'a <Theme as Catalog>::Class<'b>,
-        cancel_button: &'a mut Element<'b, Message, Theme>,
-        submit_button: &'a mut Element<'b, Message, Theme>,
+        cancel_button: &'a mut PickerButton<'b, Message, Theme>,
+        submit_button: &'a mut PickerButton<'b, Message, Theme>,
         hex_input: &'a mut TextInput<'b, InternalMessage, InternalTheme<Theme>>,
+        appearance: &'a mut Appearance<'b, Theme>,
     ) -> Self {
         ColorPickerOverlay {
             state,
             cancel_button,
             submit_button,
             hex_input,
+            appearance,
             on_cancel,
             on_submit,
             layout,
@@ -737,7 +1180,7 @@ where
     }
 
     fn rebuild_hex_input(&mut self) {
-        let mut hex_input = hex_text_input(self.state.color, &self.state.hex_text);
+        let mut hex_input = hex_text_input(self.state.color, &self.state.hex_text, self.appearance);
         self.tree.children[3].diff::<_, _, Renderer>(&mut hex_input);
         *self.hex_input = hex_input;
     }
@@ -750,9 +1193,10 @@ where
         position: Point,
         window: Size,
         underlay_height: f32,
-        cancel_button: &mut Element<'b, Message, Theme>,
-        submit_button: &mut Element<'b, Message, Theme>,
+        cancel_button: &mut PickerButton<'b, Message, Theme>,
+        submit_button: &mut PickerButton<'b, Message, Theme>,
         hex_input: &mut TextInput<'b, InternalMessage, InternalTheme<Theme>>,
+        appearance: &Appearance<'b, Theme>,
     ) -> Tree {
         let space_below = window.height - (position.y + underlay_height + OFFSET);
         let space_above = position.y - OFFSET;
@@ -775,9 +1219,9 @@ where
         };
 
         let (max_width, max_height) = if bounds.width > bounds.height {
-            (600.0, 300.0)
+            (MAX_SIZE.width, MAX_SIZE.height)
         } else {
-            (300.0, 600.0)
+            (MAX_SIZE.height, MAX_SIZE.width)
         };
 
         let limits = Limits::new(Size::ZERO, bounds)
@@ -791,6 +1235,7 @@ where
             hex_input,
             tree,
             rgba_tree,
+            appearance,
         };
         let first = Row::<Element<'_, (), Theme, Renderer>>::new()
             .width(Length::Fill)
@@ -1510,7 +1955,7 @@ where
 impl<'a, 'b, Message, Theme> Overlay<Message, Theme, Renderer>
     for ColorPickerOverlay<'a, 'b, Message, Theme>
 where
-    Message: 'a + Clone + std::fmt::Debug,
+    Message: 'b + Clone + std::fmt::Debug,
     Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
@@ -1520,6 +1965,43 @@ where
         + Clone,
     'b: 'a,
 {
+    fn operate(&mut self, renderer: &Renderer, operation: &mut dyn Operation) {
+        let viewport = Rectangle::with_size(self.window);
+        operation.container(None, self.layout.bounds(), &viewport);
+        operation.traverse(&mut |operation| {
+            let hex_layout = self.hex_input_layout();
+            self.hex_input.operate(
+                &mut self.tree.children[3],
+                hex_layout,
+                &viewport,
+                renderer,
+                operation,
+            );
+            let controls = self.layout.children().nth(1).expect("picker controls");
+            let cancel = controls.children().nth(2).expect("cancel button");
+            let submit = controls.children().nth(3).expect("submit button");
+            // String implements operation::Text with no-op selection in this iced revision.
+            operation.text(None, cancel.bounds(), &mut self.appearance.cancel_label);
+            let cancel_layout = cancel.for_widget(&self.tree.children[0]);
+            self.cancel_button.operate(
+                &mut self.tree.children[0],
+                cancel_layout,
+                &viewport,
+                renderer,
+                operation,
+            );
+            operation.text(None, submit.bounds(), &mut self.appearance.submit_label);
+            let submit_layout = submit.for_widget(&self.tree.children[1]);
+            self.submit_button.operate(
+                &mut self.tree.children[1],
+                submit_layout,
+                &viewport,
+                renderer,
+                operation,
+            );
+        });
+    }
+
     fn update(
         &mut self,
         event: &Event,
@@ -1527,6 +2009,17 @@ where
         renderer: &Renderer,
         shell: &mut Shell<Message>,
     ) {
+        // The winit runtime moves the cursor to the finger, but other callers (such as headless
+        // simulators) may not, so touch hit tests use the finger position directly.
+        let cursor = match event {
+            Event::Touch(
+                touch::Event::FingerPressed { position, .. }
+                | touch::Event::FingerMoved { position, .. }
+                | touch::Event::FingerLifted { position, .. }
+                | touch::Event::FingerLost { position, .. },
+            ) => Cursor::Available(*position),
+            _ => cursor,
+        };
         let layout = self.layout;
         if self.on_confirm_key(event, renderer, shell) {
             return;
@@ -1623,15 +2116,24 @@ where
             .expect("widget: Layout should have a cancel button layout for a ColorPicker")
             .for_widget(&self.tree.children[0]);
 
+        let mut cancel_messages = shell::Bus::new();
+        let mut cancel_shell = shell.local(&mut cancel_messages);
+        if shell.is_event_captured() {
+            cancel_shell.capture_event();
+        }
         self.cancel_button.update(
             &mut self.tree.children[0],
             event,
             cancel_button_layout,
             cursor,
             renderer,
-            shell,
+            &mut cancel_shell,
             &layout.bounds(),
         );
+        shell.merge(cancel_shell, |action| match action {
+            ButtonAction::Content(message) => message,
+            ButtonAction::Press => self.on_cancel.clone(),
+        });
 
         let mut fake_messages = shell::Bus::new();
         let mut fake_submit_shell = shell.local(&mut fake_messages);
@@ -1655,19 +2157,17 @@ where
             &layout.bounds(),
         );
 
-        // Reconcile redraws and captures
-        match fake_submit_shell.redraw_request() {
-            iced::window::RedrawRequest::NextFrame => shell.request_redraw(),
-            iced::window::RedrawRequest::At(instant) => shell.request_redraw_at(instant),
-            iced::window::RedrawRequest::Wait => {}
-        }
-        if fake_submit_shell.event_status() == event::Status::Captured {
-            shell.capture_event();
-        }
-        drop(fake_submit_shell);
-
-        if !fake_messages.is_empty() {
-            self.submit(shell);
+        // Content messages must not be mistaken for a submit button press.
+        let submitted = Cell::new(false);
+        shell.merge(fake_submit_shell, |action| match action {
+            ButtonAction::Content(message) => message,
+            ButtonAction::Press => {
+                submitted.set(true);
+                (self.on_submit)(self.state.color)
+            }
+        });
+        if submitted.get() {
+            self.state.previous_hue_degrees = self.state.current_hue_degrees;
             shell.capture_event();
             shell.request_redraw();
         }
@@ -1753,12 +2253,8 @@ where
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds,
-                        border: Border {
-                            radius: style_sheet[&style_state].border_radius.into(),
-                            width: style_sheet[&style_state].border_width,
-                            color: style_sheet[&style_state].border_color,
-                        },
-                        shadow: Shadow::default(),
+                        border: style_sheet[&style_state].border,
+                        shadow: style_sheet[&style_state].shadow,
                         snap: true,
                     },
                     style_sheet[&style_state].background,
@@ -1789,22 +2285,72 @@ where
     }
 }
 
-fn rgba_elements<'a, Message, Theme>() -> Column<Element<'a, Message, Theme, Renderer>>
+fn rgba_elements<'a, Message, Theme>(
+    renderer: &Renderer,
+    appearance: &Appearance<'_, Theme>,
+) -> Column<Element<'a, Message, Theme, Renderer>>
 where
     Message: 'a,
     Theme: text::Catalog + 'a,
 {
+    let default_labels = ["R:", "G:", "B:", "A:"];
+    let custom_labels = appearance
+        .channel_labels
+        .iter()
+        .map(String::as_str)
+        .ne(default_labels);
+    let font = appearance.font.unwrap_or_else(|| {
+        if custom_labels || appearance.text_size.is_some() {
+            Font::default()
+        } else {
+            renderer.font()
+        }
+    });
+    let size = appearance.text_size.unwrap_or_else(|| renderer.text_size());
+    let label_width =
+        if custom_labels || appearance.font.is_some() || appearance.text_size.is_some() {
+            appearance
+                .channel_labels
+                .iter()
+                .map(|label| {
+                    layout_geometry::<(), Theme>(
+                        text::<Theme>(label.clone())
+                            .font(font)
+                            .size(size)
+                            .shaping(text::Shaping::Advanced),
+                        renderer,
+                        &Limits::new(Size::ZERO, Size::INFINITE),
+                    )
+                    .size
+                    .width
+                })
+                .fold(0.0, f32::max)
+        } else {
+            // Preserve the original stand-in's spacing when no text options are set.
+            layout_geometry::<(), Theme>(
+                text::<Theme>("X: "),
+                renderer,
+                &Limits::new(Size::ZERO, Size::INFINITE),
+            )
+            .size
+            .width
+        };
     let mut rgba_colors = Column::new();
-    for _ in 0..4 {
+    for label in &appearance.channel_labels {
         rgba_colors = rgba_colors.push(
             row![
-                text("X: ")
+                text(label.clone())
+                    .font(font)
+                    .size(size)
+                    .width(label_width)
                     .align_x(Horizontal::Center)
                     .align_y(Vertical::Center),
                 Row::<Element<'a, Message, Theme, Renderer>>::new()
                     .width(Length::FillPortion(5))
                     .height(Length::Fill),
                 text("XXX")
+                    .font(appearance.font.unwrap_or_else(|| renderer.font()))
+                    .size(size)
                     .align_x(Horizontal::Center)
                     .align_y(Vertical::Center),
             ]
@@ -1816,119 +2362,6 @@ where
         );
     }
     rgba_colors
-}
-
-pub fn overlay_element<'a, Message, Theme>(
-    color: Color,
-    on_cancel: Message,
-) -> impl Widget<Message, Theme, Renderer> + 'a
-where
-    Message: 'a + Clone,
-    Theme: 'a
-        + Catalog
-        + iced::widget::button::Catalog
-        + iced::widget::text::Catalog
-        + container::Catalog
-        + text_input::Catalog,
-{
-    let rgba_colors = rgba_elements::<Message, Theme>();
-
-    let hex_input = text_input("0x00000000", "0x00000000")
-        .padding(PADDING)
-        .align_x(Alignment::Center);
-
-    let cancel_button = Button::new(
-        text("X")
-            .align_x(Horizontal::Center)
-            .font(iced::Font {
-                weight: iced::font::Weight::ExtraBold,
-                ..iced::Font::DEFAULT
-            })
-            .width(Length::Fill),
-    )
-    .width(Length::Fill);
-    let submit_button = Button::new(
-        text(Renderer::CHECKMARK_ICON)
-            .font(Renderer::ICON_FONT)
-            .align_x(Horizontal::Center)
-            .width(Length::Fill),
-    )
-    .width(Length::Fill);
-
-    let block2 = Column::<Element<'a, Message, Theme, Renderer>>::new()
-        .spacing(PADDING.y() / 2.)
-        .push(rgba_colors.boxed())
-        .push(hex_input.boxed())
-        .push(
-            Row::new()
-                .spacing(PADDING.y() / 2.)
-                .push(cancel_button)
-                .push(submit_button)
-                .boxed(),
-        );
-
-    let block1 = Column::<Element<'a, Message, Theme, Renderer>>::new()
-        .spacing(PADDING.y() / 2.)
-        .push(
-            Row::new()
-                .push(
-                    container("")
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(7)),
-                )
-                .boxed(),
-        )
-        .push(
-            Row::new()
-                .push(
-                    container("")
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(1)),
-                )
-                .boxed(),
-        );
-
-    let divider = Row::<Element<'a, Message, Theme, Renderer>>::new()
-        .spacing(SPACING)
-        .push(
-            Row::new()
-                .push(container(block1).width(Length::Fill).height(Length::Fill))
-                .boxed(),
-        )
-        .push(
-            Row::new()
-                .push(container(block2).width(Length::Fill).height(Length::Fill))
-                .boxed(),
-        )
-        .width(600)
-        .height(300);
-
-    let element: Element<Message, Theme, Renderer> = divider.boxed();
-
-    let cancel_button = Button::new(
-        text("X")
-            .align_x(Horizontal::Center)
-            .font(iced::Font {
-                weight: iced::font::Weight::ExtraBold,
-                ..iced::Font::DEFAULT
-            })
-            .width(Length::Fill),
-    )
-    .width(Length::Fill)
-    .on_press(on_cancel.clone());
-    let submit_button = Button::new(
-        text(Renderer::CHECKMARK_ICON)
-            .font(Renderer::ICON_FONT)
-            .align_x(Horizontal::Center)
-            .width(Length::Fill),
-    )
-    .width(Length::Fill)
-    .on_press(on_cancel.clone()); // Sending a fake message
-    let hex_input = text_input(color.as_hex_string(), color.as_hex_string())
-        .on_input(move |_| on_cancel.clone())
-        .padding(PADDING);
-
-    row![cancel_button, submit_button, element, hex_input]
 }
 
 /// Defines the layout of the 1. block of the color picker containing the HSV part.
@@ -1959,14 +2392,14 @@ fn block1_layout<Theme>(renderer: &Renderer, bounds: Rectangle) -> Tree {
 }
 
 /// Defines the layout of the 2. block of the color picker containing the RGBA part, Hex and buttons.
-fn block2_layout<'a, Message, Theme>(
-    color_picker: &mut ColorPickerLayout<'a, '_, Message, Theme>,
+fn block2_layout<'a, 'b: 'a, Message, Theme>(
+    color_picker: &mut ColorPickerLayout<'a, 'b, Message, Theme>,
     renderer: &Renderer,
     bounds: Rectangle,
 ) -> Tree
 where
-    Message: 'a + Clone,
-    Theme: 'a
+    Message: 'b + Clone,
+    Theme: 'b
         + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
@@ -1977,10 +2410,19 @@ where
         .width(Length::Fill)
         .height(Length::Fill);
 
-    // Measure these heights before reserving the remaining space for RGBA rows.
+    // Measure buttons at their final width so wrapped content reserves enough height.
+    let button_limits =
+        block2_limits.width(Length::Fill.max(((bounds.width / 2.0) - BUTTON_SPACING.0).max(0.0)));
     color_picker
         .cancel_button
-        .layout(&mut color_picker.tree.children[0], renderer, &block2_limits);
+        .layout(&mut color_picker.tree.children[0], renderer, &button_limits);
+    color_picker
+        .submit_button
+        .layout(&mut color_picker.tree.children[1], renderer, &button_limits);
+    let button_height = color_picker.tree.children[0]
+        .size
+        .height
+        .max(color_picker.tree.children[1].size.height);
     color_picker
         .hex_input
         .layout(&mut color_picker.tree.children[3], renderer, &block2_limits);
@@ -1991,10 +2433,10 @@ where
 
     let block2_limits = block2_limits.shrink(Size::new(
         0.0,
-        color_picker.tree.children[0].size.height + hex_text_layout.size.height + 2.0 * SPACING.0,
+        button_height + hex_text_layout.size.height + 2.0 * SPACING.0,
     ));
 
-    let mut rgba_elements = rgba_elements::<Message, Theme>();
+    let mut rgba_elements = rgba_elements::<Message, Theme>(renderer, color_picker.appearance);
     color_picker.rgba_tree.diff(&mut rgba_elements);
     rgba_elements.layout(color_picker.rgba_tree, renderer, &block2_limits);
     let mut rgba_colors = geometry_tree(color_picker.rgba_tree);
@@ -2005,7 +2447,7 @@ where
         Vector::new(PADDING.left, rgba_size.height + PADDING.top + SPACING.0);
     let hex_size = hex_text_layout.size;
 
-    let button_limits = block2_limits
+    let button_limits = Limits::new(Size::ZERO, bounds.size())
         .width(Length::Fill.max(((rgba_size.width / 2.0) - BUTTON_SPACING.0).max(0.0)));
     color_picker
         .cancel_button
@@ -2034,7 +2476,7 @@ where
             rgba_size.width + PADDING.x(),
             rgba_size.height
                 + hex_size.height
-                + cancel_button.size.height
+                + cancel_button.size.height.max(submit_button.size.height)
                 + PADDING.y()
                 + (2.0 * SPACING.0),
         ),
@@ -2077,9 +2519,9 @@ fn block1<Message, Theme>(
 
 /// Draws the 2. block of the color picker containing the RGBA part, Hex and buttons.
 #[allow(clippy::too_many_arguments)]
-fn block2<Message, Theme>(
+fn block2<'b, Message, Theme>(
     renderer: &mut Renderer,
-    color_picker: &ColorPickerOverlay<'_, '_, Message, Theme>,
+    color_picker: &ColorPickerOverlay<'_, 'b, Message, Theme>,
     layout: GeometryLayout<'_>,
     cursor: Cursor,
     theme: &Theme,
@@ -2087,8 +2529,9 @@ fn block2<Message, Theme>(
     viewport: &Rectangle,
     style_sheet: &HashMap<StyleState, Style>,
 ) where
-    Message: Clone,
-    Theme: Catalog
+    Message: Clone + 'b,
+    Theme: 'b
+        + Catalog
         + iced::widget::button::Catalog
         + iced::widget::text::Catalog
         + text_input::Catalog
@@ -2106,7 +2549,7 @@ fn block2<Message, Theme>(
         rgba_color_layout,
         &color_picker.state.color,
         cursor,
-        style,
+        color_picker.appearance,
         style_sheet,
         color_picker.state.focus,
     );
@@ -2118,6 +2561,8 @@ fn block2<Message, Theme>(
     let hex_input_theme = InternalTheme {
         theme: theme.clone(),
         color: color_picker.state.color,
+        is_valid: parse_hex(&color_picker.state.hex_text).is_some(),
+        invalid_hex: style_sheet[&StyleState::Active].invalid_hex,
     };
     color_picker.hex_input.draw(
         &color_picker.tree.children[3],
@@ -2137,7 +2582,10 @@ fn block2<Message, Theme>(
     color_picker.cancel_button.draw(
         &color_picker.tree.children[0],
         renderer,
-        theme,
+        &ButtonTheme {
+            theme: theme.clone(),
+            focused: color_picker.state.focus == Focus::Cancel,
+        },
         style,
         cancel_button_layout.for_widget(&color_picker.tree.children[0]),
         cursor,
@@ -2151,7 +2599,10 @@ fn block2<Message, Theme>(
     color_picker.submit_button.draw(
         &color_picker.tree.children[1],
         renderer,
-        theme,
+        &ButtonTheme {
+            theme: theme.clone(),
+            focused: color_picker.state.focus == Focus::Submit,
+        },
         style,
         submit_button_layout.for_widget(&color_picker.tree.children[1]),
         cursor,
@@ -2165,11 +2616,7 @@ fn block2<Message, Theme>(
             renderer.fill_quad(
                 renderer::Quad {
                     bounds,
-                    border: Border {
-                        radius: style_sheet[&StyleState::Focused].border_radius.into(),
-                        width: style_sheet[&StyleState::Focused].border_width,
-                        color: style_sheet[&StyleState::Focused].border_color,
-                    },
+                    border: style_sheet[&StyleState::Focused].focus_border,
                     shadow: Shadow::default(),
                     snap: true,
                 },
@@ -2184,11 +2631,7 @@ fn block2<Message, Theme>(
             renderer.fill_quad(
                 renderer::Quad {
                     bounds,
-                    border: Border {
-                        radius: style_sheet[&StyleState::Focused].border_radius.into(),
-                        width: style_sheet[&StyleState::Focused].border_width,
-                        color: style_sheet[&StyleState::Focused].border_color,
-                    },
+                    border: style_sheet[&StyleState::Focused].focus_border,
                     shadow: Shadow::default(),
                     snap: true,
                 },
@@ -2229,6 +2672,10 @@ fn hsv_color<Message, Theme>(
         sat_value_style_state = sat_value_style_state.max(StyleState::Hovered);
     }
 
+    let sat_style = style_sheet[&sat_value_style_state];
+    if color_picker.state.sat_value_style.replace(Some(sat_style)) != Some(sat_style) {
+        color_picker.state.sat_value_canvas_cache.clear();
+    }
     let geometry = color_picker.state.sat_value_canvas_cache.draw(
         renderer,
         sat_value_layout.bounds().size(),
@@ -2254,15 +2701,15 @@ fn hsv_color<Message, Theme>(
             }
 
             let stroke = Stroke {
-                style: canvas::Style::Solid(
+                style: canvas::Style::Solid(sat_style.sat_value_marker.unwrap_or_else(|| {
                     Hsv {
                         hue: 0,
                         saturation: 0.0,
                         value: 1.0 - hsv_color.value,
                     }
-                    .into(),
-                ),
-                width: 3.0,
+                    .into()
+                })),
+                width: MARKER_STROKE_WIDTH,
                 line_cap: LineCap::Round,
                 ..Stroke::default()
             };
@@ -2284,24 +2731,13 @@ fn hsv_color<Message, Theme>(
             );
 
             let stroke = Stroke {
-                style: canvas::Style::Solid(
-                    style_sheet
-                        .get(&sat_value_style_state)
-                        .expect("Style Sheet not found.")
-                        .bar_border_color,
-                ),
-                width: 2.0,
+                style: canvas::Style::Solid(sat_style.area_border.color),
+                width: sat_style.area_border.width,
                 line_cap: LineCap::Round,
                 ..Stroke::default()
             };
 
-            frame.stroke(
-                &Path::rectangle(
-                    Point::new(0.0, 0.0),
-                    Size::new(frame.size().width - 0.0, frame.size().height - 0.0),
-                ),
-                stroke,
-            );
+            frame.stroke(&area_outline(frame.size(), sat_style.area_border), stroke);
         },
     );
 
@@ -2321,6 +2757,10 @@ fn hsv_color<Message, Theme>(
         hue_style_state = hue_style_state.max(StyleState::Hovered);
     }
 
+    let hue_style = style_sheet[&hue_style_state];
+    if color_picker.state.hue_style.replace(Some(hue_style)) != Some(hue_style) {
+        color_picker.state.hue_canvas_cache.clear();
+    }
     let geometry =
         color_picker
             .state
@@ -2349,8 +2789,8 @@ fn hsv_color<Message, Theme>(
                 }
 
                 let stroke = Stroke {
-                    style: canvas::Style::Solid(Color::BLACK),
-                    width: 3.0,
+                    style: canvas::Style::Solid(hue_style.hue_marker),
+                    width: MARKER_STROKE_WIDTH,
                     line_cap: LineCap::Round,
                     ..Stroke::default()
                 };
@@ -2364,24 +2804,13 @@ fn hsv_color<Message, Theme>(
                 );
 
                 let stroke = Stroke {
-                    style: canvas::Style::Solid(
-                        style_sheet
-                            .get(&hue_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_color,
-                    ),
-                    width: 2.0,
+                    style: canvas::Style::Solid(hue_style.area_border.color),
+                    width: hue_style.area_border.width,
                     line_cap: LineCap::Round,
                     ..Stroke::default()
                 };
 
-                frame.stroke(
-                    &Path::rectangle(
-                        Point::new(0.0, 0.0),
-                        Size::new(frame.size().width, frame.size().height),
-                    ),
-                    stroke,
-                );
+                frame.stroke(&area_outline(frame.size(), hue_style.area_border), stroke);
             });
 
     let translation = Vector::new(hue_layout.bounds().x, hue_layout.bounds().y);
@@ -2390,14 +2819,22 @@ fn hsv_color<Message, Theme>(
     });
 }
 
+fn area_outline(size: Size, border: Border) -> Path {
+    if border.radius == iced::border::Radius::default() {
+        Path::rectangle(Point::ORIGIN, size)
+    } else {
+        Path::rounded_rectangle(Point::ORIGIN, size, border.radius)
+    }
+}
+
 /// Draws the RGBA color area.
 #[allow(clippy::too_many_lines)]
-fn rgba_color(
+fn rgba_color<Theme>(
     renderer: &mut Renderer,
     layout: GeometryLayout<'_>,
     color: &Color,
     cursor: Cursor,
-    style: &renderer::Style,
+    appearance: &Appearance<'_, Theme>,
     style_sheet: &HashMap<StyleState, Style>,
     focus: Focus,
 ) {
@@ -2422,14 +2859,21 @@ fn rgba_color(
             .next()
             .expect("Graphics: Layout should have a value layout");
 
+        let bar_bounds = bar_layout.bounds();
+        let bar_style_state = if cursor.is_over(bar_bounds) {
+            StyleState::Hovered
+        } else {
+            StyleState::Active
+        };
+        let part_style = style_sheet[&bar_style_state];
+
         // Label
         renderer.fill_text(
             Text {
                 content: label.to_owned(),
                 bounds: Size::new(label_layout.bounds().width, label_layout.bounds().height),
-                size: renderer.text_size(),
-                // font: REQUIRED_FONT,
-                font: iced::Font::default(),
+                size: appearance.text_size.unwrap_or_else(|| renderer.text_size()),
+                font: appearance.font.unwrap_or_default(),
                 align_x: Horizontal::Center.into(),
                 align_y: Vertical::Center,
                 line_height: text::LineHeight::Relative(1.3),
@@ -2442,17 +2886,23 @@ fn rgba_color(
                 label_layout.bounds().center_x(),
                 label_layout.bounds().center_y(),
             ),
-            style.text_color,
+            part_style.text_color,
             label_layout.bounds(),
         );
 
-        let bar_bounds = bar_layout.bounds();
-
-        let bar_style_state = if cursor.is_over(bar_bounds) {
-            StyleState::Hovered
-        } else {
-            StyleState::Active
-        };
+        if bar_bounds.width > 0.0 && bar_bounds.height > 0.0 {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bar_bounds,
+                    border: Border {
+                        radius: part_style.bar_border.radius,
+                        ..Border::default()
+                    },
+                    ..renderer::Quad::default()
+                },
+                part_style.bar_background,
+            );
+        }
 
         // Bar background
         let background_bounds = Rectangle {
@@ -2466,15 +2916,8 @@ fn rgba_color(
                 renderer::Quad {
                     bounds: background_bounds,
                     border: Border {
-                        radius: style_sheet
-                            .get(&bar_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_radius
-                            .into(),
-                        width: style_sheet
-                            .get(&bar_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_width,
+                        radius: part_style.bar_border.radius,
+                        width: part_style.bar_border.width,
                         color: Color::TRANSPARENT,
                     },
                     shadow: Shadow::default(),
@@ -2489,21 +2932,7 @@ fn rgba_color(
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: bar_bounds,
-                    border: Border {
-                        radius: style_sheet
-                            .get(&bar_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_radius
-                            .into(),
-                        width: style_sheet
-                            .get(&bar_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_width,
-                        color: style_sheet
-                            .get(&bar_style_state)
-                            .expect("Style Sheet not found.")
-                            .bar_border_color,
-                    },
+                    border: part_style.bar_border,
                     shadow: Shadow::default(),
                     snap: true,
                 },
@@ -2516,8 +2945,8 @@ fn rgba_color(
             Text {
                 content: format!("{}", (255.0 * value) as u8),
                 bounds: Size::new(value_layout.bounds().width, value_layout.bounds().height),
-                size: renderer.text_size(),
-                font: renderer.font(),
+                size: appearance.text_size.unwrap_or_else(|| renderer.text_size()),
+                font: appearance.font.unwrap_or_else(|| renderer.font()),
                 align_x: Horizontal::Center.into(),
                 align_y: Vertical::Center,
                 line_height: iced::widget::text::LineHeight::Relative(1.3),
@@ -2530,7 +2959,7 @@ fn rgba_color(
                 value_layout.bounds().center_x(),
                 value_layout.bounds().center_y(),
             ),
-            style.text_color,
+            part_style.text_color,
             value_layout.bounds(),
         );
 
@@ -2539,21 +2968,7 @@ fn rgba_color(
             renderer.fill_quad(
                 renderer::Quad {
                     bounds,
-                    border: Border {
-                        radius: style_sheet
-                            .get(&StyleState::Focused)
-                            .expect("Style Sheet not found.")
-                            .border_radius
-                            .into(),
-                        width: style_sheet
-                            .get(&StyleState::Focused)
-                            .expect("Style Sheet not found.")
-                            .border_width,
-                        color: style_sheet
-                            .get(&StyleState::Focused)
-                            .expect("Style Sheet not found.")
-                            .border_color,
-                    },
+                    border: style_sheet[&StyleState::Focused].focus_border,
                     shadow: Shadow::default(),
                     snap: true,
                 },
@@ -2570,7 +2985,7 @@ fn rgba_color(
     f(
         renderer,
         red_row_layout,
-        "R:",
+        &appearance.channel_labels[0],
         Color::from_rgb(color.r, 0.0, 0.0),
         color.r,
         cursor,
@@ -2585,7 +3000,7 @@ fn rgba_color(
     f(
         renderer,
         green_row_layout,
-        "G:",
+        &appearance.channel_labels[1],
         Color::from_rgb(0.0, color.g, 0.0),
         color.g,
         cursor,
@@ -2600,7 +3015,7 @@ fn rgba_color(
     f(
         renderer,
         blue_row_layout,
-        "B:",
+        &appearance.channel_labels[2],
         Color::from_rgb(0.0, 0.0, color.b),
         color.b,
         cursor,
@@ -2615,7 +3030,7 @@ fn rgba_color(
     f(
         renderer,
         alpha_row_layout,
-        "A:",
+        &appearance.channel_labels[3],
         Color::from_rgba(0.0, 0.0, 0.0, color.a),
         color.a,
         cursor,
@@ -2649,6 +3064,8 @@ pub struct OverlayState {
     /// The last color given to the [`ColorPicker`] by the application.
     external_color: Color,
     rgba_tree: Tree,
+    sat_value_style: Cell<Option<Style>>,
+    hue_style: Cell<Option<Style>>,
 }
 
 impl OverlayState {
@@ -2689,6 +3106,8 @@ impl Default for OverlayState {
             keyboard_modifiers: keyboard::Modifiers::default(),
             layout_stale: false,
             rgba_tree: Tree::empty(),
+            sat_value_style: Cell::new(None),
+            hue_style: Cell::new(None),
         }
     }
 }
@@ -2790,28 +3209,37 @@ impl Focus {
 }
 
 /// The appearance of a [`ColorPicker`](crate::widget::ColorPicker).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Style {
-    /// The background of the [`ColorPicker`](crate::widget::ColorPicker).
+    /// The overlay background.
     pub background: Background,
+    /// The overlay border.
+    pub border: Border,
+    /// The overlay shadow (none by default).
+    pub shadow: Shadow,
+    /// The color of channel labels and values.
+    pub text_color: Color,
+    /// The saturation/value and hue outlines. Radius rounds the outline, not the gradient.
+    pub area_border: Border,
+    /// The RGBA bar outlines.
+    pub bar_border: Border,
+    /// The track behind each RGBA bar's filled portion.
+    pub bar_background: Background,
+    /// The ring drawn around a focused RGBA bar or button, read from the Focused style. The
+    /// saturation/value area and hue bar show focus through `area_border` instead.
+    pub focus_border: Border,
+    /// The saturation/value crosshair color. None uses automatic contrast gray.
+    pub sat_value_marker: Option<Color>,
+    /// The hue marker color.
+    pub hue_marker: Color,
+    /// The default hex input's border color when its text is invalid.
+    pub invalid_hex: Color,
+}
 
-    /// The border radius of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub border_radius: f32,
-
-    /// The border with of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub border_width: f32,
-
-    /// The border color of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub border_color: Color,
-
-    /// The border radius of the bars of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub bar_border_radius: f32,
-
-    /// The border width of the bars of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub bar_border_width: f32,
-
-    /// The border color of the bars of the [`ColorPicker`](crate::widget::ColorPicker).
-    pub bar_border_color: Color,
+impl Default for Style {
+    fn default() -> Self {
+        primary(&Theme::Light, Status::Active)
+    }
 }
 
 /// The Catalog of a [`ColorPicker`](crate::widget::ColorPicker).
@@ -2843,23 +3271,39 @@ impl Catalog for Theme {
 pub fn primary(theme: &Theme, status: Status) -> Style {
     let palette = theme.palette();
 
-    let base = Style {
-        background: palette.background.base.color.into(),
-        border_radius: 15.0,
-        border_width: 1.0,
-        border_color: palette.background.base.text,
-        bar_border_radius: 5.0,
-        bar_border_width: 1.0,
-        bar_border_color: palette.background.base.text,
+    let border_color = if status == Status::Focused {
+        palette.background.strong.color
+    } else {
+        palette.background.base.text
     };
-
-    match status {
-        Status::Focused => Style {
-            border_color: palette.background.strong.color,
-            bar_border_color: palette.background.strong.color,
-            ..base
+    Style {
+        background: palette.background.base.color.into(),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 15.0.into(),
         },
-        _ => base,
+        shadow: Shadow::default(),
+        text_color: palette.background.base.text,
+        area_border: Border {
+            color: border_color,
+            width: 2.0,
+            radius: 0.0.into(),
+        },
+        bar_border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        bar_background: Color::TRANSPARENT.into(),
+        focus_border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 15.0.into(),
+        },
+        sat_value_marker: None,
+        hue_marker: Color::BLACK,
+        invalid_hex: palette.danger.base.color,
     }
 }
 
@@ -3342,7 +3786,10 @@ mod tests {
 
     impl Harness {
         fn new(color: Color) -> Self {
-            let mut picker = picker_with(color);
+            Self::with_picker(picker_with(color))
+        }
+
+        fn with_picker(mut picker: ColorPicker<'static, Message>) -> Self {
             let mut tree = Tree::new(&picker);
             tree.diff(&mut picker);
             let mut harness = Self {
@@ -3533,6 +3980,416 @@ mod tests {
         fn color(&self) -> Color {
             self.tree.state.downcast_ref::<State>().overlay_state.color
         }
+    }
+
+    #[test]
+    fn default_body_style_supports_partial_customization() {
+        assert_eq!(Style::default(), primary(&Theme::Light, Status::Active));
+        let customized = Style {
+            background: Color::BLACK.into(),
+            ..Style::default()
+        };
+        assert_eq!(customized.background, Color::BLACK.into());
+        assert_eq!(customized.border, Style::default().border);
+        for theme in [Theme::Light, Theme::Dark] {
+            let palette = theme.palette();
+            let active = primary(&theme, Status::Active);
+            assert_eq!(active.text_color, palette.background.base.text);
+            assert_eq!(active.area_border.width, 2.0);
+            assert_eq!(active.bar_background, Color::TRANSPARENT.into());
+            assert_eq!(active.shadow, Shadow::default());
+            assert_eq!(active.sat_value_marker, None);
+            assert_eq!(active.hue_marker, Color::BLACK);
+            assert_eq!(
+                primary(&theme, Status::Focused).focus_border.color,
+                palette.background.strong.color
+            );
+        }
+    }
+
+    fn channel_bounds(ui: &Harness) -> Vec<Vec<Rectangle>> {
+        let state = ui.tree.state.downcast_ref::<State>();
+        let geometry = &state.overlay_layout.as_ref().unwrap().2;
+        GeometryLayout::new(geometry)
+            .children()
+            .nth(1)
+            .unwrap()
+            .children()
+            .next()
+            .unwrap()
+            .children()
+            .map(|row| row.children().map(GeometryLayout::bounds).collect())
+            .collect()
+    }
+
+    #[test]
+    fn custom_labels_and_text_size_reserve_space_before_bars() {
+        let default = Harness::new(original());
+        let ui = Harness::with_picker(
+            picker_with(original())
+                .channel_labels("Red channel", "Green", "Blue", "Alpha")
+                .text_size(24)
+                .font(Font::MONOSPACE),
+        );
+        let defaults = channel_bounds(&default);
+        let custom = channel_bounds(&ui);
+        for (row, default_row) in custom.iter().zip(&defaults) {
+            assert!(row[0].width > default_row[0].width);
+            assert!(row[1].x >= row[0].x + row[0].width + SPACING.0);
+            assert!(row[1].width > 0.0);
+            assert!(row[2].x >= row[1].x + row[1].width);
+            assert_eq!(row[0].width, custom[0][0].width);
+        }
+        assert!(
+            ui.tree.children[1].children[3].size.height
+                > default.tree.children[1].children[3].size.height
+        );
+    }
+
+    #[test]
+    fn default_button_styles_keep_the_theme_catalog_appearance() {
+        for theme in [Theme::Light, Theme::Dark] {
+            for focused in [false, true] {
+                let wrapper = ButtonTheme {
+                    theme: theme.clone(),
+                    focused,
+                };
+                for status in [
+                    button::Status::Active,
+                    button::Status::Hovered,
+                    button::Status::Pressed,
+                ] {
+                    assert_eq!(
+                        button::Catalog::style(&wrapper, &None, status),
+                        button::Catalog::style(
+                            &theme,
+                            &<Theme as button::Catalog>::default(),
+                            status
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_button_styles_receive_hover_press_and_keyboard_focus() {
+        use keyboard::key::Named;
+        use std::cell::RefCell;
+
+        let statuses = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&statuses);
+        let mut ui =
+            Harness::with_picker(picker_with(original()).button_style(move |theme, status| {
+                record.borrow_mut().push(status);
+                button::primary(theme, button::Status::Active)
+            }));
+        let cancel = ui.control_bounds(2);
+        ui.cursor = Cursor::Available(cancel.center());
+        ui.redraw();
+        assert!(statuses.borrow().contains(&ButtonStatus::Hovered));
+        for _ in 0..8 {
+            ui.press(Named::Tab);
+        }
+        assert_eq!(
+            ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+            Focus::Cancel
+        );
+        assert!(
+            statuses
+                .borrow()
+                .contains(&ButtonStatus::Focused { is_hovered: true })
+        );
+        statuses.borrow_mut().clear();
+        ui.send(Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        )));
+        ui.redraw();
+        assert!(statuses.borrow().contains(&ButtonStatus::Pressed));
+        assert!(
+            !statuses
+                .borrow()
+                .contains(&ButtonStatus::Focused { is_hovered: true })
+        );
+        ui.cursor = Cursor::Unavailable;
+        ui.send(Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        )));
+        ui.press(Named::Tab);
+        assert_eq!(
+            ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+            Focus::Submit
+        );
+        assert!(
+            statuses
+                .borrow()
+                .contains(&ButtonStatus::Focused { is_hovered: false })
+        );
+    }
+
+    #[test]
+    fn custom_button_contents_keep_their_actions_and_independent_styles() {
+        use std::cell::RefCell;
+        let cancel_statuses = Rc::new(RefCell::new(Vec::new()));
+        let submit_statuses = Rc::new(RefCell::new(Vec::new()));
+        let cancel = Rc::clone(&cancel_statuses);
+        let submit = Rc::clone(&submit_statuses);
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .cancel_button_style(move |theme, status| {
+                    cancel.borrow_mut().push(status);
+                    button::danger(theme, button::Status::Active)
+                })
+                .cancel_content(text("Discard"))
+                .submit_content(text("Apply"))
+                .submit_button_style(move |theme, status| {
+                    submit.borrow_mut().push(status);
+                    button::success(theme, button::Status::Active)
+                }),
+        );
+        let submit = ui.control_bounds(3);
+        assert_eq!(ui.click(submit), vec![Message::Submit(original())]);
+        let cancel = ui.control_bounds(2);
+        assert_eq!(ui.click(cancel), vec![Message::Cancel]);
+        assert!(!cancel_statuses.borrow().is_empty());
+        assert!(!submit_statuses.borrow().is_empty());
+    }
+
+    #[test]
+    fn tall_submit_content_reserves_its_real_height() {
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .submit_content(iced::widget::Space::new().width(20).height(120)),
+        );
+        let hex = ui.control_bounds(1);
+        let submit = ui.control_bounds(3);
+        assert_eq!(submit.height, 120.0 + button::DEFAULT_PADDING.y());
+        assert!(submit.y >= hex.y + hex.height + SPACING.0);
+        assert_eq!(ui.click(submit), vec![Message::Submit(original())]);
+    }
+
+    #[test]
+    fn custom_buttons_follow_release_inside_and_touch_semantics() {
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .cancel_content(text("Discard"))
+                .submit_content(text("Apply")),
+        );
+        let submit = ui.control_bounds(3);
+        ui.cursor = Cursor::Available(submit.center());
+        assert!(
+            ui.send(Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left
+            )))
+            .is_empty()
+        );
+        ui.cursor = Cursor::Available(Point::ORIGIN);
+        assert!(
+            ui.send(Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left
+            )))
+            .is_empty()
+        );
+        ui.cursor = Cursor::Unavailable;
+        let id = touch::Finger(1);
+        assert!(
+            ui.send(Event::Touch(touch::Event::FingerPressed {
+                id,
+                position: submit.center()
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            ui.send(Event::Touch(touch::Event::FingerLifted {
+                id,
+                position: submit.center()
+            })),
+            vec![Message::Submit(original())]
+        );
+        let cancel = ui.control_bounds(2);
+        assert!(
+            ui.send(Event::Touch(touch::Event::FingerPressed {
+                id,
+                position: cancel.center()
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            ui.send(Event::Touch(touch::Event::FingerLifted {
+                id,
+                position: cancel.center()
+            })),
+            vec![Message::Cancel]
+        );
+    }
+
+    #[test]
+    fn custom_content_messages_are_not_converted_to_submit() {
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .submit_content(Button::new(text("Inner action")).on_press(Message::Cancel)),
+        );
+        let submit = ui.control_bounds(3);
+        assert_eq!(ui.click(submit), vec![Message::Cancel]);
+    }
+
+    #[derive(Default)]
+    struct Controls {
+        labels: Vec<(String, Rectangle)>,
+        inputs: Vec<String>,
+        focusables: usize,
+    }
+
+    impl Operation for Controls {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn operation::Text) {
+            self.labels.push((state.text().to_string(), bounds));
+            state.select_all();
+            assert_eq!(state.copy(), None);
+        }
+        fn text_input(
+            &mut self,
+            _id: Option<&Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::TextInput,
+        ) {
+            self.inputs.push(state.text().into_owned());
+        }
+        fn focusable(
+            &mut self,
+            _id: Option<&Id>,
+            _bounds: Rectangle,
+            _state: &mut dyn operation::Focusable,
+        ) {
+            self.focusables += 1;
+        }
+    }
+
+    fn operate(ui: &mut Harness) -> Controls {
+        let mut operation = Controls::default();
+        let layout = ui.layout();
+        let mut overlays = ui.picker.overlay(
+            &mut ui.tree,
+            layout,
+            &ui.renderer,
+            &Rectangle::with_size(WINDOW),
+            Vector::ZERO,
+            WINDOW,
+        );
+        overlays[0]
+            .as_overlay_mut()
+            .operate(&ui.renderer, &mut operation);
+        operation
+    }
+
+    #[test]
+    fn overlay_operations_expose_button_labels_contents_and_hex_input() {
+        let mut ui = Harness::new(original());
+        let cancel = ui.control_bounds(2);
+        let submit = ui.control_bounds(3);
+        let controls = operate(&mut ui);
+        assert!(controls.labels.contains(&("Cancel".into(), cancel)));
+        assert!(controls.labels.contains(&("Submit".into(), submit)));
+        assert_eq!(controls.inputs, [ORIGINAL_HEX]);
+        assert_eq!(controls.focusables, 1);
+
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .cancel_label("Discard changes")
+                .submit_label("Apply color")
+                .cancel_content(text("Keep old"))
+                .submit_content(text_input("", "nested input").on_input(|_| Message::Cancel)),
+        );
+        let controls = operate(&mut ui);
+        assert!(
+            controls
+                .labels
+                .iter()
+                .any(|(text, _)| text == "Discard changes")
+        );
+        assert!(
+            controls
+                .labels
+                .iter()
+                .any(|(text, _)| text == "Apply color")
+        );
+        assert!(controls.labels.iter().any(|(text, _)| text == "Keep old"));
+        assert_eq!(controls.inputs, [ORIGINAL_HEX, "nested input"]);
+        assert_eq!(controls.focusables, 2);
+    }
+
+    #[test]
+    fn hex_style_receives_draft_validity_and_current_color() {
+        use std::cell::RefCell;
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&states);
+        let mut ui = Harness::with_picker(
+            picker_with(original())
+                .font(Font::MONOSPACE)
+                .text_size(22)
+                .hex_input_style(move |theme, status| {
+                    record.borrow_mut().push(status);
+                    text_input::default(theme, status.status)
+                }),
+        );
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+        ui.type_text("#12z");
+        assert_eq!(ui.hex_text(), "#12z");
+        assert!(!states.borrow().last().unwrap().is_valid);
+        assert!(matches!(
+            states.borrow().last().unwrap().status,
+            text_input::Status::Focused { .. }
+        ));
+        ui.select_all();
+        ui.type_text("#123");
+        let state = *states.borrow().last().unwrap();
+        assert!(state.is_valid);
+        assert_eq!(state.color, Color::from_rgb8(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn default_hex_style_uses_active_invalid_hex_color() {
+        let invalid_hex = Color::from_rgb8(234, 12, 56);
+        let mut ui =
+            Harness::with_picker(picker_with(original()).style(move |theme, status| Style {
+                invalid_hex: if status == Status::Active {
+                    invalid_hex
+                } else {
+                    Color::BLACK
+                },
+                ..primary(theme, status)
+            }));
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+        ui.type_text("#12z");
+        let state = &ui.tree.state.downcast_ref::<State>().overlay_state;
+        let active = Catalog::style(&Theme::Dark, &ui.picker.class, Status::Active);
+        let theme = InternalTheme {
+            theme: Theme::Dark,
+            color: state.color,
+            is_valid: parse_hex(&state.hex_text).is_some(),
+            invalid_hex: active.invalid_hex,
+        };
+        let status = text_input::Status::Focused { is_hovered: true };
+        let style = text_input::Catalog::style(&theme, &None, status);
+        assert_eq!(style.border.color, invalid_hex);
+        assert_eq!(style.border.width, 1.0);
+        assert_eq!(style.border.radius, 5.0.into());
+        let valid = InternalTheme {
+            is_valid: true,
+            ..theme
+        };
+        assert_eq!(
+            text_input::Catalog::style(&valid, &None, status)
+                .border
+                .color,
+            text_input::default(&Theme::Dark, status).border.color
+        );
     }
 
     #[test]

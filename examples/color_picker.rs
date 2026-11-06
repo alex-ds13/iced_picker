@@ -1,8 +1,11 @@
 use iced::{
-    Center, Color, Fill, Length, Shrink, Theme, Widget,
-    widget::{Button, Column, Text, column, container, pick_list, row, space},
+    Border, Center, Color, Fill, Font, Length, Shrink, Theme, Widget,
+    widget::{
+        Button, Column, Text, button, checkbox, column, container, pick_list, row, space,
+        text_input,
+    },
 };
-use iced_picker::color_picker::color_picker;
+use iced_picker::color_picker::{self, ButtonStatus, color_picker};
 
 fn main() -> iced::Result {
     iced::application(
@@ -23,6 +26,7 @@ enum Message {
     SubmitColor(Color),
     CancelColor,
     Theme(Theme),
+    CustomStyle(bool),
 }
 
 #[derive(Debug)]
@@ -31,6 +35,7 @@ struct ColorPickerExample {
     show_picker: bool,
     show_picker2: bool,
     theme: Theme,
+    custom_style: bool,
 }
 
 impl Default for ColorPickerExample {
@@ -40,6 +45,7 @@ impl Default for ColorPickerExample {
             show_picker: false,
             show_picker2: false,
             theme: Theme::TokyoNightStorm,
+            custom_style: false,
         }
     }
 }
@@ -63,6 +69,7 @@ impl ColorPickerExample {
                 self.show_picker2 = false;
             }
             Message::Theme(theme) => self.theme = theme,
+            Message::CustomStyle(enabled) => self.custom_style = enabled,
         }
     }
 
@@ -79,6 +86,89 @@ impl ColorPickerExample {
             Message::CancelColor,
             Message::SubmitColor,
         );
+
+        let picker1 = if self.custom_style {
+            picker1
+                .style(|theme: &Theme, status| {
+                    let palette = theme.palette();
+                    color_picker::Style {
+                        background: palette.background.weak.color.into(),
+                        border: Border {
+                            color: palette.primary.base.color,
+                            width: 2.0,
+                            radius: 10.0.into(),
+                        },
+                        shadow: iced::Shadow {
+                            color: Color::BLACK.scale_alpha(0.35),
+                            offset: iced::Vector::new(3.0, 4.0),
+                            blur_radius: 12.0,
+                        },
+                        bar_background: palette.background.strong.color.into(),
+                        sat_value_marker: Some(Color::WHITE),
+                        hue_marker: Color::WHITE,
+                        ..color_picker::primary(theme, status)
+                    }
+                })
+                .font(Font::MONOSPACE)
+                .channel_labels("Red", "Green", "Blue", "Alpha")
+                .cancel_content(Text::new("Cancel").width(Fill).align_x(Center))
+                .submit_content(Text::new("Apply").width(Fill).align_x(Center))
+                .submit_label("Apply")
+                .button_style(|theme, status| {
+                    let palette = theme.palette();
+                    let (background, text_color) = match status {
+                        ButtonStatus::Active => {
+                            (palette.secondary.base.color, palette.secondary.base.text)
+                        }
+                        ButtonStatus::Hovered => {
+                            (palette.primary.strong.color, palette.primary.strong.text)
+                        }
+                        ButtonStatus::Pressed => {
+                            (palette.success.strong.color, palette.success.strong.text)
+                        }
+                        ButtonStatus::Focused { is_hovered } => (
+                            if is_hovered {
+                                palette.warning.strong.color
+                            } else {
+                                palette.warning.base.color
+                            },
+                            palette.warning.base.text,
+                        ),
+                    };
+                    button::Style {
+                        background: Some(background.into()),
+                        text_color,
+                        border: Border {
+                            radius: 8.0.into(),
+                            ..Border::default()
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .hex_input_style(|theme, state| {
+                    let palette = theme.palette();
+                    let base = text_input::default(theme, state.status);
+                    text_input::Style {
+                        background: palette.background.base.color.into(),
+                        value: state.color,
+                        border: Border {
+                            color: if state.is_valid {
+                                palette.primary.base.color
+                            } else {
+                                palette.danger.base.color
+                            },
+                            width: 2.0,
+                            radius: 8.0.into(),
+                        },
+                        ..base
+                    }
+                })
+        } else {
+            picker1
+        };
+        let custom_style = checkbox(self.custom_style)
+            .label("Custom style")
+            .on_toggle(Message::CustomStyle);
 
         let picker2 = color_picker(
             self.show_picker2,
@@ -128,7 +218,7 @@ impl ColorPickerExample {
         let pickers_row = row![picker1, picker2].spacing(10).align_y(Center);
         let color_display = row![color_swatch, color_info].spacing(15).align_y(Center);
 
-        let content: Column<_> = column![theme_picker, pickers_row, color_display]
+        let content: Column<_> = column![theme_picker, custom_style, pickers_row, color_display]
             .spacing(20)
             .width(Shrink);
 
