@@ -667,6 +667,66 @@ where
         is_focused.0
     }
 
+    fn hex_input_layout(&self) -> Layout {
+        self.layout
+            .children()
+            .nth(1)
+            .and_then(|block2| block2.children().nth(1))
+            .expect("widget: Layout should have a hex text layout")
+            .for_widget(&self.tree.children[3])
+    }
+
+    fn submit(&mut self, shell: &mut Shell<Message>) {
+        shell.publish((self.on_submit)(self.state.color));
+        self.state.previous_hue_degrees = self.state.current_hue_degrees;
+    }
+
+    /// Handles Enter and Escape, returning whether the key was consumed.
+    ///
+    /// Enter submits while any part of the picker is focused, except the cancel button, where
+    /// it cancels. Escape always cancels. Handled keys are captured so they cannot also reach
+    /// the application below the picker.
+    fn on_confirm_key(
+        &mut self,
+        event: &Event,
+        renderer: &Renderer,
+        shell: &mut Shell<Message>,
+    ) -> bool {
+        let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event else {
+            return false;
+        };
+
+        let submit = match key {
+            keyboard::Key::Named(keyboard::key::Named::Escape) => false,
+            keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                if self.is_hex_input_focused(self.hex_input_layout(), renderer) {
+                    if parse_hex(&self.state.hex_text).is_none() {
+                        // Submitting would not use what was typed.
+                        shell.capture_event();
+                        return true;
+                    }
+                    true
+                } else {
+                    match self.state.focus {
+                        Focus::None => return false,
+                        Focus::Cancel => false,
+                        _ => true,
+                    }
+                }
+            }
+            _ => return false,
+        };
+
+        if submit {
+            self.submit(shell);
+        } else {
+            shell.publish(self.on_cancel.clone());
+        }
+        shell.capture_event();
+        shell.request_redraw();
+        true
+    }
+
     /// Replaces the hex text with the formatted current color.
     fn sync_hex_text(&mut self) {
         self.state.hex_text = self.state.color.as_hex_string();
@@ -1468,6 +1528,10 @@ where
         shell: &mut Shell<Message>,
     ) {
         let layout = self.layout;
+        if self.on_confirm_key(event, renderer, shell) {
+            return;
+        }
+
         let color_before = self.state.color;
         if event::Status::Captured == self.on_event_keyboard(event) {
             if self.state.color != color_before {
@@ -1603,10 +1667,7 @@ where
         drop(fake_submit_shell);
 
         if !fake_messages.is_empty() {
-            // Submit the selected color
-            shell.publish((self.on_submit)(self.state.color));
-            self.state.previous_hue_degrees = self.state.current_hue_degrees;
-
+            self.submit(shell);
             shell.capture_event();
             shell.request_redraw();
         }
@@ -3329,6 +3390,10 @@ mod tests {
         }
 
         fn send(&mut self, event: Event) -> Vec<Message> {
+            self.send_with_status(event).0
+        }
+
+        fn send_with_status(&mut self, event: Event) -> (Vec<Message>, event::Status) {
             let mut messages = shell::Bus::new();
             let mut shell = Shell::new(
                 &iced_core::window::Headless,
@@ -3348,8 +3413,28 @@ mod tests {
                 .as_overlay_mut()
                 .update(&event, self.cursor, &self.renderer, &mut shell);
             drop(overlays);
+            let status = shell.event_status();
             drop(shell);
-            messages.into_iter().collect()
+            (messages.into_iter().collect(), status)
+        }
+
+        /// Presses a named key, returning the messages and whether the press was captured.
+        fn press(&mut self, key: keyboard::key::Named) -> (Vec<Message>, bool) {
+            let key = keyboard::Key::Named(key);
+            let (messages, status) =
+                self.send_with_status(Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }));
+            self.redraw();
+            (messages, status == event::Status::Captured)
         }
 
         fn redraw(&mut self) {
@@ -3516,5 +3601,69 @@ mod tests {
         ui.rebuild(external);
         assert_eq!(ui.hex_text(), "#010203FF");
         assert_eq!(ui.color(), external);
+    }
+
+    #[test]
+    fn enter_in_the_hex_input_submits_only_valid_text() {
+        use keyboard::key::Named;
+
+        let mut ui = Harness::new(original());
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+        ui.type_text("#abc");
+        let abc = Color::from_rgb8(0xAA, 0xBB, 0xCC);
+        assert_eq!(ui.press(Named::Enter), (vec![Message::Submit(abc)], true));
+
+        ui.type_text("z");
+        assert_eq!(ui.hex_text(), "#abcz");
+        assert_eq!(ui.press(Named::Enter), (vec![], true));
+    }
+
+    #[test]
+    fn enter_submits_or_cancels_from_the_focused_control() {
+        use keyboard::key::Named;
+
+        let mut ui = Harness::new(original());
+        assert_eq!(ui.press(Named::Enter), (vec![], false));
+
+        assert!(ui.press(Named::Tab).1);
+        assert_eq!(
+            ui.press(Named::Enter),
+            (vec![Message::Submit(original())], true)
+        );
+
+        assert!(ui.press(Named::Tab).1);
+        assert!(ui.press(Named::ArrowDown).1);
+        let changed = ui.color();
+        assert_ne!(changed, original());
+        assert_eq!(ui.hex_text(), changed.as_hex_string());
+        assert_eq!(
+            ui.press(Named::Enter),
+            (vec![Message::Submit(changed)], true)
+        );
+
+        // Hue, red, green, blue, alpha, then cancel.
+        for _ in 0..6 {
+            assert!(ui.press(Named::Tab).1);
+        }
+        assert_eq!(ui.press(Named::Enter), (vec![Message::Cancel], true));
+    }
+
+    #[test]
+    fn escape_cancels_and_is_consumed() {
+        let mut ui = Harness::new(original());
+        assert_eq!(
+            ui.press(keyboard::key::Named::Escape),
+            (vec![Message::Cancel], true)
+        );
+
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.type_text("#1");
+        assert_eq!(
+            ui.press(keyboard::key::Named::Escape),
+            (vec![Message::Cancel], true)
+        );
     }
 }
