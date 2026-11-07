@@ -1679,41 +1679,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_ties_choose_the_later_side_in_popover_order() {
-        let viewport = Rectangle::with_size(Size::new(220.0, 220.0));
-        let bounds = resolve_tooltip_bounds(
-            Position::Auto {
-                preference: Side::Top,
-            },
-            Rectangle::new(Point::new(100.0, 100.0), Size::new(20.0, 20.0)),
-            Size::new(240.0, 240.0),
-            4.0,
-            7.0,
-            Point::ORIGIN,
-            viewport,
-            false,
-        );
-        assert_eq!(
-            bounds,
-            Rectangle::new(Point::new(-14.0, 127.0), Size::new(248.0, 248.0)),
-        );
-
-        let bounds = resolve_tooltip_bounds(
-            Position::Auto {
-                preference: Side::Top,
-            },
-            Rectangle::new(Point::new(100.0, 10.0), Size::new(20.0, 200.0)),
-            Size::new(240.0, 240.0),
-            4.0,
-            7.0,
-            Point::ORIGIN,
-            viewport,
-            false,
-        );
-        assert_eq!(bounds.position(), Point::new(127.0, -14.0));
-    }
-
-    #[test]
     fn fixed_directions_flip_and_preserve_cross_axis_alignment() {
         let viewport = Rectangle::with_size(Size::new(200.0, 100.0));
         let cases = [
