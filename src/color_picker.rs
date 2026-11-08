@@ -2020,6 +2020,11 @@ where
             ) => Cursor::Available(*position),
             _ => cursor,
         };
+        // Hover styles are resolved from the cursor while drawing, and a plain move between
+        // parts changes nothing else that would request a frame.
+        if Hover::at(self.layout, cursor) != self.state.drawn_hover.get() {
+            shell.request_redraw();
+        }
         let layout = self.layout;
         if self.on_confirm_key(event, renderer, shell) {
             return;
@@ -2219,6 +2224,7 @@ where
         cursor: Cursor,
     ) {
         let layout = self.layout;
+        self.state.drawn_hover.set(Hover::at(layout, cursor));
         renderer.with_layer(Rectangle::with_size(self.window), |renderer| {
             let bounds = layout.bounds();
             let mut children = layout.children();
@@ -3066,6 +3072,71 @@ pub struct OverlayState {
     rgba_tree: Tree,
     sat_value_style: Cell<Option<Style>>,
     hue_style: Cell<Option<Style>>,
+    /// The hover the last frame was drawn with. It outlives a close and reopen, and the
+    /// layout can move under a still cursor, so it tracks what is on screen instead of the
+    /// last cursor seen by `update`.
+    drawn_hover: Cell<Hover>,
+}
+
+/// The parts of the [`ColorPickerOverlay`] whose style depends on the cursor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Hover {
+    overlay: bool,
+    area: HoveredArea,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HoveredArea {
+    #[default]
+    None,
+    SatValue,
+    Hue,
+    Red,
+    Green,
+    Blue,
+    Alpha,
+}
+
+impl Hover {
+    /// Mirrors the hover checks made while drawing the overlay.
+    fn at(layout: GeometryLayout<'_>, cursor: Cursor) -> Self {
+        let mut blocks = layout.children();
+        let hsv_areas = blocks
+            .next()
+            .expect("Hover: Layout should have a 1. block layout")
+            .children()
+            .map(GeometryLayout::bounds);
+        let bars = blocks
+            .next()
+            .expect("Hover: Layout should have a 2. block layout")
+            .children()
+            .next()
+            .expect("Hover: Layout should have a RGBA color layout")
+            .children()
+            .map(|row| {
+                row.children()
+                    .nth(1)
+                    .expect("Hover: Layout should have a bar layout")
+                    .bounds()
+            });
+        let area = [
+            HoveredArea::SatValue,
+            HoveredArea::Hue,
+            HoveredArea::Red,
+            HoveredArea::Green,
+            HoveredArea::Blue,
+            HoveredArea::Alpha,
+        ]
+        .into_iter()
+        .zip(hsv_areas.chain(bars))
+        .find_map(|(area, bounds)| cursor.is_over(bounds).then_some(area))
+        .unwrap_or_default();
+
+        Self {
+            overlay: cursor.is_over(layout.bounds()),
+            area,
+        }
+    }
 }
 
 impl OverlayState {
@@ -3108,6 +3179,7 @@ impl Default for OverlayState {
             rgba_tree: Tree::empty(),
             sat_value_style: Cell::new(None),
             hue_style: Cell::new(None),
+            drawn_hover: Cell::new(Hover::default()),
         }
     }
 }
@@ -3841,6 +3913,25 @@ mod tests {
         }
 
         fn send_with_status(&mut self, event: Event) -> (Vec<Message>, event::Status) {
+            let (messages, status, _) = self.dispatch(event);
+            (messages, status)
+        }
+
+        /// Moves the cursor without drawing, returning the redraw the overlay requested.
+        fn move_cursor(&mut self, cursor: Cursor) -> iced::window::RedrawRequest {
+            self.cursor = cursor;
+            let event = cursor
+                .position()
+                .map_or(mouse::Event::CursorLeft, |position| {
+                    mouse::Event::CursorMoved { position }
+                });
+            self.dispatch(Event::Mouse(event)).2
+        }
+
+        fn dispatch(
+            &mut self,
+            event: Event,
+        ) -> (Vec<Message>, event::Status, iced::window::RedrawRequest) {
             let mut messages = shell::Bus::new();
             let mut shell = Shell::new(
                 &iced_core::window::Headless,
@@ -3861,8 +3952,9 @@ mod tests {
                 .update(&event, self.cursor, &self.renderer, &mut shell);
             drop(overlays);
             let status = shell.event_status();
+            let redraw = shell.redraw_request();
             drop(shell);
-            (messages.into_iter().collect(), status)
+            (messages.into_iter().collect(), status, redraw)
         }
 
         /// Presses a named key, returning the messages and whether the press was captured.
@@ -4522,5 +4614,85 @@ mod tests {
             ui.press(keyboard::key::Named::Escape),
             (vec![Message::Cancel], true)
         );
+    }
+
+    fn hsv_area_bounds(ui: &Harness) -> Vec<Rectangle> {
+        let state = ui.tree.state.downcast_ref::<State>();
+        let geometry = &state.overlay_layout.as_ref().unwrap().2;
+        GeometryLayout::new(geometry)
+            .children()
+            .next()
+            .unwrap()
+            .children()
+            .map(GeometryLayout::bounds)
+            .collect()
+    }
+
+    // The hex input stays unfocused in these tests: its caret blink schedules redraws,
+    // which used to hide the missing hover redraws.
+    #[test]
+    fn moving_between_rgba_bars_requests_a_redraw() {
+        use iced::window::RedrawRequest;
+
+        let mut ui = Harness::new(original());
+        let bars: Vec<_> = channel_bounds(&ui).iter().map(|row| row[1]).collect();
+        let _ = ui.move_cursor(Cursor::Available(bars[0].center()));
+        ui.redraw();
+
+        for bar in &bars[1..] {
+            assert_eq!(
+                ui.move_cursor(Cursor::Available(bar.center())),
+                RedrawRequest::NextFrame
+            );
+            ui.redraw();
+        }
+    }
+
+    #[test]
+    fn moving_between_hsv_areas_and_out_requests_a_redraw() {
+        use iced::window::RedrawRequest;
+
+        let mut ui = Harness::new(original());
+        let areas = hsv_area_bounds(&ui);
+        let label = channel_bounds(&ui)[0][0];
+        assert_eq!(
+            ui.move_cursor(Cursor::Available(areas[0].center())),
+            RedrawRequest::NextFrame
+        );
+        ui.redraw();
+
+        for cursor in [
+            Cursor::Available(areas[1].center()),
+            Cursor::Available(label.center()),
+            Cursor::Unavailable,
+        ] {
+            assert_eq!(ui.move_cursor(cursor), RedrawRequest::NextFrame);
+            ui.redraw();
+        }
+    }
+
+    #[test]
+    fn moving_without_changing_the_hovered_part_does_not_request_a_redraw() {
+        use iced::window::RedrawRequest;
+
+        let mut ui = Harness::new(original());
+        let channels = channel_bounds(&ui);
+        let red = channels[0][1];
+        let hue = hsv_area_bounds(&ui)[1];
+        for (from, to) in [
+            (
+                red.center(),
+                red.center() + Vector::new(red.width / 4.0, 0.0),
+            ),
+            (
+                hue.center(),
+                hue.center() + Vector::new(hue.width / 4.0, 0.0),
+            ),
+            (channels[0][0].center(), channels[1][0].center()),
+        ] {
+            let _ = ui.move_cursor(Cursor::Available(from));
+            ui.redraw();
+            assert_eq!(ui.move_cursor(Cursor::Available(to)), RedrawRequest::Wait);
+        }
     }
 }
