@@ -1,5 +1,11 @@
 #![allow(dead_code)]
-//! Tooltips display a hint of information over some element when hovered.
+//! Tooltips with widget-managed hover or click opening.
+//!
+//! Use iced's [`tooltip`](iced::widget::tooltip()) for simple hover hints, or its
+//! [`popover`](iced::widget::popover()) for app-controlled `Some`/`None` visibility
+//! and `on_close` handling. This widget manages its own open state and adds click
+//! opening, corners, flipping, `FollowCursor`, and trigger styling. Unlike iced's
+//! popover, its popup is not clipped to the parent viewport.
 //!
 //! # Example
 //! ```no_run
@@ -41,7 +47,12 @@ use iced::widget::container;
 use iced::{Task, Widget as _};
 use iced_core as core;
 
-/// An element to display a widget over another.
+/// A popup with widget-managed hover or click opening and trigger styling.
+///
+/// Use iced's [`tooltip`](iced::widget::tooltip()) for simple hover hints, or its
+/// [`popover`](iced::widget::popover()) when the app should control visibility via
+/// `Some`/`None` and `on_close`. This widget also offers corners, flipping, and
+/// `FollowCursor`, without clipping the popup to the parent viewport.
 ///
 /// # Example
 /// ```no_run
@@ -74,6 +85,8 @@ where
     tooltip: Element<'a, Message, Theme, Renderer>,
     position: Position,
     open: Open,
+    on_open: Option<Box<dyn Fn() -> Message + 'a>>,
+    on_close: Option<Box<dyn Fn() -> Message + 'a>>,
     disabled: bool,
     gap: f32,
     content_padding: Padding,
@@ -114,6 +127,8 @@ where
             tooltip: tooltip.boxed(),
             position: Default::default(),
             open: Default::default(),
+            on_open: None,
+            on_close: None,
             disabled: false,
             gap: 0.0,
             content_padding: DEFAULT_CONTENT_PADDING,
@@ -167,6 +182,31 @@ where
     /// Sets how the [`Tooltip`] is opened.
     pub fn open(mut self, open: Open) -> Self {
         self.open = open;
+        self
+    }
+
+    /// Sets the message published when the [`Tooltip`] changes from closed to open.
+    ///
+    /// Like iced's [`popover::on_close`](iced::widget::Popover::on_close), this
+    /// notifies the application. The widget still manages its own open state.
+    pub fn on_open(mut self, message: Message) -> Self
+    where
+        Message: Clone + 'a,
+    {
+        self.on_open = Some(Box::new(move || message.clone()));
+        self
+    }
+
+    /// Sets the message published when the [`Tooltip`] changes from open to closed.
+    ///
+    /// This mirrors iced's [`popover::on_close`](iced::widget::Popover::on_close)
+    /// notification, but the widget closes itself. Closing with [`close`] or
+    /// [`close_all`] does not publish this message, since the app initiated it.
+    pub fn on_close(mut self, message: Message) -> Self
+    where
+        Message: Clone + 'a,
+    {
+        self.on_close = Some(Box::new(move || message.clone()));
         self
     }
 
@@ -450,6 +490,11 @@ where
             if was_idle != is_idle {
                 if was_idle {
                     state.needs_relayout = true;
+                    if let Some(on_open) = &self.on_open {
+                        shell.publish(on_open());
+                    }
+                } else if let Some(on_close) = &self.on_close {
+                    shell.publish(on_close());
                 }
 
                 shell.invalidate_overlay();
@@ -500,6 +545,36 @@ where
             shell,
             viewport,
         );
+
+        let is_over = match event {
+            Event::Touch(
+                touch::Event::FingerPressed { position, .. }
+                | touch::Event::FingerLifted { position, .. }
+                | touch::Event::FingerLost { position, .. },
+            ) => layout.bounds().contains(*position),
+            _ => cursor.is_over(layout.bounds()),
+        };
+        if !self.disabled
+            && is_over
+            && matches!(
+                (self.open, pointer_event(event)),
+                (
+                    Open::LeftPointer,
+                    Some(
+                        mouse::Event::ButtonPressed(mouse::Button::Left)
+                            | mouse::Event::ButtonReleased(mouse::Button::Left)
+                    )
+                ) | (
+                    Open::RightPointer,
+                    Some(
+                        mouse::Event::ButtonPressed(mouse::Button::Right)
+                            | mouse::Event::ButtonReleased(mouse::Button::Right)
+                    )
+                )
+            )
+        {
+            shell.capture_event();
+        }
     }
 
     fn mouse_interaction(
@@ -663,6 +738,8 @@ where
                 tooltip_state: mode,
                 positioning: self.position,
                 open: self.open,
+                on_open: self.on_open.as_deref(),
+                on_close: self.on_close.as_deref(),
                 class: &self.tooltip_class,
                 window,
             })))
@@ -710,50 +787,31 @@ pub enum Position {
     BottomLeft,
 }
 
-/// A side that a tooltip can appear on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Side {
-    /// The top side.
-    Top,
-    /// The bottom side.
-    #[default]
-    Bottom,
-    /// The left side.
-    Left,
-    /// The right side.
-    Right,
+pub use iced::widget::overlay::Side;
+
+fn available_space(
+    side: Side,
+    anchor: Rectangle,
+    viewport: Rectangle,
+    popup: Size,
+    gap: f32,
+) -> f32 {
+    match side {
+        Side::Top => anchor.y - viewport.y - popup.height - gap,
+        Side::Bottom => {
+            viewport.y + viewport.height - (anchor.y + anchor.height) - popup.height - gap
+        }
+        Side::Left => anchor.x - viewport.x - popup.width - gap,
+        Side::Right => viewport.x + viewport.width - (anchor.x + anchor.width) - popup.width - gap,
+    }
 }
 
-impl Side {
-    fn available_space(self, anchor: Rectangle, viewport: Rectangle, popup: Size, gap: f32) -> f32 {
-        match self {
-            Self::Top => anchor.y - viewport.y - popup.height - gap,
-            Self::Bottom => {
-                viewport.y + viewport.height - (anchor.y + anchor.height) - popup.height - gap
-            }
-            Self::Left => anchor.x - viewport.x - popup.width - gap,
-            Self::Right => {
-                viewport.x + viewport.width - (anchor.x + anchor.width) - popup.width - gap
-            }
-        }
-    }
-
-    fn opposite(self) -> Self {
-        match self {
-            Self::Top => Self::Bottom,
-            Self::Bottom => Self::Top,
-            Self::Left => Self::Right,
-            Self::Right => Self::Left,
-        }
-    }
-
-    fn position(self) -> Position {
-        match self {
-            Self::Top => Position::Top,
-            Self::Bottom => Position::Bottom,
-            Self::Left => Position::Left,
-            Self::Right => Position::Right,
-        }
+fn opposite(side: Side) -> Side {
+    match side {
+        Side::Top => Side::Bottom,
+        Side::Bottom => Side::Top,
+        Side::Left => Side::Right,
+        Side::Right => Side::Left,
     }
 }
 
@@ -771,19 +829,9 @@ fn resolve_tooltip_bounds(
     snap_within_viewport: bool,
 ) -> Rectangle {
     let popup = content.expand(Padding::new(padding));
-    let available = |side: Side| side.available_space(anchor, viewport, popup, gap);
+    let available = |side: Side| available_space(side, anchor, viewport, popup, gap);
     let position = match position {
-        Position::Auto { preference } => {
-            let side = if available(preference) >= 0.0 {
-                preference
-            } else {
-                [Side::Top, Side::Left, Side::Right, Side::Bottom]
-                    .into_iter()
-                    .max_by(|a, b| available(*a).total_cmp(&available(*b)))
-                    .unwrap_or_default()
-            };
-            side.position()
-        }
+        Position::Auto { .. } => position,
         position if snap_within_viewport => {
             let side = match position {
                 Position::Top | Position::TopLeft | Position::TopRight => Some(Side::Top),
@@ -796,7 +844,7 @@ fn resolve_tooltip_bounds(
             };
 
             if side.is_some_and(|side| {
-                available(side) < 0.0 && available(side.opposite()) > available(side)
+                available(side) < 0.0 && available(opposite(side)) > available(side)
             }) {
                 match position {
                     Position::Top => Position::Bottom,
@@ -816,14 +864,27 @@ fn resolve_tooltip_bounds(
         position => position,
     };
 
-    let x_center = anchor.x + (anchor.width - content.width) / 2.0;
-    let y_center = anchor.y + (anchor.height - content.height) / 2.0;
-    // Corners align the content edge, not the outer padded box.
+    let shared_position = match position {
+        Position::Auto { preference } => Some(iced::widget::overlay::Position::Auto { preference }),
+        Position::Top => Some(iced::widget::overlay::Position::Top),
+        Position::Bottom => Some(iced::widget::overlay::Position::Bottom),
+        Position::Left => Some(iced::widget::overlay::Position::Left),
+        Position::Right => Some(iced::widget::overlay::Position::Right),
+        _ => None,
+    };
+    if let Some(position) = shared_position {
+        return position.resolve(
+            anchor,
+            popup,
+            gap,
+            cursor_position,
+            viewport,
+            snap_within_viewport,
+        );
+    }
+
+    // Corners align the content edge, and FollowCursor retains its padding offset.
     let offset = match position {
-        Position::Top => Point::new(x_center, anchor.y - content.height - gap - padding),
-        Position::Bottom => Point::new(x_center, anchor.y + anchor.height + gap + padding),
-        Position::Left => Point::new(anchor.x - content.width - gap - padding, y_center),
-        Position::Right => Point::new(anchor.x + anchor.width + gap + padding, y_center),
         Position::FollowCursor => Point::new(cursor_position.x, cursor_position.y - content.height),
         Position::TopRight => Point::new(
             anchor.x + anchor.width - content.width,
@@ -835,7 +896,11 @@ fn resolve_tooltip_bounds(
             anchor.y + anchor.height + gap + padding,
         ),
         Position::BottomLeft => Point::new(anchor.x, anchor.y + anchor.height + gap + padding),
-        Position::Auto { .. } => unreachable!(),
+        Position::Auto { .. }
+        | Position::Top
+        | Position::Bottom
+        | Position::Left
+        | Position::Right => unreachable!(),
     };
 
     let mut bounds = Rectangle {
@@ -1169,6 +1234,8 @@ where
     tooltip_state: &'b mut Mode,
     positioning: Position,
     open: Open,
+    on_open: Option<&'b (dyn Fn() -> Message + 'a)>,
+    on_close: Option<&'b (dyn Fn() -> Message + 'a)>,
     class: &'b Theme::Class<'a>,
     window: Size,
 }
@@ -1238,6 +1305,15 @@ where
             let is_idle = matches!(*state, Mode::Idle { .. });
 
             if was_idle != is_idle {
+                let notification = if was_idle {
+                    self.on_open
+                } else {
+                    self.on_close
+                };
+                if let Some(notification) = notification {
+                    shell.publish(notification());
+                }
+
                 shell.invalidate_overlay();
                 shell.request_redraw();
             } else if self.positioning == Position::FollowCursor && *state != previous_state {
@@ -1403,7 +1479,7 @@ mod tests {
         )
     }
 
-    fn tree_for(tooltip: &mut Tooltip<'_, (), Theme, ()>) -> widget::Tree {
+    fn tree_for<Message>(tooltip: &mut Tooltip<'_, Message, Theme, ()>) -> widget::Tree {
         let mut tree = widget::Tree::new(tooltip);
         tree.diff(tooltip);
         tooltip.layout(
@@ -1550,11 +1626,20 @@ mod tests {
         event: &Event,
         cursor: mouse::Cursor,
     ) -> event::Status {
+        dispatch_event_with_bus(tooltip, tree, event, cursor, &mut Bus::new())
+    }
+
+    fn dispatch_event_with_bus<Message>(
+        tooltip: &mut Tooltip<'_, Message, Theme, ()>,
+        tree: &mut widget::Tree,
+        event: &Event,
+        cursor: mouse::Cursor,
+        bus: &mut Bus<Message>,
+    ) -> event::Status {
         let window = Size::new(200.0, 100.0);
         let viewport = Rectangle::with_size(window);
         let layout = Layout::new(tree.size);
-        let mut bus = Bus::new();
-        let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), bus);
         let overlays = tooltip.overlay(tree, layout, &(), &viewport, Vector::ZERO, window);
         let mut group = overlay::Group::new(overlays);
         group.update(event, cursor, &(), &mut shell);
@@ -1568,6 +1653,303 @@ mod tests {
             tooltip.update(tree, event, layout, base_cursor, &(), &mut shell, &viewport);
         }
         shell.event_status()
+    }
+
+    #[test]
+    fn pointer_triggers_capture_only_their_button_over_enabled_content() {
+        for open in [Open::Hovered, Open::LeftPointer, Open::RightPointer] {
+            for disabled in [false, true] {
+                for opened in [false, true] {
+                    for position in [Point::new(10.0, 10.0), Point::new(190.0, 90.0)] {
+                        for button in [
+                            mouse::Button::Left,
+                            mouse::Button::Right,
+                            mouse::Button::Middle,
+                        ] {
+                            for event in [
+                                mouse::Event::ButtonPressed(button),
+                                mouse::Event::ButtonReleased(button),
+                            ] {
+                                let mut tooltip = test_widget()
+                                    .open(open)
+                                    .disable(disabled)
+                                    .position(Position::Bottom);
+                                let mut tree = tree_for(&mut tooltip);
+                                if opened {
+                                    tree.state.downcast_mut::<State>().mode = Mode::Opened {
+                                        cursor_position: Point::new(10.0, 10.0),
+                                        over_overlay: false,
+                                    };
+                                }
+                                let expected = if !disabled
+                                    && position.x == 10.0
+                                    && matches!(
+                                        (open, button),
+                                        (Open::LeftPointer, mouse::Button::Left)
+                                            | (Open::RightPointer, mouse::Button::Right)
+                                    ) {
+                                    event::Status::Captured
+                                } else {
+                                    event::Status::Ignored
+                                };
+                                assert_eq!(
+                                    dispatch_event(
+                                        &mut tooltip,
+                                        &mut tree,
+                                        &Event::Mouse(event),
+                                        mouse::Cursor::Available(position),
+                                    ),
+                                    expected,
+                                    "{open:?}, disabled = {disabled}, opened = {opened}, {position:?}, {event:?}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn touch_trigger_capture_uses_finger_bounds_and_only_left_pointer() {
+        for open in [Open::Hovered, Open::LeftPointer, Open::RightPointer] {
+            for disabled in [false, true] {
+                for position in [Point::new(10.0, 10.0), Point::new(190.0, 90.0)] {
+                    for touch in [
+                        touch::Event::FingerPressed {
+                            id: touch::Finger(1),
+                            position,
+                        },
+                        touch::Event::FingerLifted {
+                            id: touch::Finger(1),
+                            position,
+                        },
+                        touch::Event::FingerLost {
+                            id: touch::Finger(1),
+                            position,
+                        },
+                        touch::Event::FingerMoved {
+                            id: touch::Finger(1),
+                            position,
+                        },
+                    ] {
+                        let mut tooltip = test_widget().open(open).disable(disabled);
+                        let mut tree = tree_for(&mut tooltip);
+                        let expected = if open == Open::LeftPointer
+                            && !disabled
+                            && position.x == 10.0
+                            && !matches!(touch, touch::Event::FingerMoved { .. })
+                        {
+                            event::Status::Captured
+                        } else {
+                            event::Status::Ignored
+                        };
+                        assert_eq!(
+                            dispatch_event(
+                                &mut tooltip,
+                                &mut tree,
+                                &Event::Touch(touch),
+                                mouse::Cursor::Unavailable,
+                            ),
+                            expected,
+                            "{open:?}, disabled = {disabled}, {touch:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Notification {
+        Opened,
+        Closed,
+    }
+
+    fn notifying_widget(open: Open) -> Tooltip<'static, Notification, Theme, ()> {
+        Tooltip::new(
+            Space::new().width(80).height(30),
+            Space::new().width(40).height(20),
+        )
+        .open(open)
+        .position(Position::Bottom)
+        .on_open(Notification::Opened)
+        .on_close(Notification::Closed)
+    }
+
+    #[test]
+    fn hover_notifications_publish_once_per_open_and_close() {
+        let mut tooltip = notifying_widget(Open::Hovered);
+        let mut tree = tree_for(&mut tooltip);
+        let mut bus = Bus::new();
+        for (position, expected) in [
+            (Point::new(10.0, 10.0), vec![Notification::Opened]),
+            (Point::new(20.0, 10.0), vec![]),
+            (Point::new(30.0, 40.0), vec![]),
+            (Point::new(190.0, 90.0), vec![Notification::Closed]),
+            (Point::new(190.0, 90.0), vec![]),
+            (Point::new(10.0, 10.0), vec![Notification::Opened]),
+        ] {
+            dispatch_event_with_bus(
+                &mut tooltip,
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position }),
+                mouse::Cursor::Available(position),
+                &mut bus,
+            );
+            assert_eq!(
+                bus.drain().map(|(message, _)| message).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_notifications_publish_once_and_close_on_an_outside_press() {
+        for (open, button) in [
+            (Open::LeftPointer, mouse::Button::Left),
+            (Open::RightPointer, mouse::Button::Right),
+        ] {
+            let mut tooltip = notifying_widget(open);
+            let mut tree = tree_for(&mut tooltip);
+            let mut bus = Bus::new();
+            let inside = Point::new(10.0, 10.0);
+            let outside = Point::new(190.0, 90.0);
+            for (event, position, expected) in [
+                (mouse::Event::ButtonPressed(button), inside, vec![]),
+                (
+                    mouse::Event::ButtonReleased(button),
+                    inside,
+                    vec![Notification::Opened],
+                ),
+                (mouse::Event::ButtonReleased(button), inside, vec![]),
+                (
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    Point::new(30.0, 40.0),
+                    vec![],
+                ),
+                (
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    outside,
+                    vec![Notification::Closed],
+                ),
+                (
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    outside,
+                    vec![],
+                ),
+                (
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                    outside,
+                    vec![],
+                ),
+            ] {
+                dispatch_event_with_bus(
+                    &mut tooltip,
+                    &mut tree,
+                    &Event::Mouse(event),
+                    mouse::Cursor::Available(position),
+                    &mut bus,
+                );
+                assert_eq!(
+                    bus.drain().map(|(message, _)| message).collect::<Vec<_>>(),
+                    expected,
+                    "{open:?}, {event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_hover_notifies_only_when_opened() {
+        let delay = Duration::from_secs(60);
+        let mut tooltip = notifying_widget(Open::Hovered).delay(delay);
+        let mut tree = tree_for(&mut tooltip);
+        let mut bus = Bus::new();
+        let position = Point::new(10.0, 10.0);
+        dispatch_event_with_bus(
+            &mut tooltip,
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved { position }),
+            mouse::Cursor::Available(position),
+            &mut bus,
+        );
+        assert!(bus.is_empty());
+        tree.state.downcast_mut::<State>().mode = Mode::Idle {
+            pressed: false,
+            hovered_at: Some(Instant::now() - delay),
+        };
+        for _ in 0..2 {
+            dispatch_event_with_bus(
+                &mut tooltip,
+                &mut tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                mouse::Cursor::Available(position),
+                &mut bus,
+            );
+        }
+        assert_eq!(
+            bus.into_iter().collect::<Vec<_>>(),
+            vec![Notification::Opened]
+        );
+    }
+
+    #[test]
+    fn programmatic_close_does_not_publish_a_close_notification() {
+        for close_all in [false, true] {
+            let id = Id::new("notification-tooltip");
+            let mut tooltip = notifying_widget(Open::LeftPointer).id(id.clone());
+            let mut tree = tree_for(&mut tooltip);
+            tree.state.downcast_mut::<State>().mode = Mode::Opened {
+                cursor_position: Point::new(10.0, 10.0),
+                over_overlay: false,
+            };
+            let layout = Layout::new(tree.size);
+            let viewport = Rectangle::with_size(Size::new(200.0, 100.0));
+            if close_all {
+                tooltip.operate(
+                    &mut tree,
+                    layout,
+                    &viewport,
+                    &(),
+                    &mut close_all_operation::<()>(),
+                );
+            } else {
+                tooltip.operate(
+                    &mut tree,
+                    layout,
+                    &viewport,
+                    &(),
+                    &mut close_operation::<()>(id),
+                );
+            }
+            let mut bus = Bus::new();
+            dispatch_event_with_bus(
+                &mut tooltip,
+                &mut tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                mouse::Cursor::Unavailable,
+                &mut bus,
+            );
+            assert_eq!(tree.state.downcast_ref::<State>().mode, Mode::default());
+            assert!(bus.is_empty());
+        }
+    }
+
+    #[test]
+    fn widget_does_not_require_clone_messages_without_notifications() {
+        struct NonClone;
+
+        let mut tooltip: Tooltip<'_, NonClone, Theme, ()> =
+            Tooltip::new(Space::new(), Space::new());
+        let mut tree = tree_for(&mut tooltip);
+        dispatch_event_with_bus(
+            &mut tooltip,
+            &mut tree,
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            mouse::Cursor::Unavailable,
+            &mut Bus::new(),
+        );
     }
 
     #[test]
