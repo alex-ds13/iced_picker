@@ -6,6 +6,10 @@ use iced::{
     widget::{Action, Component, Id, button, column, container, sensor, space},
 };
 
+// The v2 candidate stays private and test-only until it replaces this widget.
+#[cfg(all(test, debug_assertions))]
+mod v2;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Status {
     pub button: button::Status,
