@@ -2193,14 +2193,13 @@ where
             self.state.clear();
         } else if matches!(
             event,
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                | Event::Touch(touch::Event::FingerLifted { .. })
-                | Event::Touch(touch::Event::FingerLost { .. })
-                | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 | Event::Touch(touch::Event::FingerPressed { .. })
         ) && !cursor.is_over(layout.bounds())
         {
-            // Clicked outside of bounds so lets send the `on_cancel` message to close the picker
+            // Only presses count as clicks outside. A release outside ends a press that began
+            // inside (iced's button no longer captures releases), or one that predates the
+            // overlay, and neither should close the picker.
             shell.publish(self.on_cancel.clone());
             shell.capture_event();
             self.state.clear();

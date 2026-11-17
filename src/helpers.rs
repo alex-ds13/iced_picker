@@ -58,8 +58,8 @@ pub fn tip<'a, Message: 'a>(
                 text_color: Some(Color::WHITE),
                 ..container::rounded_box(t)
             }),
-        tooltip::Position::Bottom,
     )
+    .position(tooltip::Position::Bottom)
     .gap(5)
     .delay(iced::time::milliseconds(350))
 }
