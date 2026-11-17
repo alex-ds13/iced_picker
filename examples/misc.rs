@@ -112,7 +112,7 @@ impl App {
 
     fn view(&self) -> impl Widget<Message> {
         let amount_row = row![
-            text("Amount:").width(100),
+            text("Amount:").width(100).selectable(true),
             NumberInput::new("0.00", self.amount)
                 .on_input(Message::AmountChanged)
                 .min(0.0_f64)
@@ -122,7 +122,7 @@ impl App {
         .align_y(Center);
 
         let formatted_row = row![
-            text("Formatted:").width(100),
+            text("Formatted:").width(100).selectable(true),
             TextInput::new("0.00 €", format!("{:.2} €", self.amount))
                 .padding([0, 5])
                 .line_height(1.85)
@@ -136,18 +136,21 @@ impl App {
         let last_action = text(match &self.last_action {
             Some(s) => format!("Last action: {s}"),
             None => "No action yet".into(),
-        });
+        })
+        .selectable(true);
 
         let content = column![
-            text("Number Input + Formatted TextInput").size(18),
+            text("Number Input + Formatted TextInput")
+                .size(18)
+                .selectable(true),
             amount_row,
             formatted_row,
             iced::widget::rule::horizontal(1.0),
-            text("Modal").size(18),
+            text("Modal").size(18).selectable(true),
             modal_btn,
             last_action,
             iced::widget::rule::horizontal(1.0),
-            text("Save with Dropdown").size(18),
+            text("Save with Dropdown").size(18).selectable(true),
             save_buttons_row(self.save_priority),
         ]
         .spacing(12)
@@ -156,8 +159,8 @@ impl App {
 
         let modal_content = container(
             column![
-                text("Are you sure?").size(20),
-                text(format!("Save with amount: {:.2} €", self.amount)),
+                text("Are you sure?").size(20).selectable(true),
+                text(format!("Save with amount: {:.2} €", self.amount)).selectable(true),
                 row![
                     button("Cancel")
                         .on_press(Message::CloseModal)
