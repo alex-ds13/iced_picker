@@ -444,12 +444,20 @@ impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
         }
 
         if state.heights.len() != self.items.len() {
-            state.heights = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| (idx, ElementHeight::unknown()))
-                .collect();
+            // Measured heights survive a change in length. Resetting them to the estimate
+            // would resize every placeholder above the viewport and make the view jump. The
+            // heights are keyed by index, so past the changed position they describe a
+            // neighbor, which is still much closer than the estimate and is corrected once
+            // the item is shown again.
+            let len = self.items.len();
+            state.heights.retain(|&idx, _| idx < len);
+            state.visible.retain(|&idx| idx < len);
+            for idx in 0..len {
+                state
+                    .heights
+                    .entry(idx)
+                    .or_insert_with(ElementHeight::unknown);
+            }
         }
 
         if self.filtered_ids != state.filtered_ids {
@@ -535,5 +543,27 @@ mod tests {
 
         state.heights.get_mut(&1).unwrap().unselected(20.0);
         assert_eq!(list.offset(&state, 3), 120.0);
+    }
+
+    #[test]
+    fn measured_heights_survive_a_change_in_length() {
+        let view = |_, _, _| space::horizontal();
+        let mut list = ListView::<_, ()>::new(0..10, view).estimated_item_height(50.0);
+        let mut state = State::default();
+        list.diff(&mut state);
+        for idx in 0..10 {
+            state.heights.get_mut(&idx).unwrap().unselected(20.0);
+        }
+        state.visible.extend([8, 9]);
+
+        let mut shorter = ListView::<_, ()>::new(0..9, view).estimated_item_height(50.0);
+        shorter.diff(&mut state);
+        assert_eq!(shorter.offset(&state, 5), 100.0);
+        assert_eq!(state.heights.len(), 9);
+        assert!(!state.visible.contains(&9));
+
+        let mut longer = ListView::<_, ()>::new(0..11, view).estimated_item_height(50.0);
+        longer.diff(&mut state);
+        assert_eq!(longer.offset(&state, 10), 9.0 * 20.0 + 50.0);
     }
 }
