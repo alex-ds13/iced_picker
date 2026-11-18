@@ -1,7 +1,7 @@
 //! The window: the items that exist as widgets, kept in the tree by key, and the
 //! walk that chooses them.
 
-use super::geometry::{Geometry, Settings, Span, Visible};
+use super::geometry::{Geometry, Settings, Span, Target, Visible};
 use super::heights::Recorded;
 use super::model::{Model, Rebuilt};
 use super::{Catalog, ListView};
@@ -24,8 +24,8 @@ pub(super) struct Core<K> {
     pub(super) geometry: Geometry,
     /// Sorted by position and aligned with the tree's children and the widget's rows.
     pub(super) window: Vec<Slot<K>>,
-    /// The pinned item. Its target content y is in the geometry.
-    pub(super) anchor: Option<K>,
+    /// What the anchor pins. Its target content y is in the geometry.
+    pub(super) anchor: Option<Anchor<K>>,
     /// The key and position of the item drawn as hovered by the last draw. A cursor
     /// event that hovers another item requests a redraw. The position tells apart
     /// items with the same key.
@@ -33,6 +33,15 @@ pub(super) struct Core<K> {
     /// Every walk, for the tests.
     #[cfg(test)]
     pub(super) walks: Vec<Walk>,
+}
+
+/// The anchor (section 4.4), with its target y kept by the geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Anchor<K> {
+    /// The top of the first item with this key.
+    Item(K),
+    /// The bottom of the last item, while the visible region reaches it.
+    End,
 }
 
 /// An item of the window.
@@ -55,6 +64,19 @@ pub(super) struct Walk {
     pub(super) evicted: usize,
     /// Rows built and dropped by the same walk, which is wasted work.
     pub(super) discarded: usize,
+    /// The walk ran inside a redraw with cached limits, not in a full layout.
+    pub(super) local: bool,
+}
+
+/// What a redraw needs from the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Redraw {
+    /// The window covers the visible region.
+    Idle,
+    /// The window must change, and nothing else did: a local walk may do it.
+    Shift,
+    /// Root layout, for every pass of this redraw.
+    Full,
 }
 
 impl<K: Clone + Eq + Hash> Core<K> {
@@ -70,15 +92,16 @@ impl<K: Clone + Eq + Hash> Core<K> {
         }
     }
 
-    pub(super) fn anchor_position(&self) -> Option<usize> {
-        self.anchor
-            .as_ref()
-            .and_then(|key| self.model.position(key))
+    pub(super) fn anchor_target(&self) -> Option<Target> {
+        match self.anchor.as_ref()? {
+            Anchor::Item(key) => self.model.position(key).map(Target::Row),
+            Anchor::End => Some(Target::End),
+        }
     }
 
     /// Rule A against the current anchor.
     pub(super) fn absorb(&mut self) {
-        let anchor = self.anchor_position();
+        let anchor = self.anchor_target();
         self.geometry.absorb(anchor);
     }
 
@@ -91,10 +114,15 @@ impl<K: Clone + Eq + Hash> Core<K> {
     }
 
     /// Applies the builder settings, keeping the anchor in place when they move it.
-    pub(super) fn configure(&mut self, settings: Settings) {
-        if self.geometry.configure(settings) {
+    /// Returns whether they changed.
+    pub(super) fn configure(&mut self, settings: Settings) -> bool {
+        let changed = self.geometry.configure(settings);
+
+        if changed {
             self.absorb();
         }
+
+        changed
     }
 
     /// Follows a structural change of the keys (section 4.2): keeps the window rows
@@ -122,11 +150,13 @@ impl<K: Clone + Eq + Hash> Core<K> {
         kept.sort_by_key(|(slot, _)| slot.position);
         (self.window, *children) = kept.into_iter().unzip();
 
-        if let Some(anchor) = &self.anchor
+        if let Some(Anchor::Item(anchor)) = &self.anchor
             && self.model.position(anchor).is_none()
         {
             match rebuilt.survivor(anchor) {
-                Some(position) => self.anchor = Some(self.model.key(position).clone()),
+                Some(position) => {
+                    self.anchor = Some(Anchor::Item(self.model.key(position).clone()));
+                }
                 None => {
                     // Nothing that was shown remains, so there is no content to keep
                     // still. Folding the drift also keeps an empty list at the height
@@ -138,16 +168,50 @@ impl<K: Clone + Eq + Hash> Core<K> {
             }
         }
 
+        // An end pin has nothing to keep in an empty list, which is as tall as its
+        // padding.
+        if self.model.len() == 0 && self.anchor.is_some() {
+            let drift = self.geometry.drift();
+            self.geometry.move_drift(-drift);
+            self.unpin();
+        }
+
         self.absorb();
         self.geometry.dirty = true;
     }
 
-    /// Handles a redraw at `now` with the given visible region (section 1.3, full path
-    /// only). Returns whether the list needs a new walk, which this phase does with a
-    /// root layout.
-    pub(super) fn redraw(&mut self, visible: Visible, now: Instant) -> bool {
+    /// Handles a redraw at `now` with the given visible region (section 1.3).
+    ///
+    /// [`Redraw::Full`] marks the whole redraw for root layout, so its retries with
+    /// the same timestamp stay on the full path: after a change made outside the
+    /// redraw, with no current layout or cached limits, and for rules Z and S.
+    pub(super) fn redraw(&mut self, visible: Visible, now: Instant) -> Redraw {
+        if mem::take(&mut self.geometry.block_next_redraw) {
+            self.geometry.full_frame = Some(now);
+        }
+
+        let redraw = self.decide(visible, now);
+
+        if redraw == Redraw::Full {
+            self.geometry.full(now);
+        }
+
+        redraw
+    }
+
+    fn decide(&mut self, visible: Visible, now: Instant) -> Redraw {
         let previous = self.geometry.visible.replace(visible);
-        let laid_out = !self.geometry.dirty && self.geometry.laid_out.is_some();
+        let current = !self.geometry.dirty
+            && self.geometry.laid_out.is_some()
+            && self.geometry.local.is_some();
+
+        let shift = |core: &Self| {
+            if core.geometry.needs_walk(visible, core.span()) {
+                Redraw::Shift
+            } else {
+                Redraw::Idle
+            }
+        };
 
         if visible.at_start() {
             // Rule Z. It applies before the list is laid out too, so I1 holds at the
@@ -155,11 +219,15 @@ impl<K: Clone + Eq + Hash> Core<K> {
             let moved = self.geometry.zero_drift();
             self.unpin();
 
-            return moved || !laid_out || self.geometry.needs_walk(visible, self.span());
+            return if moved || !current {
+                Redraw::Full
+            } else {
+                shift(self)
+            };
         }
 
-        if !laid_out {
-            return true;
+        if !current {
+            return Redraw::Full;
         }
 
         // Rule S, before any coverage work. Rule M moved the old anchor's target with
@@ -171,38 +239,80 @@ impl<K: Clone + Eq + Hash> Core<K> {
             && self.geometry.shrink(previous.top, visible.top, now)
         {
             self.pin_first_visible(visible);
-            return true;
+            return Redraw::Full;
         }
 
+        // The refresh moves no content, so a local walk may follow it.
         self.pin_first_visible(visible);
-        self.geometry.needs_walk(visible, self.span())
+        shift(self)
     }
 
-    /// The anchor refresh: pins the first item whose bottom is below the visible top.
+    /// The anchor refresh: pins the end of the list while the visible region reaches
+    /// it, else the first item whose bottom is below the visible top.
     ///
-    /// The anchor is found again through its key, which leads to the key's first
+    /// At the end, the visible items are kept still from below. Measuring them then
+    /// moves the content above, out of view, and the list's height stays as it is, so
+    /// the parent scrollable never has to clamp its translation against a list that
+    /// keeps getting shorter. Pinning the first visible item there instead would move
+    /// the end, and with it the largest translation, on every pass.
+    ///
+    /// An item is found again through its key, which leads to the key's first
     /// position. A later duplicate is skipped for the next first occurrence, else the
     /// last one before it, so a position is never paired with another one's target.
     /// This scans the run of duplicates around the visible top.
     pub(super) fn pin_first_visible(&mut self, visible: Visible) {
-        let Some(first) = self.geometry.first_visible(visible.top) else {
-            self.unpin();
+        if self
+            .geometry
+            .end_visible(visible, self.anchor == Some(Anchor::End))
+        {
+            self.anchor = Some(Anchor::End);
+            self.geometry.pin(Target::End);
             return;
-        };
+        }
 
-        let owner =
-            |position: usize| self.model.position(self.model.key(position)) == Some(position);
-        let position = (first..self.model.len())
-            .find(|&position| owner(position))
-            .or_else(|| (0..first).rev().find(|&position| owner(position)));
-
-        match position {
+        match self.first_visible_owner(visible.top) {
             Some(position) => {
-                self.anchor = Some(self.model.key(position).clone());
-                self.geometry.pin(position);
+                self.anchor = Some(Anchor::Item(self.model.key(position).clone()));
+                self.geometry.pin(Target::Row(position));
             }
             None => self.unpin(),
         }
+    }
+
+    /// The first visible item that is its key's first occurrence, else the last one
+    /// before it.
+    fn first_visible_owner(&self, top: f64) -> Option<usize> {
+        let first = self.geometry.first_visible(top)?;
+
+        let owner =
+            |position: usize| self.model.position(self.model.key(position)) == Some(position);
+
+        (first..self.model.len())
+            .find(|&position| owner(position))
+            .or_else(|| (0..first).rev().find(|&position| owner(position)))
+    }
+
+    /// The item pin that replaces an end pin when the keys change: the first visible
+    /// item, where it is now.
+    ///
+    /// Structural changes keep the visible surviving items still, wherever the
+    /// change is. An end pin would instead follow the new sequence's end, so an
+    /// appended item would push the visible items up, and unrelated new items would
+    /// keep the old end. The caller pins this before reconciling, the keyed path then
+    /// hands it to a survivor or folds the drift, and the next refresh pins the end
+    /// again if it is still in view.
+    pub(super) fn end_as_item(&self) -> Option<(K, f64)> {
+        if self.anchor != Some(Anchor::End) {
+            return None;
+        }
+
+        let visible = self.geometry.visible?;
+        let position = self.first_visible_owner(visible.top)?;
+
+        Some((
+            self.model.key(position).clone(),
+            self.geometry.content_y(position),
+        ))
     }
 
     pub(super) fn unpin(&mut self) {
@@ -223,8 +333,8 @@ impl<K: Clone + Eq + Hash> Core<K> {
         debug_assert_eq!(self.anchor.is_some(), geometry.anchor_y().is_some());
 
         if let Some(target) = geometry.anchor_y() {
-            let position = self.anchor_position().expect("the anchor key is present");
-            let error = geometry.content_y(position) - target;
+            let anchor = self.anchor_target().expect("the anchor key is present");
+            let error = geometry.target_y(anchor) - target;
             debug_assert!(error.abs() < 1.0e-3, "I2: anchor off its target by {error}");
         } else {
             debug_assert_eq!(geometry.drift(), 0.0, "drift without an anchor");
@@ -256,7 +366,8 @@ where
     /// a time until the visible region of the last redraw and the anticipation are
     /// covered by measured heights, evicts once and places the rows.
     ///
-    /// `limits` are the item limits. `x` is the left edge of the rows.
+    /// `limits` are the item limits. `x` is the left edge of the rows. `local` tells
+    /// a walk inside a redraw from one in a full layout. Both walk the same way.
     pub(super) fn sync(
         &mut self,
         core: &mut Core<K>,
@@ -264,6 +375,7 @@ where
         renderer: &Renderer,
         limits: &Limits,
         x: f32,
+        local: bool,
     ) -> Walk {
         let visible = core.geometry.visible.unwrap_or(Visible::GUESS);
 
@@ -277,7 +389,10 @@ where
             limits: *limits,
             fresh: Vec::new(),
             new: Vec::new(),
-            walk: Walk::default(),
+            walk: Walk {
+                local,
+                ..Walk::default()
+            },
             _widget: PhantomData,
         };
 
@@ -358,23 +473,28 @@ where
             // anchor itself) can move it out of the visible region, and rows measured
             // between it and the viewport would then push the visible rows away while
             // the walk follows them. So it is refreshed on the current geometry, which
-            // changes no drift. P4's instant scroll pins the destination's first row
-            // for the viewport after the jump, which the stored visible region does
-            // not show yet. That pin must be marked on the anchor and left alone here
-            // until the next laid-out redraw refreshes it.
-            if !visible.at_start() && !self.anchor_covers(visible) {
+            // changes no drift. The same happens when the end of the list comes into
+            // view, so the end is pinned before measurements shorten the list any more.
+            // P4's instant scroll pins the destination's first row for the viewport
+            // after the jump, which the stored visible region does not show yet. That
+            // pin must be marked on the anchor and left alone here until the next
+            // laid-out redraw refreshes it.
+            // Only a re-pin that changes the anchor counts. A refresh that picks the
+            // same anchor again, as when no item covers an empty visible region, must
+            // not keep the walk going.
+            let mut repinned = false;
+
+            if !visible.at_start() && self.stale_anchor(visible) {
+                let before = (self.core.anchor.clone(), self.core.geometry.anchor_y());
                 self.core.pin_first_visible(visible);
+                repinned = before != (self.core.anchor.clone(), self.core.geometry.anchor_y());
             }
 
-            let first = self.core.geometry.first_row(visible);
-            self.ensure(first);
-
-            let mut last = first;
-
-            while last + 1 < len && self.core.geometry.starts_before(last + 1, visible) {
-                last += 1;
-                self.ensure(last);
-            }
+            let (first, last) = if self.core.anchor == Some(Anchor::End) {
+                self.cover_up(visible)
+            } else {
+                self.cover_down(visible)
+            };
 
             for position in last + 1..len.min(last + 1 + anticipate) {
                 self.ensure(position);
@@ -384,7 +504,7 @@ where
                 self.ensure(position);
             }
 
-            if range == Some((first, last)) {
+            if range == Some((first, last)) && !repinned {
                 break (first, last);
             }
 
@@ -413,10 +533,73 @@ where
         retain(self.children, &keep);
     }
 
-    fn anchor_covers(&self, visible: Visible) -> bool {
-        self.core
-            .anchor_position()
-            .is_some_and(|position| self.core.geometry.covers(position, visible))
+    /// Covers `visible` from the first visible row down, adding each next row while it
+    /// starts above the visible bottom. Returns the first and last rows.
+    fn cover_down(&mut self, visible: Visible) -> (usize, usize) {
+        let len = self.core.model.len();
+        let first = self.core.geometry.first_row(visible);
+        self.ensure(first);
+
+        let mut last = first;
+
+        while last + 1 < len && self.core.geometry.starts_before(last + 1, visible) {
+            last += 1;
+            self.ensure(last);
+        }
+
+        (first, last)
+    }
+
+    /// Covers `visible` from the pinned end up, adding each previous row while it ends
+    /// below the visible top. Returns the first and last rows.
+    ///
+    /// With the end pinned, a measured row moves only the rows above it. Walking up
+    /// from the end therefore stops as soon as real heights cover the top, whether
+    /// the rows grow or shrink, and keeps every row it builds. Walking down instead
+    /// would measure every row the estimates put in view, because each one that grows
+    /// pushes the rows before it up and out.
+    fn cover_up(&mut self, visible: Visible) -> (usize, usize) {
+        // The last row starting above the visible bottom, as coverage counts it. The
+        // rows after it, between it and the pinned end, are empty and not visible.
+        let geometry = &self.core.geometry;
+        let mut last = geometry
+            .heights
+            .position_before(visible.bottom() - geometry.base());
+
+        loop {
+            self.ensure(last);
+
+            // Measuring it moves only the rows above it. If it turned out empty at
+            // the bottom, the one before it is the last visible one.
+            if last == 0 || self.core.geometry.starts_before(last, visible) {
+                break;
+            }
+
+            last -= 1;
+        }
+
+        let mut first = last;
+
+        while first > 0 && self.core.geometry.bottom_of(first - 1) > visible.top {
+            first -= 1;
+            self.ensure(first);
+        }
+
+        (first, last)
+    }
+
+    /// Whether the anchor no longer is what a refresh would pick: the end while it is
+    /// visible, else an item covering visible content.
+    fn stale_anchor(&self, visible: Visible) -> bool {
+        let geometry = &self.core.geometry;
+
+        match self.core.anchor_target() {
+            _ if geometry.end_visible(visible, self.core.anchor == Some(Anchor::End)) => {
+                self.core.anchor != Some(Anchor::End)
+            }
+            Some(Target::Row(position)) => !geometry.covers(position, visible),
+            Some(Target::End) | None => true,
+        }
     }
 
     /// Lays out the window row at `index` once per walk and records its height.

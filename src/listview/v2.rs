@@ -10,6 +10,7 @@
 
 mod geometry;
 mod heights;
+mod local;
 mod model;
 mod style;
 mod window;
@@ -19,16 +20,19 @@ mod tests;
 
 pub use style::{Catalog, Status, Style, StyleFn, default};
 
-use geometry::{Settings, Visible};
+use geometry::Settings;
+use local::LocalLayout;
 use window::{Core, Slot};
 
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::mem;
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
+use iced::advanced::shell::Invalidation;
 use iced::advanced::widget::{Id, Meta, Operation, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::{Background, Color, Event, Length, Padding, Pixels, Rectangle, Size, Vector, mouse};
@@ -297,7 +301,11 @@ where
         } = tree;
         let core = state.downcast_mut::<Core<K>>();
 
-        core.configure(self.settings());
+        // A new widget may bring new limits or settings. Only a full layout caches
+        // them again.
+        core.geometry.local = None;
+
+        let configured = core.configure(self.settings());
 
         let keys = self
             .items
@@ -305,8 +313,21 @@ where
             .enumerate()
             .map(|(index, item)| (self.key)(index, item));
 
-        if let Some(rebuilt) = core.model.reconcile(keys, &mut core.geometry.heights) {
-            core.restructure(&rebuilt, children);
+        // Taken from the geometry before the keys change it.
+        let end_as_item = core.end_as_item();
+        let rebuilt = core.model.reconcile(keys, &mut core.geometry.heights);
+
+        if let Some(rebuilt) = &rebuilt {
+            if let Some((key, y)) = end_as_item {
+                core.anchor = Some(window::Anchor::Item(key));
+                core.geometry.pin_at(y);
+            }
+
+            core.restructure(rebuilt, children);
+        }
+
+        if configured || rebuilt.is_some() {
+            core.geometry.block_next_redraw = true;
         }
 
         self.rows = core
@@ -322,7 +343,8 @@ where
 
     fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
         let width = self.resolve_width(limits);
-        let limits = item_limits((width - self.padding.x()).max(0.0), limits);
+        let content = (width - self.padding.x()).max(0.0);
+        let item_limits = item_limits(content, limits);
 
         let Tree {
             state,
@@ -332,9 +354,34 @@ where
         } = tree;
         let core = state.downcast_mut::<Core<K>>();
 
-        let _ = self.sync(core, children, renderer, &limits, self.padding.left);
+        let before = core.geometry.snapshot();
+        let walk = self.sync(
+            core,
+            children,
+            renderer,
+            &item_limits,
+            self.padding.left,
+            false,
+        );
 
         *size = Size::new(width, core.geometry.total().max(0.0) as f32);
+
+        // A geometry change found outside a redraw (a message, a task) keeps the next
+        // redraw on the full path. A full layout never clears that block.
+        let geometry = &mut core.geometry;
+        let in_redraw = mem::take(&mut geometry.redraw_layout);
+
+        if !in_redraw && (walk.changed > 0 || geometry.snapshot() != before) {
+            geometry.block_next_redraw = true;
+        }
+
+        geometry.local = Some(LocalLayout {
+            limits: *limits,
+            size: *size,
+            sizing: self.size(),
+            width: content,
+            settings: self.settings(),
+        });
     }
 
     fn update(
@@ -347,20 +394,34 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Window(iced::window::Event::RedrawRequested(now)) = event {
-            let core = tree.state.downcast_mut::<Core<K>>();
+        let redraw = match event {
+            Event::Window(iced::window::Event::RedrawRequested(now)) => Some(*now),
+            _ => None,
+        };
 
-            if core.redraw(Visible::new(*viewport, layout.bounds()), *now) {
-                shell.invalidate_layout();
-            }
+        if let Some(now) = redraw {
+            self.redraw(tree, layout, renderer, shell, viewport, now);
         }
 
+        // The child layouts come from the trees as they are now, after any local walk,
+        // so every row of the final window gets the event once, new rows included.
         for (row, (layout, tree)) in self
             .rows
             .iter_mut()
             .zip(layout.iter_mut(&mut tree.children))
         {
             row.update(tree, event, layout, cursor, renderer, shell, viewport);
+        }
+
+        // A row that changes its geometry in the redraw asks for a root layout, which
+        // the list never downgrades. The remaining passes of the redraw stay full.
+        if let Some(now) = redraw
+            && matches!(
+                shell.invalidation(),
+                Invalidation::Layout(_) | Invalidation::Widgets
+            )
+        {
+            tree.state.downcast_mut::<Core<K>>().geometry.full(now);
         }
 
         // Compared with what the last draw showed, not with the last cursor event:

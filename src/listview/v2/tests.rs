@@ -3,19 +3,23 @@
 //! [`Harness`] plays the runtime and the shell: every redraw gets up to three update
 //! passes with the same timestamp, a Layout invalidation lays out the root and
 //! rebuilds overlays inside its pass, and the frame is drawn after the last pass even
-//! if it invalidated. Lists live in `scrollable(column![header, list, footer])`.
+//! if it invalidated, and a Widgets invalidation rebuilds the view between passes.
+//! Lists live in `scrollable(column![header, list, footer])`. "No root layout" is
+//! what the shell reports: no pass with a Layout invalidation.
 
 use super::geometry::Visible;
-use super::window::{Core, Walk};
+use super::heights::Estimate;
+use super::window::{Anchor, Core, Walk};
 use super::{Status, Style, StyleFn, list_view};
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
 use iced::advanced::layout::{self, Layout};
+use iced::advanced::overlay::Group;
 use iced::advanced::renderer;
 use iced::advanced::shell::{Bus, Diff, Invalidation, Waker};
 use iced::advanced::widget::operation::scrollable::{AbsoluteOffset, Scrollable, scroll_to};
@@ -23,10 +27,10 @@ use iced::advanced::widget::operation::{Animation, Operation};
 use iced::advanced::widget::{Id, Meta, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::time::Instant;
-use iced::widget::{column, scrollable, space, text};
+use iced::widget::{column, scrollable, space, sticky, text};
 use iced::{
     Color, Element, Event, Fill, Length, Padding, Point, Rectangle, Size, Theme, Vector,
-    Widget as _, mouse,
+    Widget as _, mouse, touch,
 };
 use iced_core::window::{self, RedrawRequest};
 
@@ -46,6 +50,13 @@ enum Height {
     Fill(f32),
     /// This area divided by the width.
     Area(f32),
+    /// `column![sticky(header), items..]`. The header's key is the item's key, and
+    /// item `i` (from 1) has key `key * 1000 + i`.
+    Group {
+        header: f32,
+        items: u32,
+        item: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -85,6 +96,18 @@ struct Log {
     overlays: RefCell<Vec<(u32, Rectangle)>>,
     statuses: RefCell<Vec<Status>>,
     key_calls: Cell<usize>,
+    /// Every redraw a row received: its key, its layout's parent and its bounds.
+    redraws: RefCell<Vec<(u32, Option<Rectangle>, Rectangle)>>,
+    /// Rows that take this height on their next redraw and ask for a root layout.
+    grow: RefCell<HashMap<u32, f32>>,
+    /// Heights rows took in a redraw, over the item's height.
+    overrides: RefCell<HashMap<u32, f32>>,
+    /// Layouts of the header and footer.
+    sibling_layouts: Cell<usize>,
+    /// The footer's bounds in the last draw.
+    footer: Cell<Option<Rectangle>>,
+    /// Invalidations the header (0) and footer (1) request on their next redraws.
+    inject: RefCell<[VecDeque<Option<Invalidation>>; 2]>,
 }
 
 impl Log {
@@ -96,6 +119,7 @@ impl Log {
         self.overlays.take();
         self.statuses.take();
         self.key_calls.take();
+        self.redraws.take();
     }
 
     fn laid_out(&self) -> Vec<u32> {
@@ -117,6 +141,12 @@ impl Log {
 
     /// Asserts that the drawn rows cover `from..to`, in content coordinates.
     fn assert_covered(&self, from: f32, to: f32) {
+        self.assert_covered_within(from, to, 1.0e-3, "");
+    }
+
+    /// Like [`Self::assert_covered`], allowing gaps up to `slack` between rows, which
+    /// is how far `f32` rounds row positions at large offsets.
+    fn assert_covered_within(&self, from: f32, to: f32, slack: f32, case: &str) {
         let mut drawn = self.drawn.borrow().clone();
         drawn.sort_by(|a, b| a.bounds.y.total_cmp(&b.bounds.y));
 
@@ -124,15 +154,18 @@ impl Log {
 
         for row in &drawn {
             assert!(
-                row.bounds.y <= covered + 1.0e-3,
-                "gap at {covered} before row {} at {}",
+                row.bounds.y <= covered + slack,
+                "{case}: gap at {covered} before row {} at {}",
                 row.key,
                 row.bounds.y
             );
             covered = covered.max(row.bounds.y + row.bounds.height);
         }
 
-        assert!(covered >= to, "drawn rows end at {covered}, before {to}");
+        assert!(
+            covered >= to,
+            "{case}: drawn rows end at {covered}, before {to}"
+        );
     }
 }
 
@@ -156,7 +189,7 @@ impl Widget<(), Theme, ()> for Probe {
             width: Length::Fill,
             height: match self.item.height {
                 Height::Fill(_) => Length::Fill,
-                Height::Fixed(_) | Height::Area(_) => Length::Shrink,
+                Height::Fixed(_) | Height::Area(_) | Height::Group { .. } => Length::Shrink,
             },
         }
     }
@@ -179,9 +212,12 @@ impl Widget<(), Theme, ()> for Probe {
     fn layout(&mut self, tree: &mut Tree, _renderer: &(), limits: &layout::Limits) {
         self.log.layouts.borrow_mut().push((self.item.key, *limits));
 
+        let grown = self.log.overrides.borrow().get(&self.item.key).copied();
         let intrinsic = match self.item.height {
+            _ if let Some(height) = grown => height,
             Height::Fixed(height) | Height::Fill(height) => height,
             Height::Area(area) => area / limits.max.width,
+            Height::Group { .. } => unreachable!("a group is a column, not a probe"),
         };
         let size = self.size();
 
@@ -212,16 +248,48 @@ impl Widget<(), Theme, ()> for Probe {
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        _layout: Layout,
+        layout: Layout,
         _cursor: mouse::Cursor,
         _renderer: &(),
-        _shell: &mut Shell<'_, ()>,
+        shell: &mut Shell<'_, ()>,
         _viewport: &Rectangle,
     ) {
         assert_eq!(tree.state.downcast_ref::<RowState>().key, self.item.key);
 
         let redraw = matches!(event, Event::Window(window::Event::RedrawRequested(_)));
         self.log.updates.borrow_mut().push((self.item.key, redraw));
+
+        if redraw {
+            self.log
+                .redraws
+                .borrow_mut()
+                .push((self.item.key, layout.parent(), layout.bounds()));
+
+            let grown = self.log.grow.borrow_mut().remove(&self.item.key);
+
+            if let Some(height) = grown {
+                self.log
+                    .overrides
+                    .borrow_mut()
+                    .insert(self.item.key, height);
+                shell.invalidate_layout();
+            }
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &(),
+    ) -> mouse::Interaction {
+        if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::None
+        }
     }
 
     fn operate(
@@ -256,12 +324,104 @@ impl Widget<(), Theme, ()> for Probe {
     }
 }
 
+/// The header or the footer, which counts its layouts and requests the
+/// invalidations queued for it on its redraws.
+struct Sibling {
+    /// 0 for the header, 1 for the footer.
+    side: usize,
+    height: f32,
+    log: Rc<Log>,
+}
+
+impl Meta for Sibling {}
+
+impl Widget<(), Theme, ()> for Sibling {
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: Length::Fill,
+            height: Length::Fixed(self.height),
+        }
+    }
+
+    fn layout(&mut self, tree: &mut Tree, _renderer: &(), limits: &layout::Limits) {
+        self.log
+            .sibling_layouts
+            .set(self.log.sibling_layouts.get() + 1);
+        let size = self.size();
+        tree.size = limits.resolve(size.width, size.height, Size::ZERO);
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        _renderer: &mut (),
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        if self.side == 1 {
+            self.log.footer.set(Some(layout.bounds()));
+        }
+    }
+
+    fn update(
+        &mut self,
+        _tree: &mut Tree,
+        event: &Event,
+        _layout: Layout,
+        _cursor: mouse::Cursor,
+        _renderer: &(),
+        shell: &mut Shell<'_, ()>,
+        _viewport: &Rectangle,
+    ) {
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            let injected = self.log.inject.borrow_mut()[self.side].pop_front();
+
+            if let Some(Some(invalidation)) = injected {
+                shell.invalidate(invalidation);
+            }
+        }
+    }
+}
+
+/// A probe, or for a group a column of a sticky header probe and item probes.
+fn row(item: &Item, log: &Rc<Log>) -> Root<'static> {
+    let probe = |key, height| Probe {
+        item: Item {
+            key,
+            height: Height::Fixed(height),
+        },
+        log: Rc::clone(log),
+    };
+
+    match item.height {
+        Height::Group {
+            header,
+            items,
+            item: height,
+        } => column(
+            std::iter::once(sticky(probe(item.key, header)).boxed())
+                .chain((1..=items).map(|index| probe(item.key * 1000 + index, height).boxed())),
+        )
+        .boxed(),
+        _ => Probe {
+            item: *item,
+            log: Rc::clone(log),
+        }
+        .boxed(),
+    }
+}
+
 /// The application of most tests: a list of probes between a header and a footer.
 struct App {
     items: Vec<Item>,
     log: Rc<Log>,
     header: f32,
     scroller: bool,
+    /// The list is the scrollable's whole content: no column, header or footer.
+    direct: bool,
     height: Length,
     estimate: Option<f32>,
     anticipate: usize,
@@ -278,6 +438,7 @@ impl App {
             log: Rc::default(),
             header: 0.0,
             scroller: true,
+            direct: false,
             height: Fill,
             estimate: None,
             anticipate: 4,
@@ -299,19 +460,16 @@ impl App {
         let log = Rc::clone(&self.log);
         let calls = Rc::clone(&self.log);
 
-        let mut list = list_view(&self.items, move |_, item: &Item| Probe {
-            item: *item,
-            log: Rc::clone(&log),
-        })
-        .key(move |item: &Item| {
-            calls.key_calls.set(calls.key_calls.get() + 1);
-            item.key
-        })
-        .id(LIST)
-        .anticipate(self.anticipate)
-        .spacing(self.spacing)
-        .padding(self.padding)
-        .highlight(self.highlight.iter().copied());
+        let mut list = list_view(&self.items, move |_, item: &Item| row(item, &log))
+            .key(move |item: &Item| {
+                calls.key_calls.set(calls.key_calls.get() + 1);
+                item.key
+            })
+            .id(LIST)
+            .anticipate(self.anticipate)
+            .spacing(self.spacing)
+            .padding(self.padding)
+            .highlight(self.highlight.iter().copied());
 
         if let Some(estimate) = self.estimate {
             list = list.estimated_height(estimate);
@@ -330,8 +488,25 @@ impl App {
             });
         }
 
-        let content =
-            column![space().height(self.header), list, space().height(FOOTER)].width(Fill);
+        let header = Sibling {
+            side: 0,
+            height: self.header,
+            log: Rc::clone(&self.log),
+        };
+        let footer = Sibling {
+            side: 1,
+            height: FOOTER,
+            log: Rc::clone(&self.log),
+        };
+        if self.direct {
+            return scrollable(list)
+                .id(SCROLL)
+                .width(Fill)
+                .height(self.height)
+                .boxed();
+        }
+
+        let content = column![header, list, footer].width(Fill);
 
         if self.scroller {
             scrollable(content)
@@ -351,6 +526,10 @@ struct Updated {
     invalidation: Invalidation,
     captured: bool,
     redraw: RedrawRequest,
+    /// The interaction the runtime returns for this update: the overlays' from before
+    /// the base update, else the base tree's under the cursor it was given
+    /// (`runtime/src/user_interface.rs:472-477`).
+    interaction: mouse::Interaction,
 }
 
 /// The result of one frame.
@@ -370,6 +549,13 @@ struct Harness {
     now: Instant,
     root_layouts: usize,
     frame_start: usize,
+    /// View rebuilds after a Widgets invalidation.
+    rebuilds: usize,
+    /// The number of walks when the current frame started.
+    walk_start: usize,
+    /// The runtime's overlay state: `Some` with the overlays' mouse interaction when
+    /// the last update had overlays (`runtime/src/user_interface.rs:279-283`).
+    overlay: Option<mouse::Interaction>,
 }
 
 impl Harness {
@@ -386,6 +572,9 @@ impl Harness {
             now: Instant::now(),
             root_layouts: 0,
             frame_start: 0,
+            rebuilds: 0,
+            walk_start: 0,
+            overlay: None,
         };
 
         harness.rebuild(root);
@@ -417,7 +606,9 @@ impl Harness {
         Rectangle::with_size(self.window)
     }
 
-    fn overlays(&mut self, root: &mut Root<'_>) {
+    /// Builds the overlays as the runtime does and returns their mouse interaction,
+    /// `None` when there are none.
+    fn overlays(&mut self, root: &mut Root<'_>) -> Option<mouse::Interaction> {
         let layout = Layout::new(self.tree.size);
         let viewport = self.viewport();
         let overlays = root.overlay(
@@ -429,58 +620,159 @@ impl Harness {
             self.window,
         );
 
-        assert!(overlays.is_empty(), "the probes have no overlays");
+        (!overlays.is_empty()).then(|| Group::new(overlays).mouse_interaction(self.cursor, &()))
     }
 
-    /// One runtime update. It never draws: a redraw request is only reported.
-    fn update(&mut self, root: &mut Root<'_>, event: &Event) -> Updated {
-        self.overlays(root);
+    /// The interaction the runtime computes on the overlays that got the event: none
+    /// without a cursor position (`runtime/src/user_interface.rs:286-297`).
+    fn interaction(
+        group: &mut Group<'_, (), Theme, ()>,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        cursor
+            .position()
+            .map(|position| group.mouse_interaction(mouse::Cursor::Available(position), &()))
+            .unwrap_or_default()
+    }
 
+    /// Lays out the root for a Layout invalidation.
+    fn invalidated(&mut self, root: &mut Root<'_>, invalidation: Invalidation) {
+        if let Invalidation::Layout(diff) = invalidation {
+            if diff == Diff::Perform {
+                self.tree.diff(root);
+            }
+
+            self.layout(root);
+        }
+    }
+
+    /// The cursor of the base tree: levitating while the overlays are interactive.
+    fn base_cursor(&self) -> mouse::Cursor {
+        match self.overlay {
+            None | Some(mouse::Interaction::None) => self.cursor,
+            Some(_) => self.cursor.levitate(),
+        }
+    }
+
+    /// One runtime update, in the runtime's order
+    /// (`runtime/src/user_interface.rs:232-384`): the overlays get the event first,
+    /// then the base tree with a levitating cursor over interactive overlays. Layout
+    /// and overlays are rebuilt inside the update. It never draws: a redraw request is
+    /// only reported.
+    fn update(&mut self, root: &mut Root<'_>, event: &Event) -> Updated {
         let layout = Layout::new(self.tree.size);
         let viewport = self.viewport();
+        let window = self.window;
         let mut bus = Bus::new();
-        let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+        let mut invalidation = Invalidation::None;
+        let mut redraw = RedrawRequest::Wait;
+        let mut captured = false;
 
-        root.update(
-            &mut self.tree,
-            event,
-            layout,
-            self.cursor,
-            &(),
-            &mut shell,
-            &viewport,
-        );
+        // The overlays that got the event are kept, and their interaction computed on
+        // them, unless they asked for new overlays or a layout
+        // (`runtime/src/user_interface.rs:232-299`).
+        let retained = {
+            let overlays =
+                root.overlay(&mut self.tree, layout, &(), &viewport, Vector::ZERO, window);
 
-        let invalidation = shell.invalidation();
-        let captured = shell.is_event_captured();
-        let redraw = shell.redraw_request();
-        drop(shell);
+            if overlays.is_empty() {
+                None
+            } else {
+                let mut group = Group::new(overlays);
+                let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+                group.update(event, self.cursor, &(), &mut shell);
+
+                invalidation = shell.invalidation();
+                captured = shell.is_event_captured();
+                redraw = shell.redraw_request();
+                drop(shell);
+
+                Some(match invalidation {
+                    Invalidation::Layout(_) | Invalidation::Overlay => None,
+                    _ => Some(Self::interaction(&mut group, self.cursor)),
+                })
+            }
+        };
+
+        self.overlay = match retained {
+            None => None,
+            Some(Some(interaction)) => Some(interaction),
+            Some(None) => {
+                self.invalidated(root, invalidation);
+
+                let layout = Layout::new(self.tree.size);
+                let overlays =
+                    root.overlay(&mut self.tree, layout, &(), &viewport, Vector::ZERO, window);
+
+                (!overlays.is_empty())
+                    .then(|| Self::interaction(&mut Group::new(overlays), self.cursor))
+            }
+        };
+
+        let overlaid = self.overlay.unwrap_or_default();
+        let cursor = self.base_cursor();
+
+        if !captured {
+            let layout = Layout::new(self.tree.size);
+            let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+
+            root.update(
+                &mut self.tree,
+                event,
+                layout,
+                cursor,
+                &(),
+                &mut shell,
+                &viewport,
+            );
+
+            let base = shell.invalidation();
+            captured = shell.is_event_captured();
+            redraw = redraw.min(shell.redraw_request());
+            drop(shell);
+
+            if captured {
+                self.overlay = None;
+            }
+
+            if let Invalidation::Layout(_) | Invalidation::Overlay = base {
+                self.invalidated(root, base);
+
+                if let Some(interaction) = self.overlays(root) {
+                    self.overlay = Some(interaction);
+                }
+            }
+
+            invalidation = invalidation.max(base);
+        }
+
         assert!(bus.is_empty(), "nothing publishes messages in these tests");
 
-        match invalidation {
-            Invalidation::None => {}
-            Invalidation::Overlay => self.overlays(root),
-            Invalidation::Layout(diff) => {
-                if diff == Diff::Perform {
-                    self.tree.diff(root);
-                }
-
-                self.layout(root);
-                self.overlays(root);
-            }
-            Invalidation::Widgets => panic!("no test rebuilds the view during a frame"),
-        }
+        let interaction = if overlaid == mouse::Interaction::None {
+            root.mouse_interaction(
+                &self.tree,
+                Layout::new(self.tree.size),
+                cursor,
+                &viewport,
+                &(),
+            )
+        } else {
+            overlaid
+        };
 
         Updated {
             invalidation,
             captured,
             redraw,
+            interaction,
         }
     }
 
     fn next_redraw(&mut self) -> Event {
-        self.now += Duration::from_millis(16);
+        // Never behind the real clock, which smooth scrolling starts from.
+        self.now = (self.now + Duration::from_millis(16)).max(Instant::now());
         self.frame_start = self.root_layouts;
+        self.walk_start = self.walks();
 
         Event::Window(window::Event::RedrawRequested(self.now))
     }
@@ -491,14 +783,35 @@ impl Harness {
         self.complete(root, &event, Vec::new())
     }
 
+    /// A redraw whose Widgets invalidations rebuild the view with `view`.
+    fn frame_with<'a>(&mut self, root: &mut Root<'a>, view: &dyn Fn() -> Root<'a>) -> Frame {
+        let event = self.next_redraw();
+        self.run(root, &event, Vec::new(), Some(view))
+    }
+
     /// Finishes a frame whose first passes the test ran itself.
-    fn complete(
+    fn complete(&mut self, root: &mut Root<'_>, event: &Event, passes: Vec<Invalidation>) -> Frame {
+        self.run(root, event, passes, None)
+    }
+
+    /// The shell's retry loop (`winit/src/lib.rs:784-835`): at most three passes,
+    /// Overlay and Layout retry, Widgets rebuilds the view before the next pass, and
+    /// the third pass is drawn whatever it invalidated.
+    fn run<'a>(
         &mut self,
-        root: &mut Root<'_>,
+        root: &mut Root<'a>,
         event: &Event,
         mut passes: Vec<Invalidation>,
+        view: Option<&dyn Fn() -> Root<'a>>,
     ) -> Frame {
         while passes.len() < 3 && passes.last() != Some(&Invalidation::None) {
+            if passes.last() == Some(&Invalidation::Widgets) {
+                let view = view.expect("a Widgets invalidation needs the view");
+                *root = view();
+                self.rebuild(root);
+                self.rebuilds += 1;
+            }
+
             passes.push(self.update(root, event).invalidation);
         }
 
@@ -510,24 +823,64 @@ impl Harness {
         }
     }
 
+    /// Draws the base tree, then the overlays when the last update had some
+    /// (`runtime/src/user_interface.rs:578-618`).
     fn draw(&mut self, root: &mut Root<'_>) {
         self.log.drawn.take();
+
+        let layout = Layout::new(self.tree.size);
+        let viewport = self.viewport();
+        let style = renderer::Style { text_color: TEXT };
 
         root.draw(
             &self.tree,
             &mut (),
             &Theme::Light,
-            &renderer::Style { text_color: TEXT },
-            Layout::new(self.tree.size),
-            self.cursor,
-            &self.viewport(),
+            &style,
+            layout,
+            self.base_cursor(),
+            &viewport,
         );
+
+        if self.overlay.is_some() {
+            let overlays = root.overlay(
+                &mut self.tree,
+                layout,
+                &(),
+                &viewport,
+                Vector::ZERO,
+                self.window,
+            );
+
+            if !overlays.is_empty() {
+                Group::new(overlays).draw(&mut (), &Theme::Light, &style, self.cursor);
+            }
+        }
     }
 
+    /// Operates on the base tree, then the overlays
+    /// (`runtime/src/user_interface.rs:623-645`).
     fn operate(&mut self, root: &mut Root<'_>, operation: &mut dyn Operation) {
         let layout = Layout::new(self.tree.size);
         let viewport = self.viewport();
-        root.operate(&mut self.tree, layout, &viewport, &(), operation);
+        let tree = &mut self.tree;
+
+        operation.traverse(&mut |operation| {
+            root.operate(tree, layout, &viewport, &(), operation);
+        });
+
+        let overlays = root.overlay(
+            &mut self.tree,
+            layout,
+            &(),
+            &viewport,
+            Vector::ZERO,
+            self.window,
+        );
+
+        if !overlays.is_empty() {
+            Group::new(overlays).operate(&(), operation);
+        }
     }
 
     /// Sets the scrollable's offset like an instant `scroll_to` task.
@@ -568,6 +921,48 @@ impl Harness {
         }
 
         find(&self.tree, Vector::ZERO).expect("the view has a list")
+    }
+
+    /// A new view diffed into the tree without the layout that always follows.
+    fn diff_only(&mut self, root: &mut Root<'_>) {
+        self.tree.diff(root);
+    }
+
+    /// The interaction of the current trees: the overlays kept or rebuilt by the last
+    /// update when they have one, else the base tree's. What the runtime returned for
+    /// that update is [`Updated::interaction`]. Rebuilding the overlays here would
+    /// lose state they keep in themselves.
+    fn mouse_interaction(&self, root: &Root<'_>) -> mouse::Interaction {
+        match self.overlay {
+            Some(interaction) if interaction != mouse::Interaction::None => interaction,
+            _ => root.mouse_interaction(
+                &self.tree,
+                Layout::new(self.tree.size),
+                self.base_cursor(),
+                &self.viewport(),
+                &(),
+            ),
+        }
+    }
+
+    /// The walks of the current frame.
+    fn frame_walks(&self) -> Vec<Walk> {
+        self.core().walks[self.walk_start..].to_vec()
+    }
+
+    fn core_mut(&mut self) -> &mut Core<u32> {
+        fn find(tree: &mut Tree) -> Option<&mut Tree> {
+            if tree.tag == tree::Tag::of::<Core<u32>>() {
+                return Some(tree);
+            }
+
+            tree.children.iter_mut().find_map(find)
+        }
+
+        find(&mut self.tree)
+            .expect("the view has a list")
+            .state
+            .downcast_mut()
     }
 
     fn core(&self) -> &Core<u32> {
@@ -624,9 +1019,20 @@ impl Harness {
         origin.y + tree.children[index].translation.y - translation
     }
 
+    /// The anchored key, `None` at the end, and the target.
     fn anchor(&self) -> (Option<u32>, Option<f64>) {
         let core = self.core();
-        (core.anchor, core.geometry.anchor_y())
+
+        let key = match core.anchor {
+            Some(Anchor::Item(key)) => Some(key),
+            Some(Anchor::End) | None => None,
+        };
+
+        (key, core.geometry.anchor_y())
+    }
+
+    fn end_pinned(&self) -> bool {
+        self.core().anchor == Some(Anchor::End)
     }
 
     /// Checks I1 and I2 against the stored visible region.
@@ -640,9 +1046,8 @@ impl Harness {
             assert_eq!(core.anchor, None);
         }
 
-        if let Some(key) = core.anchor {
-            let position = core.model.position(&key).unwrap();
-            assert_eq!(Some(geometry.content_y(position)), geometry.anchor_y());
+        if let Some(target) = core.anchor_target() {
+            assert_eq!(Some(geometry.target_y(target)), geometry.anchor_y());
         }
     }
 }
@@ -724,6 +1129,7 @@ fn window_walk_covers_extreme_estimates() {
             changed: 604,
             evicted: 0,
             discarded: 0,
+            local: false,
         }
     );
     assert_eq!(ui.positions(), range(0..=603));
@@ -845,10 +1251,12 @@ fn hysteresis_and_lazy_eviction_bound_window() {
     app.log.assert_covered(60.0, 660.0);
 
     // A larger shift covers both edges in one walk, which evicts once at the end.
-    // Every row it built is kept and only the previous rows are evicted.
+    // Every row it built is kept and only the previous rows are evicted. The new rows
+    // measure as estimated, so the walk is local and no root layout follows.
     app.log.clear();
     let frame = ui.scroll(&mut root, 4000.0);
-    assert_eq!(frame.root_layouts, 1);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    assert_eq!(frame.root_layouts, 0);
     assert_eq!(ui.walks(), walks + 1);
     assert_eq!(
         ui.last_walk(),
@@ -858,6 +1266,7 @@ fn hysteresis_and_lazy_eviction_bound_window() {
             changed: 0,
             evicted: 30,
             discarded: 0,
+            local: true,
         }
     );
     assert_eq!(ui.positions(), range(96..=118));
@@ -910,10 +1319,13 @@ fn hysteresis_and_lazy_eviction_bound_window() {
     ui.scroll(&mut root, 400.0);
     assert_eq!(ui.positions(), range(0..=15));
 
+    // An eviction-only walk is geometry neutral, so it is local.
     let walks = ui.walks();
     let frame = ui.scroll(&mut root, 0.0);
-    assert_eq!(frame.root_layouts, 1);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    assert_eq!(frame.root_layouts, 0);
     assert_eq!(ui.walks(), walks + 1);
+    assert!(ui.last_walk().local);
     assert_eq!(ui.last_walk().built, 0);
     assert_eq!(ui.last_walk().evicted, 10);
     assert_eq!(ui.positions(), range(0..=5));
@@ -1103,11 +1515,14 @@ fn removed_anchor_uses_next_survivor_then_previous() {
     assert_eq!(app.log.screen()[&102], 0.0);
     drop(root);
 
-    // Without one after it, the last surviving key before it.
+    // Without one after it, the last surviving key before it. Row 99 keeps the
+    // target, and then the end of the list is in view, so the walk pins the end
+    // where it now is (review P3-R1 F1).
     app.items.retain(|item| item.key < 102);
     let mut root = app.view();
     ui.rebuild(&mut root);
-    assert_eq!(ui.anchor(), (Some(99), Some(4005.0)));
+    assert_eq!(ui.anchor(), (None, Some(4045.0)));
+    assert!(ui.end_pinned());
     assert_eq!(ui.screen_y(&mut root, 99), 0.0);
     assert_eq!(ui.core().geometry.drift(), 40.0);
     ui.assert_invariants();
@@ -1443,7 +1858,11 @@ fn child_first_nonselectable_events_and_traversal() {
         .collect();
     assert_eq!(*app.log.operated.borrow(), expected);
 
+    // Operations also traverse the overlays, which the rows were asked for.
+    assert_eq!(*app.log.overlays.borrow(), expected);
+
     // Overlays are asked of the current rows only, at the same bounds.
+    app.log.overlays.take();
     ui.update(&mut root, &Event::Mouse(mouse::Event::CursorLeft));
     assert_eq!(*app.log.overlays.borrow(), expected);
     assert!(app.log.layouts.borrow().is_empty());
@@ -1672,12 +2091,9 @@ fn spacing_at_the_viewport_edges_is_not_missing_content() {
     assert_eq!(frame.root_layouts, 0);
 
     // The top in the spacing above row 12 and the bottom in the spacing below row 23:
-    // neither row 11 nor row 24 shows any content.
+    // neither row 11 nor row 24 shows any content. The shift is geometry neutral.
     let frame = ui.scroll(&mut root, 595.0);
-    assert_eq!(
-        frame.passes,
-        [Invalidation::Layout(Diff::Skip), Invalidation::None]
-    );
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
     assert_eq!(ui.positions(), range(12..=23));
     assert_eq!(app.log.drawn_keys(), (12..=23).collect::<Vec<u32>>());
 
@@ -1689,7 +2105,8 @@ fn spacing_at_the_viewport_edges_is_not_missing_content() {
 #[test]
 fn retained_measurements_repin_the_ordinary_anchor() {
     // Review P2-R2 F2: row 0 is 10,000 px tall and the only visible row at top 600.
-    let mut items = rows(0..1000, 1.0);
+    // The estimated end stays below the viewport, so the ordinary anchor applies.
+    let mut items = rows(0..2000, 1.0);
     items[0].height = Height::Fixed(10_000.0);
     let mut app = App::estimated(items, 1.0);
     let mut root = app.view();
@@ -1772,11 +2189,16 @@ fn overestimated_start_row_is_bounded_by_the_estimate_error() {
 
     // Accepted limitation (see `ListView`): the discarded rows are about the start
     // row's estimate error divided by the real row height. These counts are pinned so
-    // that any change, in either direction, shows here.
-    let walk = ui.last_walk();
-    assert_eq!(walk.built, 1580);
-    assert_eq!(walk.discarded, 972);
-    assert_eq!(walk.evicted, 604 + 972);
+    // that any change, in either direction, shows here. The local walk does that work
+    // and, having changed heights, falls back to a root layout, whose walk builds
+    // nothing more.
+    let walks = &ui.core().walks;
+    let (local, full) = (walks[walks.len() - 2], walks[walks.len() - 1]);
+    assert!(local.local && !full.local);
+    assert_eq!(local.built, 1580);
+    assert_eq!(local.discarded, 972);
+    assert_eq!(local.evicted, 604 + 972);
+    assert_eq!((full.built, full.changed, full.evicted), (0, 0, 0));
     assert_eq!(ui.positions(), range(2004..=2611));
 
     app.log.assert_covered(10_000.0, 10_600.0);
@@ -1785,4 +2207,1476 @@ fn overestimated_start_row_is_bounded_by_the_estimate_error() {
     let frame = ui.frame(&mut root);
     assert_eq!(frame.passes, [Invalidation::None]);
     assert_eq!(frame.root_layouts, 0);
+}
+
+/// Whether no walk of `walks` was local.
+fn all_full(walks: &[Walk]) -> bool {
+    walks.iter().all(|walk| !walk.local)
+}
+
+#[test]
+fn remeasured_cached_window_shifts_never_layout_root() {
+    // FP1: rows are 40 px and the estimate 30 px, so a first visit changes heights and
+    // takes the full path. Shifts over measured rows never lay out the root.
+    let app = App::estimated(rows(0..1000, 40.0), 30.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    for y in (400..=6000).step_by(400) {
+        ui.scroll(&mut root, y as f32);
+    }
+
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    let siblings = app.log.sibling_layouts.get();
+
+    for y in [
+        2000.0, 1200.0, 4400.0, 3000.0, 2600.0, 4800.0, 1000.0, 1160.0, 3400.0,
+    ] {
+        app.log.clear();
+        let frame = ui.scroll(&mut root, y);
+
+        // The shell saw an Overlay invalidation and then an idle confirmation pass.
+        assert_eq!(
+            frame.passes,
+            [Invalidation::Overlay, Invalidation::None],
+            "{y}"
+        );
+        assert_eq!(frame.root_layouts, 0);
+
+        let walks = ui.frame_walks();
+        assert_eq!(walks.len(), 1);
+        assert!(walks[0].local);
+        assert_eq!(walks[0].changed, 0);
+        assert_eq!(walks[0].discarded, 0);
+
+        // Rows entering the window are measured again, with unchanged heights.
+        let entering = app.log.created.borrow().clone();
+        let laid_out = app.log.laid_out();
+        assert!(!entering.is_empty());
+        assert!(entering.iter().all(|key| laid_out.contains(key)));
+
+        app.log.assert_covered(y, y + 600.0);
+        ui.assert_invariants();
+    }
+
+    assert_eq!(app.log.sibling_layouts.get(), siblings);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+}
+
+#[test]
+fn measurement_mismatch_falls_back_even_with_equal_total() {
+    // FP2: rows 117 and 118 are measured at 4000, change while the viewport is away,
+    // and come back as anticipated rows below the visible ones at 4080, where they
+    // move neither the anchor nor the drift.
+    let check = |changes: &[(usize, f32)], len: u32| {
+        let mut app = App::estimated(rows(0..len, 40.0), 40.0);
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.scroll(&mut root, 4000.0);
+        ui.scroll(&mut root, 8000.0);
+        drop(root);
+
+        for &(index, height) in changes {
+            app.items[index].height = Height::Fixed(height);
+        }
+
+        let mut root = app.view();
+        ui.rebuild(&mut root);
+
+        // Nothing measured changed, so the next redraw is not blocked.
+        assert!(!ui.core().geometry.block_next_redraw);
+        let before = (ui.list().1.size, ui.core().geometry.heights.total());
+
+        let frame = ui.scroll(&mut root, 4080.0);
+        assert_eq!(
+            frame.passes,
+            [Invalidation::Layout(Diff::Skip), Invalidation::None]
+        );
+
+        let walks = ui.frame_walks();
+        assert!(walks[0].local && walks[0].changed > 0);
+        assert!(all_full(&walks[1..]));
+
+        assert_eq!(ui.anchor(), (Some(102), Some(4080.0)));
+        assert_eq!(app.log.screen()[&102], 0.0);
+        app.log.assert_covered(4080.0, 4680.0);
+        ui.assert_invariants();
+
+        (
+            before,
+            (ui.list().1.size, ui.core().geometry.heights.total()),
+        )
+    };
+
+    // One row 1 px taller.
+    let ((size, total), (after, after_total)) = check(&[(117, 41.0)], 1000);
+    assert_eq!(after_total, total + 1.0);
+    assert_eq!(after.height, size.height + 1.0);
+
+    // One row 1 px taller and the next 1 px shorter: neither total nor size change.
+    let ((size, total), (after, after_total)) = check(&[(117, 41.0), (118, 39.0)], 1000);
+    assert_eq!(after_total, total);
+    assert_eq!(after, size);
+
+    // One grid unit on a 1.6M px list, which the f32 size cannot show.
+    let ((size, total), (after, after_total)) = check(&[(117, 40.0 + 1.0 / 256.0)], 40_000);
+    assert_eq!(after_total, total + 1.0 / 256.0);
+    assert_eq!(after, size);
+}
+
+#[test]
+fn constraint_cache_and_estimate_changes_use_full_path() {
+    // FP3. Downward shifts only, so rule S never applies.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let local = |ui: &mut Harness, root: &mut Root<'_>, y: f32| {
+        let frame = ui.scroll(root, y);
+        assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+        assert!(ui.frame_walks()[0].local);
+    };
+    let full = |ui: &mut Harness, root: &mut Root<'_>, y: f32| {
+        let frame = ui.scroll(root, y);
+        assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+        assert!(all_full(&ui.frame_walks()));
+    };
+
+    local(&mut ui, &mut root, 2000.0);
+
+    // A diff that the redraw sees before the layout that always follows it.
+    drop(root);
+    let mut root = app.view();
+    ui.diff_only(&mut root);
+    assert!(ui.core().geometry.local.is_none());
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(all_full(&ui.frame_walks()));
+    assert!(ui.core().geometry.local.is_some());
+    local(&mut ui, &mut root, 2400.0);
+
+    // Changed padding, then spacing. The rebuild's layout caches them, and the next
+    // redraw is full whatever it shifts. Only the one after it is local again.
+    drop(root);
+    app.padding = Padding::ZERO.vertical(8.0).horizontal(10.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(ui.core().geometry.block_next_redraw);
+    full(&mut ui, &mut root, 2800.0);
+    local(&mut ui, &mut root, 3200.0);
+    assert_eq!(
+        ui.core().geometry.local.unwrap().settings.padding,
+        app.padding
+    );
+
+    drop(root);
+    app.spacing = 4.0;
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(ui.core().geometry.block_next_redraw);
+    full(&mut ui, &mut root, 3600.0);
+    local(&mut ui, &mut root, 4000.0);
+
+    // New limits reach the list through a full layout, which replaces the cache.
+    // The local walks after it lay rows out with the new width.
+    ui.resize(&mut root, Size::new(600.0, 600.0));
+    assert_eq!(ui.core().geometry.local.unwrap().limits.max.width, 600.0);
+    app.log.clear();
+    local(&mut ui, &mut root, 4800.0);
+    assert!(!app.log.created.borrow().is_empty());
+    assert!(
+        app.log
+            .layouts
+            .borrow()
+            .iter()
+            .all(|(_, limits)| limits.max.width == 580.0)
+    );
+    drop(root);
+
+    // Adopting the first positive measurement as the estimate is a full-path result,
+    // even when it equals the provisional 32 px. Rows 0..=106 are 0 px tall and
+    // measured by the first layout, rows from 107 on are 32 px.
+    let items = (0..2000)
+        .map(|key| Item {
+            key,
+            height: Height::Fixed(if key < 107 { 0.0 } else { 32.0 }),
+        })
+        .collect();
+    let mut app = App::new(items);
+    app.spacing = 10.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.heights.estimate(), Estimate::Provisional);
+    local(&mut ui, &mut root, 200.0);
+
+    let frame = ui.scroll(&mut root, 800.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    let walks = ui.frame_walks();
+    assert!(walks[0].local);
+    assert_eq!(walks[0].changed, 0);
+    assert_eq!(
+        ui.core().geometry.heights.estimate(),
+        Estimate::Measured(32 * 256)
+    );
+    // Rows 81..=106 are 0 px tall between 10 px gaps and row 107 starts at 1070.
+    assert_eq!(ui.positions(), range(77..=118));
+    ui.assert_invariants();
+}
+
+#[test]
+fn drift_or_task_barrier_covers_every_retry() {
+    // FP4.
+    let mut app = App::estimated(rows(1000..1400, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 4000.0);
+    drop(root);
+
+    // Negative drift from a prepend. The structural change blocks the next redraw.
+    app.items.splice(0..0, rows(0..10, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -400.0);
+    assert!(ui.core().geometry.block_next_redraw);
+
+    let frame = ui.scroll(&mut root, 4400.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(all_full(&ui.frame_walks()));
+
+    // Downward scrolling with unchanged nonzero drift may be local.
+    let frame = ui.scroll(&mut root, 4800.0);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    assert!(ui.frame_walks()[0].local);
+    assert_eq!(ui.core().geometry.drift(), -400.0);
+
+    // Rule S: every pass of that redraw is full, also a retry that needs a walk
+    // because the ancestors moved the viewport again in between.
+    ui.scroll_only(&mut root, 4400.0);
+    let redraw = ui.next_redraw();
+    let first = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(first, Invalidation::Layout(Diff::Skip));
+    assert_ne!(ui.core().geometry.drift(), -400.0);
+
+    ui.scroll_only(&mut root, 3600.0);
+    let second = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(second, Invalidation::Layout(Diff::Skip));
+    ui.complete(&mut root, &redraw, vec![first, second]);
+    assert!(ui.frame_walks().len() >= 2);
+    assert!(all_full(&ui.frame_walks()));
+    app.log.assert_covered(3600.0, 4200.0);
+
+    // Rule Z likewise.
+    ui.scroll_only(&mut root, 0.0);
+    let redraw = ui.next_redraw();
+    let first = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(first, Invalidation::Layout(Diff::Skip));
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+
+    ui.scroll_only(&mut root, 300.0);
+    let second = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(second, Invalidation::Layout(Diff::Skip));
+    ui.complete(&mut root, &redraw, vec![first, second]);
+    assert!(all_full(&ui.frame_walks()));
+
+    // A later stable shift is local again.
+    let frame = ui.scroll(&mut root, 1200.0);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+
+    // A geometry change made by an operation, as the tasks of a later phase will
+    // make, blocks the next redraw. A full layout in between does not lift it.
+    let core = ui.core_mut();
+    core.geometry.move_drift(40.0);
+    core.geometry.block_next_redraw = true;
+    drop(root);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(ui.core().geometry.block_next_redraw);
+
+    let frame = ui.scroll(&mut root, 1600.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(all_full(&ui.frame_walks()));
+    let frame = ui.scroll(&mut root, 2000.0);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    ui.assert_invariants();
+}
+
+#[test]
+fn input_deltas_wait_for_redraw_viewport() {
+    // FP5: real input through the parent scrollable. The list never walks on it, and
+    // the next redraw covers the translation the scrollable actually has.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let input = |ui: &mut Harness, root: &mut Root<'_>, event: Event| {
+        let walks = ui.walks();
+        let updated = ui.update(root, &event);
+        assert_eq!(ui.walks(), walks, "no walk on {event:?}");
+        assert!(!matches!(
+            updated.invalidation,
+            Invalidation::Layout(_) | Invalidation::Widgets
+        ));
+    };
+    let covered = |ui: &mut Harness, root: &mut Root<'_>| {
+        ui.frame(root);
+        let translation = ui.translation(root);
+        app.log.assert_covered(translation, translation + 600.0);
+        ui.assert_invariants();
+        translation
+    };
+
+    // Pixels scroll at once. The translation the content sees only changes on the
+    // next redraw (`widget/src/scrollable.rs:2629-2640`).
+    ui.cursor = mouse::Cursor::Available(Point::new(400.0, 300.0));
+    let pixels = mouse::ScrollDelta::Pixels { x: 0.0, y: -500.0 };
+    input(
+        &mut ui,
+        &mut root,
+        Event::Mouse(mouse::Event::WheelScrolled { delta: pixels }),
+    );
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(covered(&mut ui, &mut root), 500.0);
+
+    // Lines scroll smoothly, over several redraws.
+    let lines = mouse::ScrollDelta::Lines { x: 0.0, y: -10.0 };
+    input(
+        &mut ui,
+        &mut root,
+        Event::Mouse(mouse::Event::WheelScrolled { delta: lines }),
+    );
+    let mut previous = 500.0;
+    let mut moving = 0;
+
+    for _ in 0..120 {
+        let translation = covered(&mut ui, &mut root);
+
+        if translation == previous && moving > 0 {
+            break;
+        }
+
+        if translation != previous {
+            moving += 1;
+        }
+
+        previous = translation;
+    }
+
+    assert!(moving > 1, "the smooth scroll took several redraws");
+    assert_eq!(previous, 500.0 + 1200.0);
+
+    // Touch drags scroll by the finger's movement.
+    let finger = touch::Finger(0);
+    let start = Point::new(400.0, 300.0);
+    ui.cursor = mouse::Cursor::Available(start);
+    input(
+        &mut ui,
+        &mut root,
+        Event::Touch(touch::Event::FingerPressed {
+            id: finger,
+            position: start,
+        }),
+    );
+    let end = Point::new(400.0, 100.0);
+    ui.cursor = mouse::Cursor::Available(end);
+    input(
+        &mut ui,
+        &mut root,
+        Event::Touch(touch::Event::FingerMoved {
+            id: finger,
+            position: end,
+        }),
+    );
+    assert_eq!(ui.translation(&mut root), 1700.0);
+    assert_eq!(covered(&mut ui, &mut root), 1900.0);
+    input(
+        &mut ui,
+        &mut root,
+        Event::Touch(touch::Event::FingerLifted {
+            id: finger,
+            position: end,
+        }),
+    );
+
+    // Dragging the scrollbar's scroller.
+    let content = ui.tree.children[0].size.height;
+    let scroller = 1900.0 / content * 600.0;
+    ui.cursor = mouse::Cursor::Available(Point::new(795.0, scroller + 1.0));
+    input(
+        &mut ui,
+        &mut root,
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    assert_eq!(ui.translation(&mut root), 1900.0);
+
+    let position = Point::new(795.0, scroller + 101.0);
+    ui.cursor = mouse::Cursor::Available(position);
+    input(
+        &mut ui,
+        &mut root,
+        Event::Mouse(mouse::Event::CursorMoved { position }),
+    );
+    assert_eq!(ui.translation(&mut root), 1900.0);
+    let dragged = covered(&mut ui, &mut root);
+    assert!(
+        dragged > 1900.0 + 5000.0,
+        "the scroller was dragged to {dragged}"
+    );
+    input(
+        &mut ui,
+        &mut root,
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+    );
+}
+
+#[test]
+fn local_tree_geometry_is_visible_without_root_layout() {
+    // FP6: after a local shift, draw, operate, mouse interaction and overlays see the
+    // new rows from the trees, and the siblings keep their bounds.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.header = 100.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 400.0);
+    ui.frame(&mut root);
+
+    let (origin, list) = ui.list();
+    let list = Rectangle::new(Point::ORIGIN + origin, list.size);
+    let footer = app.log.footer.get();
+    let siblings = app.log.sibling_layouts.get();
+
+    // The first pass walks locally and reports only an Overlay invalidation.
+    ui.scroll_only(&mut root, 2100.0);
+    let redraw = ui.next_redraw();
+    app.log.clear();
+    let pass = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(pass, Invalidation::Overlay);
+    assert_eq!(ui.root_layouts, ui.frame_start);
+    assert!(ui.frame_walks()[0].local);
+
+    let rows: Vec<(u32, Rectangle)> = {
+        let (origin, tree) = ui.list();
+        ui.core()
+            .window
+            .iter()
+            .zip(&tree.children)
+            .map(|(slot, child)| {
+                let position = Point::ORIGIN + origin + child.translation;
+                (slot.key, Rectangle::new(position, child.size))
+            })
+            .collect()
+    };
+    assert_eq!(rows.first().map(|(key, _)| *key), Some(46));
+
+    // Every row of the final window got this redraw once, with the list as its
+    // parent and its new bounds. Evicted rows got none.
+    let redraws: Vec<(u32, Option<Rectangle>, Rectangle)> = rows
+        .iter()
+        .map(|&(key, bounds)| (key, Some(list), bounds))
+        .collect();
+    assert_eq!(*app.log.redraws.borrow(), redraws);
+
+    // The overlays rebuilt inside the pass come from the new trees.
+    let overlays = app.log.overlays.borrow().clone();
+    assert_eq!(overlays[overlays.len() - rows.len()..], rows[..]);
+
+    let frame = ui.complete(&mut root, &redraw, vec![pass]);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    assert_eq!(frame.root_layouts, 0);
+
+    // Draw.
+    for drawn in app.log.drawn.borrow().iter() {
+        let (_, bounds) = rows.iter().find(|(key, _)| *key == drawn.key).unwrap();
+        assert_eq!(drawn.bounds, *bounds);
+    }
+
+    app.log.assert_covered(2100.0, 2700.0);
+
+    // Operate.
+    app.log.clear();
+    ui.operate(&mut root, &mut Visits::default());
+    assert_eq!(*app.log.operated.borrow(), rows);
+
+    // Mouse interaction over row 60, which the local walk built (screen y 400).
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 400.0));
+    assert_eq!(ui.mouse_interaction(&root), mouse::Interaction::Pointer);
+
+    // The siblings and the list kept their geometry.
+    let (origin, tree) = ui.list();
+    assert_eq!(Rectangle::new(Point::ORIGIN + origin, tree.size), list);
+    assert_eq!(app.log.footer.get(), footer);
+    assert_eq!(app.log.sibling_layouts.get(), siblings);
+}
+
+#[test]
+fn local_eviction_matches_full_walk() {
+    // FP7: the same trace with local relayout on and off gives the same windows,
+    // translations, tree identities and geometry.
+    #[derive(Debug, PartialEq)]
+    struct State {
+        positions: Vec<usize>,
+        keys: Vec<u32>,
+        translations: Vec<Vector>,
+        serials: Vec<u64>,
+        anchor: (Option<u32>, Option<f64>),
+        drift: f64,
+        total: u64,
+        size: Size,
+    }
+
+    fn state(ui: &Harness) -> State {
+        let (_, tree) = ui.list();
+        let core = ui.core();
+
+        State {
+            positions: ui.positions(),
+            keys: ui.keys(),
+            translations: tree
+                .children
+                .iter()
+                .map(|child| child.translation)
+                .collect(),
+            serials: tree
+                .children
+                .iter()
+                .map(|child| child.state.downcast_ref::<RowState>().serial)
+                .collect(),
+            anchor: ui.anchor(),
+            drift: core.geometry.drift(),
+            total: core.geometry.heights.total().to_bits(),
+            size: tree.size,
+        }
+    }
+
+    fn trace(local: bool) -> (Vec<State>, Vec<Walk>) {
+        super::local::ENABLED.set(local);
+
+        // Every seventh row is 0 px tall, so first visits change heights.
+        let items = (0..400)
+            .map(|key| Item {
+                key,
+                height: Height::Fixed(if key % 7 == 0 { 0.0 } else { 40.0 }),
+            })
+            .collect();
+        let mut app = App::estimated(items, 40.0);
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        let mut states = Vec::new();
+
+        for y in [
+            0.0, 600.0, 1200.0, 1800.0, 2400.0, 1800.0, 1300.0, 1360.0, 700.0, 2200.0, 400.0, 0.0,
+            30.0, 2000.0,
+        ] {
+            let total = ui.core().geometry.heights.total().to_bits();
+            ui.scroll(&mut root, y);
+            states.push(state(&ui));
+
+            // A local walk that kept the geometry did not touch the height sums.
+            if ui.frame_walks().iter().all(|walk| walk.local) {
+                assert_eq!(ui.core().geometry.heights.total().to_bits(), total);
+            }
+        }
+
+        drop(root);
+        app.items.clear();
+        let mut root = app.view();
+        ui.rebuild(&mut root);
+        ui.frame(&mut root);
+        states.push(state(&ui));
+
+        super::local::ENABLED.set(true);
+        (states, ui.core().walks.clone())
+    }
+
+    let (local, local_walks) = trace(true);
+    let (full, full_walks) = trace(false);
+    assert_eq!(local, full);
+
+    assert!(local_walks.iter().any(|walk| walk.local));
+    assert!(all_full(&full_walks));
+
+    // Eviction happens once per walk, after the final range is known.
+    for walk in local_walks.iter().chain(&full_walks) {
+        assert_eq!(walk.discarded, 0);
+    }
+
+    for walk in local_walks.iter().filter(|walk| walk.local) {
+        assert!(walk.measured > 0);
+    }
+
+    assert!(local.last().unwrap().keys.is_empty());
+}
+
+#[test]
+fn child_and_sibling_invalidations_are_not_downgraded() {
+    // FP8.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let view = || app.view();
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 400.0);
+
+    // A row the local walk builds grows on that same redraw and asks for a root
+    // layout, which repairs the geometry before the draw.
+    app.log.grow.borrow_mut().insert(55, 80.0);
+    let frame = ui.scroll(&mut root, 2000.0);
+    assert_eq!(
+        frame.passes,
+        [Invalidation::Layout(Diff::Skip), Invalidation::None]
+    );
+    let walks = ui.frame_walks();
+    assert!(walks[0].local && walks[0].changed == 0);
+    assert!(all_full(&walks[1..]));
+    assert_eq!(ui.core().geometry.heights.height(55), 80.0);
+    let screen = app.log.screen();
+    assert_eq!(screen[&56] - screen[&55], 80.0);
+    app.log.assert_covered(2000.0, 2600.0);
+
+    // A retained row does the same.
+    app.log.grow.borrow_mut().insert(60, 120.0);
+    let frame = ui.scroll(&mut root, 2200.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(ui.frame_walks()[0].local);
+    assert_eq!(ui.core().geometry.heights.height(60), 120.0);
+    app.log.assert_covered(2200.0, 2800.0);
+
+    // The header, before the list, asks for a root layout: no local attempt.
+    app.log.inject.borrow_mut()[0].push_back(Some(Invalidation::Layout(Diff::Skip)));
+    let frame = ui.scroll(&mut root, 2600.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(all_full(&ui.frame_walks()));
+    app.log.assert_covered(2600.0, 3200.0);
+
+    // The footer, after a local walk, asks for one: it is not downgraded.
+    app.log.inject.borrow_mut()[1].push_back(Some(Invalidation::Layout(Diff::Skip)));
+    let frame = ui.scroll(&mut root, 3000.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    let walks = ui.frame_walks();
+    assert!(walks[0].local);
+    assert!(all_full(&walks[1..]));
+    app.log.assert_covered(3000.0, 3600.0);
+
+    // Widgets from the header: the shell rebuilds the view between passes, and the
+    // retry with the same timestamp stays full.
+    app.log.inject.borrow_mut()[0].push_back(Some(Invalidation::Widgets));
+    ui.scroll_only(&mut root, 3400.0);
+    let rebuilds = ui.rebuilds;
+    let frame = ui.frame_with(&mut root, &view);
+    assert_eq!(frame.passes, [Invalidation::Widgets, Invalidation::None]);
+    assert_eq!(ui.rebuilds, rebuilds + 1);
+    assert!(all_full(&ui.frame_walks()));
+    app.log.assert_covered(3400.0, 4000.0);
+
+    // Widgets from the footer after a local walk.
+    app.log.inject.borrow_mut()[1].push_back(Some(Invalidation::Widgets));
+    ui.scroll_only(&mut root, 3800.0);
+    let frame = ui.frame_with(&mut root, &view);
+    assert_eq!(frame.passes, [Invalidation::Widgets, Invalidation::None]);
+    assert_eq!(ui.rebuilds, rebuilds + 2);
+    assert!(ui.frame_walks()[0].local);
+    app.log.assert_covered(3800.0, 4400.0);
+
+    // At the retry limit: the third pass asks for Widgets, and the frame is drawn
+    // without a rebuild or a fourth pass. The list's geometry is stable, so the
+    // drawn rows still cover the viewport.
+    app.log.inject.borrow_mut()[1].extend([
+        Some(Invalidation::Overlay),
+        Some(Invalidation::Overlay),
+        Some(Invalidation::Widgets),
+    ]);
+    let frame = ui.frame_with(&mut root, &view);
+    assert_eq!(
+        frame.passes,
+        [
+            Invalidation::Overlay,
+            Invalidation::Overlay,
+            Invalidation::Widgets
+        ]
+    );
+    assert_eq!(ui.rebuilds, rebuilds + 2);
+    app.log.assert_covered(3800.0, 4400.0);
+}
+
+/// Asserts the frame just drawn at the end of the list: the translation is the
+/// largest one the final content height allows, the footer ends at the bottom of
+/// the viewport, the drawn rows cover the viewport down to the footer, and the end
+/// of the list is pinned.
+fn assert_drawn_at_end(ui: &mut Harness, root: &mut Root<'_>, log: &Log) {
+    let content = ui.tree.children[0].size.height;
+    let translation = ui.translation(root);
+    assert_eq!(translation, content - WINDOW.height);
+
+    let footer = log.footer.get().expect("the footer is drawn");
+    assert_eq!(footer.y + footer.height, content);
+    assert_eq!(footer.y + footer.height - translation, WINDOW.height);
+
+    log.assert_covered(translation, footer.y);
+    assert!(ui.end_pinned());
+    ui.assert_invariants();
+}
+
+#[test]
+fn end_of_list_keeps_its_place_while_rows_are_measured() {
+    // Review P3-R1 F1: a jump to the largest translation, over rows estimated very
+    // differently from their real height. The end of the list is pinned, so measuring
+    // the rows in view moves only the content above them, the content height and the
+    // largest translation stay put, and the walk goes up from the end, keeping every
+    // row it builds.
+    let jump = |items: Vec<Item>, estimate: f32| {
+        let app = App::estimated(items, estimate);
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+
+        let content = ui.tree.children[0].size.height;
+        let frame = ui.scroll(&mut root, content - WINDOW.height);
+        assert!(frame.passes.len() <= 3);
+        assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+        assert_eq!(ui.tree.children[0].size.height, content);
+
+        let walks = ui.frame_walks();
+        assert!(walks.iter().all(|walk| walk.discarded == 0));
+        assert_drawn_at_end(&mut ui, &mut root, &app.log);
+
+        let built = walks.iter().map(|walk| walk.built).sum::<usize>();
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes, [Invalidation::None]);
+        built
+    };
+
+    // The reviewer's case: 1 px rows estimated at 1000 px. Without the end pin each
+    // pass shortened the list below the translation of the next one, and the last
+    // drawn frame was blank.
+    let built = jump(rows(0..2000, 1.0), 1000.0);
+    assert_eq!(built, 550 + 4);
+
+    // A realistic overestimate: 20 px rows estimated at 40 px.
+    let built = jump(rows(0..2000, 20.0), 40.0);
+    assert_eq!(built, 28 + 4);
+
+    // Growth: 40 px rows estimated at 20 px. Fourteen real rows cover the 550 px of
+    // list above the footer.
+    let built = jump(rows(0..2000, 40.0), 20.0);
+    assert_eq!(built, 14 + 4);
+}
+
+#[test]
+fn growth_at_the_end_moves_the_content_above() {
+    // Review P3-R1 F1: a list shorter than the viewport below a 1000 px header,
+    // scrolled to the end. When its last row grows, the end stays where it is and the
+    // rows above move up, so the footer stays at the bottom of the viewport.
+    let mut app = App::estimated(rows(0..20, 40.0), 40.0);
+    app.header = 1000.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 1250.0);
+    assert_drawn_at_end(&mut ui, &mut root, &app.log);
+    assert_eq!(app.log.screen()[&19], 510.0);
+    drop(root);
+
+    app.items[19].height = Height::Fixed(140.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -100.0);
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_drawn_at_end(&mut ui, &mut root, &app.log);
+    assert_eq!(app.log.screen()[&19], 410.0);
+    assert_eq!(app.log.screen()[&18], 370.0);
+
+    // Scrolling back to the start resolves the drift, as everywhere else.
+    ui.scroll(&mut root, 0.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(ui.anchor(), (None, None));
+}
+
+#[test]
+fn empty_visible_region_ends_the_walk() {
+    // Review P3-R1 F1 follow-up: a 0 px tall scrollable scrolled to a row boundary.
+    // No row shows content in the empty visible region, and the walk still ends.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.height = Length::Fixed(0.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let frame = ui.scroll(&mut root, 4000.0);
+    assert!(frame.passes.len() <= 3);
+    assert_eq!(ui.anchor(), (Some(100), Some(4000.0)));
+    assert!(ui.positions().contains(&100));
+    ui.assert_invariants();
+}
+
+#[test]
+fn sticky_group_overlay_follows_a_local_shift() {
+    // Review P3-R1 F2: item 20 is `column![sticky(header), items..]`, a 30 px header
+    // and five 40 px items, at content y 800..1030. The fork's real `Sticky`, with
+    // the harness running overlays in the runtime's order.
+    let mut items = rows(0..100, 40.0);
+    items[20].height = Height::Group {
+        header: 30.0,
+        items: 5,
+        item: 40.0,
+    };
+    let app = App::estimated(items, 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+    assert!(!ui.keys().contains(&20));
+    assert_eq!(ui.overlay, None);
+
+    let group = Rectangle::new(Point::new(0.0, 800.0), Size::new(800.0, 230.0));
+    let stuck = Rectangle::new(Point::ORIGIN, Size::new(800.0, 30.0));
+
+    // Scrolling to 850 puts the header above the viewport while the group is in it.
+    // The cached window shift is local, and its new rows get this redraw once: the
+    // group's items with the group as their parent, and the sticky, which sticks and
+    // asks for new overlays instead of passing the redraw on.
+    ui.scroll_only(&mut root, 850.0);
+    let redraw = ui.next_redraw();
+    app.log.clear();
+    let pass = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(pass, Invalidation::Overlay);
+    assert!(ui.frame_walks()[0].local);
+    assert!(ui.overlay.is_some());
+
+    let redraws = app.log.redraws.take();
+    assert!(redraws.iter().all(|&(key, _, _)| key != 20));
+
+    for index in 1..=5 {
+        let key = 20_000 + index;
+        let bounds = Rectangle::new(
+            Point::new(0.0, 830.0 + 40.0 * (index - 1) as f32),
+            Size::new(800.0, 40.0),
+        );
+        let received: Vec<_> = redraws.iter().filter(|redraw| redraw.0 == key).collect();
+        assert_eq!(received, [&(key, Some(group), bounds)]);
+    }
+
+    // The next pass delivers the redraw to the overlay first: the header, clamped to
+    // the top of the viewport in screen coordinates, with its group as its parent.
+    let frame = ui.complete(&mut root, &redraw, vec![pass]);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+    assert_eq!(frame.root_layouts, 0);
+    assert_eq!(
+        *app.log.redraws.borrow().first().unwrap(),
+        (20, Some(group), stuck)
+    );
+
+    // The base tree does not draw the stuck header and the overlay draws it there.
+    let drawn: Vec<Drawn> = app
+        .log
+        .drawn
+        .borrow()
+        .iter()
+        .copied()
+        .filter(|drawn| drawn.key == 20)
+        .collect();
+    assert_eq!(drawn.len(), 1);
+    assert_eq!((drawn[0].bounds, drawn[0].viewport), (stuck, stuck));
+
+    // Over the stuck header the overlay owns the interaction, and the base tree's
+    // cursor levitates.
+    let position = Point::new(100.0, 10.0);
+    ui.cursor = mouse::Cursor::Available(position);
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::CursorMoved { position }),
+    );
+    assert_eq!(ui.overlay, Some(mouse::Interaction::Pointer));
+    assert!(ui.base_cursor().position().is_none());
+    assert_eq!(ui.mouse_interaction(&root), mouse::Interaction::Pointer);
+
+    // Operations reach the header through the overlay only.
+    app.log.clear();
+    ui.operate(&mut root, &mut Visits::default());
+    let operated: Vec<(u32, Rectangle)> = app
+        .log
+        .operated
+        .borrow()
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key == 20)
+        .collect();
+    assert_eq!(operated, [(20, stuck)]);
+    ui.cursor = mouse::Cursor::Unavailable;
+
+    // On the last permitted pass: two passes go by, the parent moves the viewport, and
+    // the third pass shifts the window locally and creates the overlay. It is drawn
+    // with that frame.
+    ui.scroll(&mut root, 3000.0);
+    assert_eq!(ui.overlay, None);
+    app.log.inject.borrow_mut()[1]
+        .extend([Some(Invalidation::Overlay), Some(Invalidation::Overlay)]);
+
+    let redraw = ui.next_redraw();
+    let first = ui.update(&mut root, &redraw).invalidation;
+    let second = ui.update(&mut root, &redraw).invalidation;
+    ui.scroll_only(&mut root, 850.0);
+    let third = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(
+        [first, second, third],
+        [
+            Invalidation::Overlay,
+            Invalidation::Overlay,
+            Invalidation::Overlay
+        ]
+    );
+    assert!(ui.frame_walks().iter().any(|walk| walk.local));
+
+    ui.complete(&mut root, &redraw, vec![first, second, third]);
+    let drawn: Vec<Rectangle> = app
+        .log
+        .drawn
+        .borrow()
+        .iter()
+        .filter(|drawn| drawn.key == 20)
+        .map(|drawn| drawn.bounds)
+        .collect();
+    assert_eq!(drawn, [stuck]);
+}
+
+#[test]
+fn end_is_visible_as_the_parent_reports_it() {
+    // Review P3-R2 F1: the list is the scrollable's whole content, with no footer and
+    // no bottom padding. The first frame measures rows 0..=1027 as 1 px and leaves 965
+    // rows at a fractional estimate, so the exact height is not an f32.
+    let jump = |estimate: f32, exact: f64, reported: f32| {
+        let mut app = App::estimated(rows(0..1993, 1.0), estimate);
+        app.direct = true;
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+
+        assert_eq!(ui.core().geometry.total(), exact);
+        let content = ui.tree.children[0].size.height;
+        assert_eq!(content, reported);
+
+        let frame = ui.scroll(&mut root, content - WINDOW.height);
+        assert!(frame.passes.len() <= 3);
+        assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+        assert!(ui.end_pinned());
+
+        // The list kept its reported height, the translation is the largest it
+        // allows, and the drawn rows cover the viewport down to the list's end.
+        assert_eq!(ui.tree.children[0].size.height, content);
+        let translation = ui.translation(&mut root);
+        assert_eq!(translation, content - WINDOW.height);
+        app.log.assert_covered(translation, content);
+        ui.assert_invariants();
+
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes, [Invalidation::None]);
+    };
+
+    // The reviewer's case: the reported height rounds down.
+    jump(1000.0 + 1.0 / 256.0, 966_031.769_531_25, 966_031.75);
+
+    // The reported height rounds up.
+    jump(
+        1000.0 + 3.0 / 256.0,
+        966_039.308_593_75,
+        966_039.0 + 5.0 / 16.0,
+    );
+}
+
+#[test]
+fn empty_rows_at_the_end_agree_with_coverage() {
+    // Review P3-R2 F2: rows 100..=199 are 0 px tall but estimated at 40 px, and the
+    // list is the scrollable's whole content. The jump to the estimated end measures
+    // them, and the walk keeps only the empty rows coverage counts as anticipation, so
+    // later frames are idle.
+    let items = (0..200)
+        .map(|key| Item {
+            key,
+            height: Height::Fixed(if key < 100 { 40.0 } else { 0.0 }),
+        })
+        .collect();
+    let mut app = App::estimated(items, 40.0);
+    app.direct = true;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let frame = ui.scroll(&mut root, 7400.0);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert!(ui.end_pinned());
+    assert_eq!(ui.positions(), range(81..=103));
+    app.log.assert_covered(7400.0, 8000.0);
+
+    for _ in 0..3 {
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes, [Invalidation::None]);
+        assert!(ui.frame_walks().is_empty());
+    }
+
+    ui.assert_invariants();
+}
+
+#[test]
+fn structural_changes_keep_visible_items_while_the_end_is_pinned() {
+    // Review P3-R2 F3: 100 rows of 40 px and the footer, scrolled to the largest
+    // translation 3450, so the end is pinned and row 87 is at screen y 30. Keyed
+    // changes keep the visible surviving rows still, wherever they are.
+    let pinned = || {
+        let app = App::estimated(rows(0..100, 40.0), 40.0);
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, 3450.0);
+        assert!(ui.end_pinned());
+        assert_eq!(app.log.screen()[&87], 30.0);
+        drop(root);
+        (app, ui)
+    };
+
+    // An item appended at the end.
+    let (mut app, mut ui) = pinned();
+    app.items.push(rows(1000..1001, 40.0)[0]);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(ui.screen_y(&mut root, 87), 30.0);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&87], 30.0);
+    ui.assert_invariants();
+    drop(root);
+
+    // An item prepended at the start.
+    let (mut app, mut ui) = pinned();
+    app.items.insert(0, rows(1000..1001, 40.0)[0]);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -40.0);
+    assert_eq!(ui.screen_y(&mut root, 87), 30.0);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&87], 30.0);
+    drop(root);
+
+    // The last five rows removed: the visible rows stay until the scrollable clamps
+    // its translation to the shorter content, and the end is pinned again.
+    let (mut app, mut ui) = pinned();
+    app.items.truncate(95);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(ui.screen_y(&mut root, 87), 30.0);
+    ui.frame(&mut root);
+    assert_drawn_at_end(&mut ui, &mut root, &app.log);
+    drop(root);
+
+    // Every item replaced: nothing survives, so the drift is folded and the two new
+    // rows are where they belong. The walk then pins the new end, which is in view.
+    let (mut app, mut ui) = pinned();
+    app.items = rows(2000..2002, 40.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(ui.anchor(), (None, Some(80.0)));
+    assert_eq!(ui.list().1.size.height, 80.0);
+    ui.frame(&mut root);
+    assert_eq!(ui.anchor(), (None, None));
+    assert_eq!(app.log.drawn_keys(), [2000, 2001]);
+    app.log.assert_covered(0.0, 80.0);
+}
+
+/// A widget whose overlay keeps its interaction in the overlay object itself: it
+/// shows a pointer until it gets an event.
+struct Flagged;
+
+impl Meta for Flagged {}
+
+impl Widget<(), Theme, ()> for Flagged {
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: Length::Fill,
+            height: Length::Fill,
+        }
+    }
+
+    fn layout(&mut self, tree: &mut Tree, _renderer: &(), limits: &layout::Limits) {
+        tree.size = limits.max;
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        _renderer: &mut (),
+        _theme: &Theme,
+        _style: &renderer::Style,
+        _layout: Layout,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        _tree: &'b mut Tree,
+        _layout: Layout,
+        _renderer: &(),
+        _viewport: &Rectangle,
+        _translation: Vector,
+        _window: Size,
+    ) -> Vec<iced::advanced::overlay::Element<'b, (), Theme, ()>> {
+        vec![iced::advanced::overlay::Element::new(Box::new(Flag {
+            pointer: true,
+        }))]
+    }
+}
+
+struct Flag {
+    pointer: bool,
+}
+
+impl iced::advanced::Overlay<(), Theme, ()> for Flag {
+    fn draw(
+        &self,
+        _renderer: &mut (),
+        _theme: &Theme,
+        _style: &renderer::Style,
+        _cursor: mouse::Cursor,
+    ) {
+    }
+
+    fn update(
+        &mut self,
+        _event: &Event,
+        _cursor: mouse::Cursor,
+        _renderer: &(),
+        _shell: &mut Shell<'_, ()>,
+    ) {
+        self.pointer = false;
+    }
+
+    fn mouse_interaction(&self, _cursor: mouse::Cursor, _renderer: &()) -> mouse::Interaction {
+        if self.pointer {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::None
+        }
+    }
+}
+
+#[test]
+fn harness_keeps_the_overlays_that_got_the_event() {
+    // Review P3-R2 F4: without an invalidation, the runtime computes the interaction
+    // on the overlays that just handled the event, not on rebuilt ones.
+    let log = Rc::new(Log::default());
+    let mut root: Root<'_> = Flagged.boxed();
+    let mut ui = Harness::new(&mut root, &log);
+
+    let position = Point::new(10.0, 10.0);
+    ui.cursor = mouse::Cursor::Available(position);
+    let updated = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::CursorMoved { position }),
+    );
+    assert_eq!(updated.invalidation, Invalidation::None);
+    assert_eq!(ui.overlay, Some(mouse::Interaction::None));
+    assert_eq!(ui.base_cursor(), ui.cursor);
+}
+
+#[test]
+fn harness_operates_on_the_base_tree_inside_traverse() {
+    // Review P3-R2 F5: an operation that never traverses sees nothing of the base
+    // tree, as in the runtime.
+    #[derive(Default)]
+    struct Shallow(usize);
+
+    impl Operation for Shallow {
+        fn traverse(&mut self, _operate: &mut dyn FnMut(&mut dyn Operation)) {}
+
+        fn container(&mut self, _id: Option<&Id>, _bounds: Rectangle, _viewport: &Rectangle) {
+            self.0 += 1;
+        }
+
+        fn scrollable(
+            &mut self,
+            _id: Option<&Id>,
+            _bounds: Rectangle,
+            _content: Size,
+            _translation: Vector,
+            _state: &mut dyn Scrollable,
+        ) {
+            self.0 += 1;
+        }
+    }
+
+    let app = App::estimated(rows(0..100, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let mut shallow = Shallow::default();
+    ui.operate(&mut root, &mut shallow);
+    assert_eq!(shallow.0, 0);
+
+    // An operation that traverses still reaches the list and its rows.
+    let mut visits = Visits::default();
+    ui.operate(&mut root, &mut visits);
+    assert!(visits.containers.iter().any(|(id, _)| id == &Some(LIST)));
+}
+
+/// The distance from `value` to the next larger `f32`.
+fn ulp32(value: f32) -> f32 {
+    f32::from_bits(value.abs().to_bits() + 1) - value.abs()
+}
+
+/// Checks a frame drawn after a jump: the translation is within the largest one the
+/// final content allows, the drawn rows cover the viewport wherever the list has
+/// content there (with the `f32` rounding of row positions at this magnitude), and
+/// returns the translation.
+fn assert_frame_fits(ui: &mut Harness, root: &mut Root<'_>, log: &Log, case: &str) -> f32 {
+    let height = ui.window.height;
+    let content = ui.tree.children[0].size.height;
+    let translation = ui.translation(root);
+    assert!(
+        translation <= (content - height).max(0.0),
+        "{case}: translation {translation} past the largest one for content {content}"
+    );
+
+    let (origin, list) = ui.list();
+    let start = origin.y + (ui.core().geometry.base() as f32).max(0.0);
+    let end = origin.y + list.size.height;
+    let from = translation.max(start);
+    let to = (translation + height).min(end);
+
+    if to > from {
+        // Rows are placed on the 1/256 px grid of the heights, half a unit from their
+        // real height at most, and their positions are rounded to `f32`.
+        let slack = (4.0 * ulp32(to)).max(1.0 / 256.0);
+        log.assert_covered_within(from, to - slack, slack, case);
+    }
+
+    translation
+}
+
+#[test]
+fn end_stays_pinned_one_ulp_short_of_the_viewport() {
+    // Review P3-R3 F1: the scrollable's largest translation plus the viewport height
+    // ends one `f32` ulp above the reported end of the list.
+    let mut app = App::estimated(rows(0..1985, 1.0), 1000.0 + 3.0 / 256.0);
+    app.direct = true;
+    let mut root = app.view();
+    let mut ui = Harness::sized(&mut root, &app.log, Size::new(800.0, 600.031_25));
+    ui.frame(&mut root);
+
+    assert_eq!(ui.core().geometry.total(), 958_039.214_843_75);
+    let content = ui.tree.children[0].size.height;
+    assert_eq!(content, 958_039.0 + 3.0 / 16.0);
+
+    let frame = ui.scroll(&mut root, content - 600.031_25);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert!(ui.end_pinned());
+    assert_eq!(ui.tree.children[0].size.height, content);
+
+    let translation = assert_frame_fits(&mut ui, &mut root, &app.log, "counterexample");
+    assert_eq!(translation, 957_439.0 + 1.0 / 8.0);
+    ui.assert_invariants();
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes, [Invalidation::None]);
+}
+
+#[test]
+fn jumps_near_the_end_stay_covered() {
+    // Review P3-R3 F1: seeded random lists, viewports and estimates, jumping to the
+    // parent's largest translation and to offsets just above it.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1_u64 << 24) as f32
+        }
+    }
+
+    let mut random = Random(0x5EED_1157_0F2A_B3C4);
+
+    for case in 0..400 {
+        let direct = random.below(2) == 0;
+        let height = match random.below(3) {
+            0 => 600.0,
+            1 => (100 * 32 + random.below(800 * 32)) as f32 / 32.0,
+            _ => 100.0 + random.unit() * 800.0,
+        };
+
+        let real = [0.37, 1.0, 2.5, 13.0, 40.0, 97.3][random.below(6) as usize];
+        let estimate = match random.below(4) {
+            0 => None,
+            1 => Some(real * (0.5 + 2.0 * random.unit())),
+            2 => Some(real * 1000.0 + random.below(256) as f32 / 256.0),
+            _ => Some((real / 20.0).max(1.0)),
+        };
+
+        // Up to a few million px, as estimated or real.
+        let largest = estimate.unwrap_or(32.0).max(real * 2.7);
+        let len = (50 + random.below(5000))
+            .min((3.0e6 / largest) as u64)
+            .max(1) as u32;
+
+        let items = (0..len)
+            .map(|key| {
+                let height = match random.below(10) {
+                    0 => 0.0,
+                    1 => real * 2.7,
+                    _ => real,
+                };
+
+                Item {
+                    key,
+                    height: Height::Fixed(height),
+                }
+            })
+            .collect();
+
+        let mut app = App::new(items);
+        app.direct = direct;
+        app.estimate = estimate;
+
+        let case = format!(
+            "case {case}: direct {direct}, viewport {height}, real {real}, \
+             estimate {estimate:?}, {len} rows"
+        );
+
+        let mut root = app.view();
+        let mut ui = Harness::sized(&mut root, &app.log, Size::new(800.0, height));
+        ui.frame(&mut root);
+
+        for jump in 0..3 {
+            let largest = (ui.tree.children[0].size.height - height).max(0.0);
+            let offset = match jump {
+                0 => largest,
+                _ => (largest - random.unit() * 2.0 * height).max(0.0),
+            };
+
+            let frame = ui.scroll(&mut root, offset);
+            let case = format!("{case}, jump {jump} to {offset}");
+            assert!(
+                frame.passes.last() == Some(&Invalidation::None) || frame.root_layouts == 0,
+                "{case}: {frame:?}"
+            );
+            assert_frame_fits(&mut ui, &mut root, &app.log, &case);
+            ui.assert_invariants();
+
+            let frame = ui.frame(&mut root);
+            assert_eq!(frame.passes, [Invalidation::None], "{case}: next frame");
+        }
+    }
+}
+
+/// A widget that opens an overlay with a pointer when it gets an event, and has no
+/// interaction itself.
+struct Opener;
+
+#[derive(Default)]
+struct Opened(bool);
+
+impl Meta for Opener {}
+
+impl Widget<(), Theme, ()> for Opener {
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: Length::Fill,
+            height: Length::Fill,
+        }
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Opened>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Opened::default())
+    }
+
+    fn layout(&mut self, tree: &mut Tree, _renderer: &(), limits: &layout::Limits) {
+        tree.size = limits.max;
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        _renderer: &mut (),
+        _theme: &Theme,
+        _style: &renderer::Style,
+        _layout: Layout,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        _event: &Event,
+        _layout: Layout,
+        _cursor: mouse::Cursor,
+        _renderer: &(),
+        shell: &mut Shell<'_, ()>,
+        _viewport: &Rectangle,
+    ) {
+        let opened = tree.state.downcast_mut::<Opened>();
+
+        if !opened.0 {
+            opened.0 = true;
+            shell.invalidate_overlay();
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        _layout: Layout,
+        _renderer: &(),
+        _viewport: &Rectangle,
+        _translation: Vector,
+        _window: Size,
+    ) -> Vec<iced::advanced::overlay::Element<'b, (), Theme, ()>> {
+        if tree.state.downcast_ref::<Opened>().0 {
+            vec![iced::advanced::overlay::Element::new(Box::new(Flag {
+                pointer: true,
+            }))]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[test]
+fn update_reports_the_runtime_interaction() {
+    // Review P3-R3 F2: the runtime returns the interaction of the overlay phase, which
+    // had no overlay, and the base tree's under the cursor it gave the base tree. The
+    // overlay the base update opened only shows in later queries.
+    let log = Rc::new(Log::default());
+    let mut root: Root<'_> = Opener.boxed();
+    let mut ui = Harness::new(&mut root, &log);
+
+    let position = Point::new(10.0, 10.0);
+    ui.cursor = mouse::Cursor::Available(position);
+    let updated = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::CursorMoved { position }),
+    );
+    assert_eq!(updated.invalidation, Invalidation::Overlay);
+    assert_eq!(updated.interaction, mouse::Interaction::None);
+    assert_eq!(ui.mouse_interaction(&root), mouse::Interaction::Pointer);
 }

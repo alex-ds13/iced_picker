@@ -8,6 +8,7 @@
 //! Z removes it at the start of the list.
 
 use super::heights::{Estimate, Heights};
+use super::local::LocalLayout;
 
 use iced::time::Instant;
 use iced::{Padding, Rectangle};
@@ -54,6 +55,13 @@ impl Visible {
     }
 }
 
+/// What the anchor keeps still: the top of an item, or the bottom of the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Target {
+    Row(usize),
+    End,
+}
+
 /// The builder settings that place items.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Settings {
@@ -87,6 +95,25 @@ pub(super) struct Geometry {
     pub(super) dirty: bool,
     /// The redraw timestamp of the last rule S.
     shrunk_at: Option<Instant>,
+    /// The constraints of the last full layout, `None` after a `diff` until the next
+    /// full layout.
+    pub(super) local: Option<LocalLayout>,
+    /// The next redraw must use root layout for every pass. Set by changes outside a
+    /// redraw, consumed by the next redraw and never by a layout.
+    pub(super) block_next_redraw: bool,
+    /// The redraw timestamp whose passes must all use root layout.
+    pub(super) full_frame: Option<Instant>,
+    /// The next layout is the root layout a redraw asked for.
+    pub(super) redraw_layout: bool,
+}
+
+/// What a geometry-neutral walk must leave unchanged, besides every measured height
+/// and the list's size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Snapshot {
+    total: f64,
+    drift: f64,
+    estimate: Estimate,
 }
 
 impl Geometry {
@@ -104,6 +131,10 @@ impl Geometry {
             laid_out: None,
             dirty: true,
             shrunk_at: None,
+            local: None,
+            block_next_redraw: false,
+            full_frame: None,
+            redraw_layout: false,
         }
     }
 
@@ -120,6 +151,21 @@ impl Geometry {
         self.dirty = true;
 
         true
+    }
+
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            total: self.total(),
+            drift: self.drift,
+            estimate: self.heights.estimate(),
+        }
+    }
+
+    /// Makes every pass of the redraw at `now` use root layout, starting with the
+    /// one the caller asks for.
+    pub(super) fn full(&mut self, now: Instant) {
+        self.full_frame = Some(now);
+        self.redraw_layout = true;
     }
 
     pub(super) fn settings(&self) -> Settings {
@@ -147,6 +193,59 @@ impl Geometry {
         self.content_y(position) + f64::from(self.heights.height(position))
     }
 
+    /// The content y of the bottom of the last item, or of position 0 when empty.
+    pub(super) fn end(&self) -> f64 {
+        self.base() + self.heights.total()
+    }
+
+    pub(super) fn target_y(&self, target: Target) -> f64 {
+        match target {
+            Target::Row(position) => self.content_y(position),
+            Target::End => self.end(),
+        }
+    }
+
+    /// Whether the end of the list counts as visible, for choosing to pin it.
+    ///
+    /// This picks an anchor, it does not decide coverage, so it compares loosely:
+    /// pinning the end instead of the first visible item makes a difference on screen
+    /// smaller than the tolerance. Exact comparisons fail at the scrollable's largest
+    /// translation. The list reports its height as `f32`, the scrollable computes
+    /// that translation as `content - height` and the content adds the height back,
+    /// both rounded. With 1985 rows of 1 px estimated at 1000 + 3/256 px and a
+    /// 600.03125 px viewport, the end is reported at 958039.1875, the largest
+    /// translation is 957439.125 and the visible bottom 958039.125, one `f32` ulp
+    /// short. Leaving the end unpinned there let each pass shorten the list under the
+    /// next pass's translation, and the third pass drew the viewport 399 px past the
+    /// end.
+    ///
+    /// So the end is visible when it is at most four `f32` ulps below the visible
+    /// bottom, at the magnitude of the two. Once `pinned`, it stays visible until it is
+    /// more than 1 px below, or that tolerance if larger, so rounding cannot flip the
+    /// anchor between the passes of a frame.
+    pub(super) fn end_visible(&self, visible: Visible, pinned: bool) -> bool {
+        if self.heights.is_empty() {
+            return false;
+        }
+
+        let end = f64::from(self.reported_end());
+        let bottom = visible.bottom();
+        let tolerance = 4.0 * ulp(end.abs().max(bottom.abs()));
+
+        let tolerance = if pinned {
+            tolerance.max(1.0)
+        } else {
+            tolerance
+        };
+
+        end <= bottom + tolerance
+    }
+
+    /// The end as the list's reported height places it.
+    fn reported_end(&self) -> f32 {
+        self.total().max(0.0) as f32 - self.settings.padding.bottom
+    }
+
     /// The height of the list.
     pub(super) fn total(&self) -> f64 {
         self.base() + self.heights.total() + f64::from(self.settings.padding.bottom)
@@ -164,11 +263,11 @@ impl Geometry {
         self.dirty = true;
     }
 
-    /// Rule A: after heights or positions changed, moves the content so the anchor at
-    /// `position` is back at its target.
-    pub(super) fn absorb(&mut self, anchor: Option<usize>) {
-        if let (Some(position), Some(target)) = (anchor, self.anchor_y) {
-            self.drift -= self.content_y(position) - target;
+    /// Rule A: after heights or positions changed, moves the content so the anchor is
+    /// back at its target.
+    pub(super) fn absorb(&mut self, anchor: Option<Target>) {
+        if let (Some(anchor), Some(target)) = (anchor, self.anchor_y) {
+            self.drift -= self.target_y(anchor) - target;
         }
     }
 
@@ -205,9 +304,14 @@ impl Geometry {
         true
     }
 
-    /// Pins the anchor at `position` where it is now.
-    pub(super) fn pin(&mut self, position: usize) {
-        self.anchor_y = Some(self.content_y(position));
+    /// Pins the anchor where it is now.
+    pub(super) fn pin(&mut self, target: Target) {
+        self.anchor_y = Some(self.target_y(target));
+    }
+
+    /// Pins the anchor at the content y `y`.
+    pub(super) fn pin_at(&mut self, y: f64) {
+        self.anchor_y = Some(y);
     }
 
     pub(super) fn unpin(&mut self) {
@@ -284,9 +388,21 @@ impl Geometry {
     }
 }
 
+/// The distance from `value` to the next larger `f32`.
+fn ulp(value: f64) -> f64 {
+    let value = value as f32;
+
+    if !value.is_finite() {
+        return 0.0;
+    }
+
+    let next = f32::from_bits(value.abs().to_bits() + 1);
+    f64::from(next) - f64::from(value.abs())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Geometry, Settings, Span, Visible};
+    use super::{Geometry, Settings, Span, Target, Visible, ulp};
 
     use std::time::Duration;
 
@@ -390,18 +506,18 @@ mod tests {
         let mut geometry = geometry(&[Some(40.0); 200], 4);
 
         // R2-1: natural y 4400, target 4000, drift -400.
-        geometry.pin(110);
+        geometry.pin(Target::Row(110));
         geometry.move_drift(-400.0);
         assert_eq!(geometry.anchor_y(), Some(4000.0));
         geometry.dirty = false;
 
         // Absorbing a change above the anchor keeps its target.
         geometry.heights.set(5, 80.0);
-        geometry.absorb(Some(110));
+        geometry.absorb(Some(Target::Row(110)));
         assert_eq!(geometry.drift(), -440.0);
         assert_eq!(geometry.content_y(110), 4000.0);
         geometry.heights.set(5, 40.0);
-        geometry.absorb(Some(110));
+        geometry.absorb(Some(Target::Row(110)));
         assert_eq!(geometry.drift(), -400.0);
 
         // Rule S moves the target with the drift, so rule A keeps the result.
@@ -412,7 +528,7 @@ mod tests {
         assert!(geometry.dirty);
         assert_eq!(geometry.drift(), -390.0);
         assert_eq!(geometry.anchor_y(), Some(4010.0));
-        geometry.absorb(Some(110));
+        geometry.absorb(Some(Target::Row(110)));
         assert_eq!(geometry.drift(), -390.0);
 
         // Review P2-R1 F1: once per redraw timestamp, whatever the later passes see.
@@ -428,6 +544,27 @@ mod tests {
         assert!(!geometry.zero_drift());
         let last = later + Duration::from_millis(16);
         assert!(!geometry.shrink(4000.0, 3900.0, last));
+    }
+
+    #[test]
+    fn end_visibility_tolerates_rounding_and_holds_a_pinned_end() {
+        assert_eq!(ulp(958_039.0), 0.0625);
+        assert_eq!(ulp(-958_039.0), 0.0625);
+        assert_eq!(ulp(1.0), f64::from(f32::EPSILON));
+
+        // 100 rows of 40 px: the end is at 4000.
+        let geometry = geometry(&[Some(40.0); 100], 4);
+        let below = |bottom: f64| visible(bottom - 600.0, 600.0);
+
+        assert!(geometry.end_visible(below(4000.0), false));
+        assert!(geometry.end_visible(below(4000.0 - 4.0 * ulp(4000.0)), false));
+        assert!(!geometry.end_visible(below(4000.0 - 0.01), false));
+
+        // A pinned end stays visible within 1 px.
+        assert!(geometry.end_visible(below(4000.0 - 0.99), true));
+        assert!(!geometry.end_visible(below(4000.0 - 1.01), true));
+
+        assert!(!self::geometry(&[], 4).end_visible(below(4000.0), true));
     }
 
     #[test]
