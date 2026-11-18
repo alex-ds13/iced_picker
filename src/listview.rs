@@ -82,8 +82,11 @@
 //!   content, and measured heights and widget state follow the index. With stable
 //!   keys, edits above the first visible item move nothing on screen, except at
 //!   the start of the list: there the list shows the sequence's current
-//!   beginning, so items inserted at the top appear. Duplicate keys are reachable
-//!   by their first position only.
+//!   beginning, so items inserted at the top appear. When the item at the top of
+//!   the viewport is removed, the next item that was on screen takes its place.
+//!   When none of the items on screen remains, nothing is held: the scrollable
+//!   shows what is now at its offset, clamped to the content. Duplicate keys are
+//!   reachable by their first position only.
 //! * **Filtering** is the application's: it passes the filtered sequence, and the
 //!   list compares keys on every view to find what changed.
 //! * **Width.** Items outside the window cannot report an intrinsic width, so a
@@ -107,7 +110,9 @@
 //!   the visible items still. While there is drift, scrolling toward the start
 //!   moves the items by more or less than the scroll (the drift shrinks with the
 //!   distance to the start), and at the start it is gone. [`settle`] turns it into
-//!   an offset change instead.
+//!   an offset change instead. Drift never shows as a gap: when the spacer would
+//!   reach into the viewport, the items move up to the viewport's top, or to their
+//!   natural position when they are too few to fill it.
 //! * **Estimates.** Unmeasured items count with [`ListView::estimated_height`], at
 //!   least 1 px, or with the first positive measurement, 32 px before that. A jump
 //!   into unmeasured content whose estimate is much larger than the real height can

@@ -292,7 +292,9 @@ impl Contacts {
             options,
             tasks,
             edits,
-            container(scrollable(list).id(SCROLL).height(Fill))
+            // An embedded scrollbar keeps a stuck header, drawn as an overlay, from
+            // covering it.
+            container(scrollable(list).id(SCROLL).spacing(2).height(Fill))
                 .style(container::bordered_box)
                 .height(Fill),
         ]

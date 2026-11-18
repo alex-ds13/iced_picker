@@ -355,7 +355,7 @@ impl Geometry {
 
     /// The last row starting above the visible bottom, which is never after the row
     /// where a walk from [`first_row`](Self::first_row) stops.
-    fn last_row(&self, visible: Visible) -> usize {
+    pub(super) fn last_row(&self, visible: Visible) -> usize {
         let first = self.first_row(visible);
 
         self.heights

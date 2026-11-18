@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::RangeInclusive;
 
 use iced::Vector;
 use iced::advanced::Widget;
@@ -195,10 +196,93 @@ impl<K: Clone + Eq + Hash> Core<K> {
         }
     }
 
-    /// Rule A against the current anchor.
+    /// Rule A against the current anchor, then rule G against the region the list
+    /// shows (or a pending landing's destination).
     pub(super) fn absorb(&mut self) {
+        self.absorb_only();
+        let _ = self.close_gap(self.shown());
+    }
+
+    /// Rule A alone, for a batch of measurements followed by rule G: one change of
+    /// the batch alone can look like a deficit that the rest of it makes up.
+    fn absorb_only(&mut self) {
         let anchor = self.anchor_target();
         self.geometry.absorb(anchor);
+    }
+
+    /// The region the list shows: the visible region of the last redraw, or the
+    /// destination of a jump the scroller has not drawn yet.
+    pub(super) fn shown(&self) -> Option<Visible> {
+        let visible = self.geometry.visible?;
+
+        Some(match self.pending_landing() {
+            Some(landing) => Visible {
+                top: landing.top,
+                height: visible.height,
+            },
+            None => visible,
+        })
+    }
+
+    /// The positions of the items in the region the list shows, before a change of
+    /// the keys. A removed anchor is handed only to one of them.
+    pub(super) fn shown_positions(&self) -> Option<RangeInclusive<usize>> {
+        let shown = self.shown()?;
+
+        if self.model.len() == 0 {
+            return None;
+        }
+
+        Some(self.geometry.first_row(shown)..=self.geometry.last_row(shown))
+    }
+
+    /// Rule G: positive drift never shows as a gap.
+    ///
+    /// The drift spacer lies between the list's top padding and its first item. When
+    /// it reaches into the region the list shows, the drift shrinks so the first item
+    /// starts at the region's top, which moves the content and the anchor's target
+    /// together (rule M): the visible items move up into the gap instead of leaving it
+    /// blank. When the items from the first one down are shorter than the region,
+    /// the parent would clamp its translation and open the gap again, so the drift is
+    /// folded entirely and the list starts at its natural position. The parent clamps
+    /// against the shorter content on its next update, and the next redraw checks
+    /// again.
+    ///
+    /// `region` is the region the list shows, or after measurements while a landing
+    /// is pending its destination. A redraw checks the region the parent actually
+    /// shows, for a landing once that region is final: after an edit the destination
+    /// can be out of reach, and the clamped region is what is drawn. A pending
+    /// landing's destination moves with the content, so it still refers to the same
+    /// items. Returns whether the drift changed.
+    pub(super) fn close_gap(&mut self, region: Option<Visible>) -> bool {
+        let drift = self.geometry.drift();
+
+        let Some(shown) = region.filter(|_| drift > 0.0) else {
+            return false;
+        };
+
+        let padding = f64::from(self.geometry.settings().padding.top);
+
+        if padding + drift <= shown.top || padding >= shown.bottom() {
+            return false;
+        }
+
+        // The items from the first one down, and the bottom padding.
+        let below = self.geometry.total() - padding - drift;
+
+        let kept = if below >= shown.height {
+            (shown.top - padding).max(0.0)
+        } else {
+            0.0
+        };
+
+        self.geometry.move_drift(kept - drift);
+
+        if let Some(landing) = &mut self.landing {
+            landing.top += kept - drift;
+        }
+
+        true
     }
 
     pub(super) fn span(&self) -> Option<Span> {
@@ -223,8 +307,14 @@ impl<K: Clone + Eq + Hash> Core<K> {
 
     /// Follows a structural change of the keys (section 4.2): keeps the window rows
     /// and trees of surviving keys, hands a removed anchor's target to the next
-    /// surviving key, and absorbs before any window is chosen.
-    pub(super) fn restructure(&mut self, rebuilt: &Rebuilt<K>, children: &mut Vec<Tree>) {
+    /// surviving key among the `shown` positions (from before the change), and
+    /// absorbs before any window is chosen.
+    pub(super) fn restructure(
+        &mut self,
+        rebuilt: &Rebuilt<K>,
+        children: &mut Vec<Tree>,
+        shown: Option<RangeInclusive<usize>>,
+    ) {
         let window = mem::take(&mut self.window);
         let trees = mem::take(children);
 
@@ -246,16 +336,21 @@ impl<K: Clone + Eq + Hash> Core<K> {
         kept.sort_by_key(|(slot, _)| slot.position);
         (self.window, *children) = kept.into_iter().unzip();
 
+        // A removed anchor goes to a survivor that was shown before the change, which
+        // keeps what is still on screen in place. Handing it to an item that was not
+        // shown would keep that item where the anchor was, with all the drift that
+        // takes, and the drift would show as a gap.
         if let Some(Anchor::Item(anchor)) = &self.anchor
             && self.model.position(anchor).is_none()
         {
-            match rebuilt.survivor(anchor) {
+            match shown.and_then(|shown| rebuilt.survivor(anchor, shown)) {
                 Some(position) => {
                     self.anchor = Some(Anchor::Item(self.model.key(position).clone()));
                 }
                 None => {
                     // Nothing that was shown remains, so there is no content to keep
-                    // still. Folding the drift also keeps an empty list at the height
+                    // still: the drift is folded and the scrollable clamps as for any
+                    // shorter content. Folding also keeps an empty list at the height
                     // of its padding.
                     let drift = self.geometry.drift();
                     self.geometry.move_drift(-drift);
@@ -309,6 +404,15 @@ impl<K: Clone + Eq + Hash> Core<K> {
 
     fn decide(&mut self, visible: Visible, now: Instant) -> Redraw {
         let previous = self.geometry.visible.replace(visible);
+
+        // Rule G against the region the parent shows now, which it may have clamped
+        // against shorter content. A change leaves the geometry dirty, so this redraw
+        // takes the full path. A pending landing is checked once the region it reached
+        // is final, below.
+        if self.landing.is_none() {
+            let _ = self.close_gap(Some(visible));
+        }
+
         let current = !self.geometry.dirty
             && self.geometry.laid_out.is_some()
             && self.geometry.local.is_some();
@@ -329,6 +433,12 @@ impl<K: Clone + Eq + Hash> Core<K> {
             landing.total = Some(self.geometry.total());
 
             if !(walked && arrived) {
+                return Redraw::Full;
+            }
+
+            // The region the landing reached is the one drawn. When an edit put the
+            // destination out of reach, it is clamped, and rule G applies to it.
+            if self.close_gap(Some(visible)) {
                 return Redraw::Full;
             } else if !visible.at_start() {
                 return shift(self);
@@ -562,6 +672,7 @@ where
             renderer,
             limits: *limits,
             fresh: Vec::new(),
+            batch: false,
             #[cfg(test)]
             new: Vec::new(),
             walk: Walk {
@@ -600,6 +711,8 @@ struct Walker<'w, 'a, T, K, W, Message, Theme, Renderer> {
     limits: Limits,
     /// Whether each window row was laid out in this walk, aligned with the window.
     fresh: Vec<bool>,
+    /// The retained rows are being measured, and rule G waits for all of them.
+    batch: bool,
     /// Whether each window row was built by this walk, aligned with the window, for
     /// the statistics of the tests.
     #[cfg(test)]
@@ -642,10 +755,17 @@ where
             self.core.pin_first_visible(visible);
         }
 
-        // 1. The current rows pick up size changes. 2. Rule A runs after each one.
+        // 1. The current rows pick up size changes. 2. Rule A runs after each one, and
+        // rule G after all of them.
+        self.batch = true;
+
         for index in 0..self.core.window.len() {
             self.measure(index);
         }
+
+        self.batch = false;
+        let shown = self.core.shown();
+        let _ = self.core.close_gap(shown);
 
         // 3-6. Coverage from the first visible row down, then the anticipation. The
         // range is recomputed until a pass adds nothing that moves it. Rows built are
@@ -825,7 +945,11 @@ where
             self.walk.changed += 1;
         }
 
-        core.absorb();
+        if self.batch {
+            core.absorb_only();
+        } else {
+            core.absorb();
+        }
     }
 
     /// Makes sure the row at `position` is in the window and laid out in this walk.

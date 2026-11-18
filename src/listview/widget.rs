@@ -409,6 +409,9 @@ where
         core.geometry.local = None;
         core.input.rebase = true;
 
+        // The items shown before this view, taken before new settings or keys change
+        // the geometry.
+        let shown = core.shown_positions();
         let configured = core.configure(self.settings());
 
         let keys = self
@@ -427,7 +430,7 @@ where
                 core.geometry.pin_at(y);
             }
 
-            core.restructure(rebuilt, children);
+            core.restructure(rebuilt, children, shown);
         }
 
         if configured || rebuilt.is_some() {

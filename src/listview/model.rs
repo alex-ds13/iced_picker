@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::mem;
+use std::ops::RangeInclusive;
 
 /// Which key is at each position, the position of each key, and every height
 /// measured so far, by key.
@@ -214,13 +215,22 @@ impl<K: Eq + Hash> Rebuilt<K> {
     }
 
     /// The new position of `key` if it survived. Otherwise the first surviving old
-    /// item after it, or the last one before it when none after it survived.
+    /// item after it, or the last one before it when none after it survived, among
+    /// the old positions `within`.
     ///
-    /// `None` when `key` was not in the old sequence or nothing survived.
-    pub(super) fn survivor(&self, key: &K) -> Option<usize> {
+    /// `None` when `key` was not in the old sequence or nothing `within` survived.
+    pub(super) fn survivor(&self, key: &K, within: RangeInclusive<usize>) -> Option<usize> {
         let old = *self.old_positions.get(key)? as usize;
-        let after = self.moves[old..].iter().flatten().next();
-        let before = || self.moves[..old].iter().rev().flatten().next();
+        let start = (*within.start()).min(self.moves.len());
+        let end = within
+            .end()
+            .saturating_add(1)
+            .min(self.moves.len())
+            .max(start);
+        let old = old.clamp(start, end);
+
+        let after = self.moves[old..end].iter().flatten().next();
+        let before = || self.moves[start..old].iter().rev().flatten().next();
 
         after.or_else(before).map(|&position| position as usize)
     }
@@ -294,6 +304,9 @@ mod tests {
         assert_eq!(model.cached(&key), Some(height), "{key:?}");
     }
 
+    /// Every old position.
+    const ALL: std::ops::RangeInclusive<usize> = 0..=usize::MAX;
+
     #[test]
     fn keyed_reconcile_survives_insert_remove_reorder_and_filter() {
         let mut model = Model::default();
@@ -325,8 +338,13 @@ mod tests {
         let rebuilt = reconcile(&mut model, &mut heights, &['a', 'x', 'c', 'd']).unwrap();
         assert_eq!(moves(&rebuilt), [Some(0), Some(1), None, Some(2), Some(3)]);
         assert_eq!(removed(&rebuilt), [(2, 'b')]);
-        assert_eq!(rebuilt.survivor(&'b'), Some(2));
-        assert_eq!(rebuilt.survivor(&'x'), Some(1));
+        assert_eq!(rebuilt.survivor(&'b', ALL), Some(2));
+        assert_eq!(rebuilt.survivor(&'x', ALL), Some(1));
+
+        // Only the old positions given count: 'b' was at 2, 'c' at 3 and 'd' at 4.
+        assert_eq!(rebuilt.survivor(&'b', 2..=2), None);
+        assert_eq!(rebuilt.survivor(&'b', 2..=3), Some(2));
+        assert_eq!(rebuilt.survivor(&'b', 1..=2), Some(1));
         assert_eq!(model.position(&'b'), None);
         assert_eq!(model.cached(&'b'), Some(12.0));
         assert_heights(&heights, &[11.0, 10.0, 13.0, 14.0]);
@@ -374,14 +392,14 @@ mod tests {
 
         // With no survivor after a removed key, the last one before it takes over.
         let rebuilt = reconcile(&mut model, &mut heights, &['a']).unwrap();
-        assert_eq!(rebuilt.survivor(&'c'), Some(0));
-        assert_eq!(rebuilt.survivor(&'z'), Some(0));
-        assert_eq!(rebuilt.survivor(&'q'), None);
+        assert_eq!(rebuilt.survivor(&'c', ALL), Some(0));
+        assert_eq!(rebuilt.survivor(&'z', ALL), Some(0));
+        assert_eq!(rebuilt.survivor(&'q', ALL), None);
 
         // Removing every row.
         let rebuilt = reconcile(&mut model, &mut heights, &[]).unwrap();
         assert_eq!(moves(&rebuilt), [None]);
-        assert_eq!(rebuilt.survivor(&'a'), None);
+        assert_eq!(rebuilt.survivor(&'a', ALL), None);
         assert!(heights.is_empty());
         assert_eq!(heights.total(), 0.0);
         assert!(reconcile(&mut model, &mut heights, &[]).is_none());

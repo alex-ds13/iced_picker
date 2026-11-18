@@ -1450,6 +1450,14 @@ impl Harness {
         let geometry = &core.geometry;
         let visible = geometry.visible.unwrap_or(Visible::GUESS);
 
+        // Rule G: positive drift does not reach into the visible region.
+        let padding = f64::from(geometry.settings().padding.top);
+        assert!(
+            geometry.drift() <= 0.0 || padding + geometry.drift() <= visible.top + 1.0e-6,
+            "a gap of {} px above the first item",
+            padding + geometry.drift() - visible.top
+        );
+
         if visible.at_start() {
             assert_eq!(geometry.drift(), 0.0);
             assert_eq!(core.anchor, None);
@@ -1924,16 +1932,19 @@ fn removed_anchor_uses_next_survivor_then_previous() {
     assert_eq!(app.log.screen()[&102], 0.0);
     drop(root);
 
-    // Without one after it, the last surviving key before it. Row 99 keeps the
-    // target, and then the end of the list is in view, so the walk pins the end
-    // where it now is (review P3-R1 F1).
+    // Only a survivor that was shown takes it. Here every shown row goes, and row
+    // 99 ended at the viewport's top: the drift is folded instead of keeping row 99
+    // there, which would leave the viewport empty below it. The end is in view, so
+    // the walk pins it, and the scrollable clamps to the shorter content: the last
+    // rows end above the footer at the bottom.
     app.items.retain(|item| item.key < 102);
     let mut root = app.view();
     ui.rebuild(&mut root);
-    assert_eq!(ui.anchor(), (None, Some(4045.0)));
     assert!(ui.end_pinned());
-    assert_eq!(ui.screen_y(&mut root, 99), 0.0);
-    assert_eq!(ui.core().geometry.drift(), 40.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 4060.0 - 600.0);
+    assert_eq!(screen_bottom(&app.log, 99), 545.0);
     ui.assert_invariants();
     drop(root);
 
@@ -2365,9 +2376,11 @@ fn public_api_constructs_with_null_and_production_renderers() {
 }
 
 #[test]
-fn shrink_runs_once_per_redraw_so_the_drawn_translation_fits() {
-    // Review P2-R1 F1: a 50 px footer below the list, positive drift, and a list so
-    // short that the scrollable clamps its translation again after a shrink.
+fn gap_rule_folds_drift_above_too_few_rows() {
+    // Fix F1, from review P2-R1 F1's scenario: a 50 px footer below the list,
+    // positive drift, and a list so short that the scrollable clamps its translation
+    // again after any shrink. Rule S's once-per-redraw guard has its own case,
+    // `shrink_runs_once_per_redraw_while_the_parent_clamps`.
     let mut app = App::estimated(rows(0..200, 40.0), 40.0);
     let mut root = app.view();
     let mut ui = Harness::new(&mut root, &app.log);
@@ -2385,29 +2398,34 @@ fn shrink_runs_once_per_redraw_so_the_drawn_translation_fits() {
     ui.rebuild(&mut root);
     assert_eq!(ui.list().1.size.height, 4400.0);
 
-    // Pass 1 sees the translation clamped to 4450 - 600 and shrinks once. Pass 2 sees
-    // it clamped to the shorter content, which is the ancestors catching up, not
-    // scrolling, so it shrinks nothing and the layout stays.
+    // Pass 1 sees the translation clamped to 4450 - 600, where the drift would show
+    // as a 150 px gap above row 100 (fix F1). The ten rows cannot fill the viewport
+    // from its top, so rule G folds the drift. Pass 2 sees the translation clamped
+    // to the content that is left, the start.
     let frame = ui.frame(&mut root);
     assert_eq!(
         frame.passes,
-        [Invalidation::Layout(Diff::Skip), Invalidation::None]
+        [
+            Invalidation::Layout(Diff::Skip),
+            Invalidation::Layout(Diff::Skip),
+            Invalidation::None
+        ]
     );
-    assert_eq!(ui.core().geometry.drift(), 3850.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
     ui.assert_invariants();
 
-    // The drawn translation is the clamp of the final content height, so the footer
-    // ends at the bottom of the viewport.
+    // The drawn translation is the clamp of the final content height: the rows from
+    // the top, and the footer below them.
     let content = ui.list().1.size.height + FOOTER;
-    assert_eq!(content, 4300.0);
-    assert_eq!(ui.translation(&mut root), content - WINDOW.height);
+    assert_eq!(content, 450.0);
+    assert_eq!(ui.translation(&mut root), 0.0);
     assert_eq!(app.log.drawn_keys(), (100..110).collect::<Vec<u32>>());
-    assert_eq!(app.log.screen()[&109], 4210.0 - 3700.0);
+    assert_eq!(app.log.screen()[&100], 0.0);
 
     // Nothing is left for a later frame.
     let frame = ui.frame(&mut root);
     assert_eq!(frame.passes, [Invalidation::None]);
-    assert_eq!(ui.core().geometry.drift(), 3850.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
 }
 
 #[test]
@@ -5260,9 +5278,12 @@ fn zero_height_focus_target_is_a_no_op() {
 
 #[test]
 fn settle_keeps_the_screen_with_large_positive_drift() {
-    // Review P4-R1 F6: ten rows of 40 px and the footer, drift 3850 and translation
-    // 3700. Removing all the drift would need a negative offset, so settle removes
-    // what keeps the list off its start, and nothing moves.
+    // Review P4-R1 F6: 100 rows of 40 px removed above the viewport leave drift
+    // 4000, with row 100 at the top of the viewport at 4000. Removing all the drift
+    // would need offset 0, at the start, where rule Z removes it at once and moves
+    // the content, so settle leaves 1 px, and nothing moves. (The review's numbers
+    // had only ten rows left, which showed the drift as a gap; rule G now folds it,
+    // see `filters_never_leave_a_gap`.)
     let mut app = App::estimated(rows(0..200, 40.0), 40.0);
     let mut root = app.view();
     let mut ui = Harness::new(&mut root, &app.log);
@@ -5270,32 +5291,25 @@ fn settle_keeps_the_screen_with_large_positive_drift() {
     drop(root);
 
     app.items.drain(0..100);
-    app.items.truncate(10);
     let mut root = app.view();
     ui.rebuild(&mut root);
     ui.frame(&mut root);
-    assert_eq!(ui.core().geometry.drift(), 3850.0);
-    assert_eq!(ui.translation(&mut root), 3700.0);
+    assert_eq!(ui.core().geometry.drift(), 4000.0);
+    assert_eq!(ui.translation(&mut root), 4000.0);
 
     let screen = app.log.screen();
-    let footer = |ui: &mut Harness, root: &mut Root<'_>| {
-        app.log.footer.get().unwrap().y - ui.translation(root)
-    };
-    let before = footer(&mut ui, &mut root);
-    assert_eq!(screen[&100], 150.0);
-    assert_eq!(before, 550.0);
+    assert_eq!(screen[&100], 0.0);
 
     ui.run_task(&mut root, Settle::new(LIST));
     ui.frame(&mut root);
     assert_eq!(ui.translation(&mut root), 1.0);
-    assert_eq!(ui.core().geometry.drift(), 151.0);
+    assert_eq!(ui.core().geometry.drift(), 1.0);
     assert_eq!(app.log.screen(), screen);
-    assert_eq!(footer(&mut ui, &mut root), before);
 
     // The rest stays until the list reaches its start.
     let frame = ui.frame(&mut root);
     assert_eq!(frame.passes, [Invalidation::None]);
-    assert_eq!(ui.core().geometry.drift(), 151.0);
+    assert_eq!(ui.core().geometry.drift(), 1.0);
     ui.scroll(&mut root, 0.0);
     assert_eq!(ui.core().geometry.drift(), 0.0);
 }
@@ -5450,7 +5464,6 @@ fn consecutive_tasks_before_a_redraw() {
     drop(root);
 
     app.items.drain(0..100);
-    app.items.truncate(10);
     let mut root = app.view();
     ui.rebuild(&mut root);
     ui.frame(&mut root);
@@ -5460,7 +5473,7 @@ fn consecutive_tasks_before_a_redraw() {
     ui.run_task(&mut root, Settle::new(LIST));
     ui.frame(&mut root);
     assert_eq!(ui.translation(&mut root), 1.0);
-    assert_eq!(ui.core().geometry.drift(), 151.0);
+    assert_eq!(ui.core().geometry.drift(), 1.0);
     assert_eq!(app.log.screen(), screen);
     drop(root);
 
@@ -5999,9 +6012,10 @@ fn landing_case(seed: u64) -> (usize, usize) {
             ui.scroll_only(&mut root, translation - up);
             ui.frame_app(&mut root, &view, &update);
             let shrunk = ui.core().geometry.shrunk_at == Some(ui.now);
+            let closed = drift > 0.0 && ui.core().geometry.drift() < drift;
             assert!(ui.core().landing.is_none(), "{case}");
             assert!(
-                drift == 0.0 || shrunk || ui.core().geometry.visible.unwrap().at_start(),
+                drift == 0.0 || shrunk || closed || ui.core().geometry.visible.unwrap().at_start(),
                 "{case}: rule S did not apply to drift {drift}"
             );
         }
@@ -7891,4 +7905,222 @@ fn migration_keeps_index_height_cache_contract() {
     assert_eq!(offset(&ui, 101), 2050.0);
     ui.layout(&mut root);
     assert_eq!(offset(&ui, 101), 2020.0);
+}
+
+#[test]
+fn filters_never_leave_a_gap() {
+    // Fix F1, the user's scenario: 5,000 rows of 40 px in the column with the
+    // footer, scrolled to the middle, and a filter that keeps 5 rows, none of them
+    // shown. The removed anchor has no shown survivor, so the drift is folded and
+    // the scrollable clamps to the 5 rows: they are drawn from the top.
+    let mut app = App::estimated(rows(0..5000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 100_000.0);
+    drop(root);
+
+    app.items.retain(|item| item.key % 1000 == 555);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    let frame = ui.frame(&mut root);
+    assert!(frame.passes.len() <= 3);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    let content = ui.list().1.size.height + FOOTER;
+    assert_eq!(content, 250.0);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(app.log.drawn_keys(), [555, 1555, 2555, 3555, 4555]);
+    assert_eq!(app.log.screen()[&555], 0.0);
+    ui.assert_invariants();
+    assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+    drop(root);
+
+    // One shown row is kept, row 2505 at screen 200, with the 2,505 rows above it
+    // removed and the rows after it kept. It takes the anchor, and the drift would
+    // leave 200 px blank above it: rule G moves it up to the viewport's top, with the
+    // rows below it.
+    app.items = rows(0..5000, 40.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.scroll(&mut root, 100_000.0);
+    assert_eq!(app.log.screen()[&2505], 200.0);
+    drop(root);
+
+    app.items.retain(|item| item.key >= 2505);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(app.log.screen()[&2505], 0.0);
+    app.log
+        .assert_covered(ui.translation(&mut root), ui.translation(&mut root) + 600.0);
+    ui.assert_invariants();
+    assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+    drop(root);
+
+    // Only that row is kept: it cannot fill the viewport, so the drift is folded and
+    // it ends up at the top of the list, at the start.
+    app.items.retain(|item| item.key == 2505);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(app.log.screen()[&2505], 0.0);
+    ui.assert_invariants();
+    drop(root);
+
+    // Every shown row is removed, and many rows below them are kept: no shown
+    // survivor, so the drift is folded, and the rows that are now at the scroller's
+    // translation fill the viewport: the 40 rows removed from 2490 bring row 2540
+    // to the top, where row 2500 was.
+    app.items = rows(0..5000, 40.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.scroll(&mut root, 100_000.0);
+    drop(root);
+
+    app.items.retain(|item| !(2490..2530).contains(&item.key));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    let translation = ui.translation(&mut root);
+    app.log.assert_covered(translation, translation + 600.0);
+    assert_eq!(app.log.screen()[&2540], 0.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    ui.assert_invariants();
+    assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+}
+
+#[test]
+fn gap_rule_checks_the_drawn_region_of_an_unreachable_landing() {
+    // Review F1-R1 F1: an instant Start on row 100, then, before the landing frame,
+    // a filter keeps only rows 100..=109. The destination at 4000 is out of reach
+    // (400 px of rows), so the drawn region is clamped, and the drift must not show
+    // there as a gap.
+    let mut app = direct(rows(0..200, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(100, Align::Start, Animation::Instant),
+    );
+    drop(root);
+
+    app.items.retain(|item| (100..=109).contains(&item.key));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    // The frame takes all three passes: the clamp is final on the second one, rule G
+    // folds the drift there, and the third lays out the rows from the start.
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.len(), 3);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    app.log.assert_covered(0.0, 400.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+
+    // The landing was drawn at the start and goes with the next frame, rule Z's.
+    assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    ui.assert_invariants();
+    drop(root);
+
+    // The same through a waiting focus, which lands the same way: no gap, and the
+    // focus commits.
+    app.items = rows(0..200, 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.run_task(&mut root, FocusItem::new(LIST, 105_u32, field(105)));
+    assert!(ui.core().focus.deferred.is_some());
+    drop(root);
+
+    app.items.retain(|item| (100..=109).contains(&item.key));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    app.log.assert_covered(0.0, 400.0);
+    ui.frame(&mut root);
+    assert_eq!(single_focus(&mut ui, &mut root), [field(105)]);
+    ui.assert_invariants();
+}
+
+#[test]
+fn gap_rule_waits_for_the_retained_rows() {
+    // Review F1-R1 F2: 15 rows left after 100 removed above, end pinned. In one
+    // update row 100 shrinks to 0 and row 101 grows to 80, so neither the total nor
+    // row 102's position changes. Measured one by one, the first change alone
+    // would look like rows too short to fill the viewport.
+    let mut app = App::estimated(rows(0..200, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 4000.0);
+    drop(root);
+
+    app.items.drain(0..100);
+    app.items.truncate(15);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert!(ui.end_pinned());
+    let before = app.log.screen()[&102];
+
+    app.log
+        .overrides
+        .borrow_mut()
+        .extend([(100, 0.0), (101, 80.0)]);
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&102], before);
+    ui.assert_invariants();
+}
+
+#[test]
+fn shown_items_are_taken_before_new_settings() {
+    // Review F1-R1 F3: one update removes rows 100..=109 and sets 50 px spacing. Row
+    // 110 was shown at y 400 before it, so it takes the removed anchor's place.
+    let mut app = direct(rows(0..1000, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 4000.0);
+    assert_eq!(app.log.screen()[&110], 400.0);
+    drop(root);
+
+    app.items.retain(|item| !(100..=109).contains(&item.key));
+    app.spacing = 50.0;
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&110], 0.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn shrink_runs_once_per_redraw_while_the_parent_clamps() {
+    // Review F1-R1 F4, rule S's guard without a gap: 26 rows of 40 px left after 100
+    // removed above, at 5000. The first pass shrinks the drift. The next passes see
+    // the parent clamp against the shorter content, which is not scrolling, so they
+    // shrink nothing more.
+    let mut app = App::estimated(rows(0..300, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 5000.0);
+    drop(root);
+
+    app.items.drain(0..100);
+    app.items.truncate(26);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.len(), 3);
+    assert_eq!(ui.core().geometry.drift(), 3592.0);
+    assert_eq!(ui.translation(&mut root), 4082.0);
+    assert_eq!(ui.core().geometry.shrunk_at, Some(ui.now));
+    ui.assert_invariants();
 }
