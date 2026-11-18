@@ -289,6 +289,13 @@ impl Heights {
         position.min(len - 1)
     }
 
+    /// The item containing the last grid unit before `y`: an item starting exactly at
+    /// `y` is excluded, and one starting any amount before it is included. O(log n).
+    pub(super) fn position_before(&self, y: f64) -> usize {
+        let unit = (y * f64::from(UNIT)).ceil() - 1.0;
+        self.position_at(unit / f64::from(UNIT))
+    }
+
     /// The sum of the first `count` heights, without spacing, in units.
     fn prefix(&self, count: usize) -> i64 {
         let (mut node, mut sum) = (count, 0);
