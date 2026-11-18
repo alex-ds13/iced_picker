@@ -1,573 +1,159 @@
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+//! A virtualized vertical list for long sequences of items with variable heights.
+//!
+//! A [`ListView`] is content, like a `column`: the application puts it in its own
+//! `scrollable`, with anything else above or below it. Only a window of items around
+//! the visible region exists as widgets, built, laid out and drawn. Every other item
+//! is a height in an index: measured once it has been shown, estimated before that.
+//! The list never moves the scroll offset by itself. It keeps the visible items still
+//! while items above them are measured, inserted or removed, by moving a spacer above
+//! the first item (its drift).
+//!
+//! # When to use it
+//!
+//! Under a couple of thousand simple rows, a `column` in a `scrollable` is simpler:
+//! it keeps every widget's state, every operation reaches every item, and iced
+//! already skips drawing the rows outside the viewport. A list view pays off when the
+//! sequence is long or its rows are expensive to build.
+//!
+//! # Example
+//!
+//! ```
+//! use iced::widget::{Id, scrollable, text};
+//! use iced::widget::operation::Animation;
+//! use iced::{Fill, Task, Widget};
+//! use iced_picker::listview::{self, Action, Align, Selection, list_view};
+//!
+//! const SCROLL: Id = Id::new("contacts-scroll");
+//! const LIST: Id = Id::new("contacts");
+//!
+//! struct Contact {
+//!     id: u64,
+//!     name: String,
+//! }
+//!
+//! struct App {
+//!     contacts: Vec<Contact>,
+//!     selection: Selection<u64>,
+//! }
+//!
+//! #[derive(Debug, Clone)]
+//! enum Message {
+//!     Select(Action<u64>),
+//!     Open(u64),
+//! }
+//!
+//! impl App {
+//!     fn view(&self) -> impl Widget<Message> + '_ {
+//!         let list = list_view(&self.contacts, |_, contact| text(&contact.name))
+//!             .key(|contact| contact.id)
+//!             .id(LIST)
+//!             .scroller(SCROLL)
+//!             .selection(&self.selection, Message::Select)
+//!             .multiple(true)
+//!             .on_activate(Message::Open);
+//!
+//!         scrollable(list).id(SCROLL).height(Fill)
+//!     }
+//!
+//!     fn update(&mut self, message: Message) -> Task<Message> {
+//!         match message {
+//!             Message::Select(action) => {
+//!                 // Keyboard moves ask the application to bring the new cursor
+//!                 // into view, because the list cannot scroll itself.
+//!                 let reveal = action.reveal().copied();
+//!                 self.selection.perform(action);
+//!
+//!                 if let Some(key) = reveal {
+//!                     return listview::scroll_to(LIST, key, Align::Nearest, Animation::Instant);
+//!                 }
+//!             }
+//!             Message::Open(_id) => {}
+//!         }
+//!
+//!         Task::none()
+//!     }
+//! }
+//! ```
+//!
+//! # Contracts and limitations
+//!
+//! * **Keys.** Without [`ListView::key`], an item is identified by its index:
+//!   inserting or removing items above the viewport then shifts the visible
+//!   content, and measured heights and widget state follow the index. With stable
+//!   keys, edits above the first visible item move nothing on screen, except at
+//!   the start of the list: there the list shows the sequence's current
+//!   beginning, so items inserted at the top appear. Duplicate keys are reachable
+//!   by their first position only.
+//! * **Filtering** is the application's: it passes the filtered sequence, and the
+//!   list compares keys on every view to find what changed.
+//! * **Width.** Items outside the window cannot report an intrinsic width, so a
+//!   `Shrink` or `Fit` width takes the available width, like `Fill`.
+//! * **The scroller.** [`scroll_to`], [`focus`] (for items outside the window) and
+//!   [`settle`] move the scrollable named with [`ListView::scroller`]. It must be a
+//!   vertical, start-anchored ancestor of the list with a unique id. Operations
+//!   cannot tell a scrollable's direction or anchor, so this is not checked.
+//! * **Exactness.** An instant [`scroll_to`] lands exactly, provided the items from
+//!   the first one visible at the destination down to the target keep their height
+//!   until the frame at the destination is drawn. A height change in the third update
+//!   pass of a jump that changes how far the scrollable can go is drawn one frame
+//!   late. A smooth one is approximate: items measured during the animation move the
+//!   destination, and a destination beyond the content height the scrollable knows
+//!   is reached instantly.
+//! * **Widget state** of items outside the window is lost, like any widget removed
+//!   from an iced tree. Operations by id reach the items in the window only. Use
+//!   [`focus`] to focus a widget in an item outside it.
+//! * **Drift.** Edits above the viewport, and items above it measured at another
+//!   height than estimated, become drift: a spacer above the first item that keeps
+//!   the visible items still. While there is drift, scrolling toward the start
+//!   moves the items by more or less than the scroll (the drift shrinks with the
+//!   distance to the start), and at the start it is gone. [`settle`] turns it into
+//!   an offset change instead.
+//! * **Estimates.** Unmeasured items count with [`ListView::estimated_height`], at
+//!   least 1 px, or with the first positive measurement, 32 px before that. A jump
+//!   into unmeasured content whose estimate is much larger than the real height can
+//!   build and discard extra items in that frame.
+//! * **Numeric range.** Heights and spacing are kept on a 1/256 px grid. A single
+//!   item's height, the spacing and an explicit estimate are clamped to
+//!   4,194,304 px, so a taller item cannot be scrolled through entirely. A clamped
+//!   item measurement logs a warning once per list.
+//!   Positions beyond about 8 million pixels lose sub-pixel precision (`f32`
+//!   layout).
+//! * **Layout.** Rows that change their own geometry on a redraw must ask for a
+//!   layout. A window shift on a redraw lays out only the list when its last full
+//!   layout's constraints still hold, no task, jump, waiting focus or drift
+//!   correction is in progress, no widget asked for a layout earlier in that update,
+//!   and the shift leaves every measured height, the drift, the estimate and the
+//!   list's size unchanged. Otherwise the list asks for a layout of the whole
+//!   application, which can take more than one update pass to settle, and inside a
+//!   `Component` the component lays out its whole subtree after any change.
+//! * **Selection.** It is the application's [`Selection`]. Keys act only while the
+//!   list itself has the focus. A press that never reaches the list, because an
+//!   overlay or a `Component` around an earlier widget captured it, cannot cancel a
+//!   waiting [`focus`] or unfocus the list, as for iced's text inputs. Lists that
+//!   share a selection see each other's actions only once the application handled
+//!   them.
+//! * **Groups.** An item with sub-items is one item, `column![sticky(header),
+//!   sub_items..]`, whose header sticks while its sub-items scroll by. A stuck
+//!   header is an overlay: give it its own button for the group.
 
-use iced::{
-    Element, Fill, Fit, Pixels, Renderer, Theme, Widget,
-    widget::{Action, Component, Id, button, column, container, sensor, space},
-};
+mod geometry;
+mod heights;
+mod local;
+mod model;
+mod resolve;
+mod selection;
+mod style;
+mod tasks;
+mod widget;
+mod window;
 
-// The v2 candidate stays private and test-only until it replaces this widget.
+// The headless tests use iced's null renderer, which exists in debug builds only.
 #[cfg(all(test, debug_assertions))]
-mod v2;
+mod tests;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Status {
-    pub button: button::Status,
-    pub selected: bool,
-    pub highlighted: bool,
-}
+pub use selection::{Action, Change, Selection};
+pub use style::{Catalog, Status, Style, StyleFn, default};
+pub use tasks::{Align, focus, scroll_to, settle};
+pub use widget::{ListView, list_view};
 
-pub type Style = button::Style;
-
-pub trait Catalog {
-    type Class<'a>;
-    fn default<'a>() -> Self::Class<'a>;
-    fn style(&self, class: &Self::Class<'_>, status: Status) -> Style;
-}
-
-pub type StyleFn<'a, Theme> = Rc<dyn Fn(&Theme, Status) -> Style + 'a>;
-
-impl Catalog for Theme {
-    type Class<'a> = StyleFn<'a, Self>;
-
-    fn default<'a>() -> Self::Class<'a> {
-        Rc::new(default_style)
-    }
-
-    fn style(&self, class: &Self::Class<'_>, status: Status) -> Style {
-        class(self, status)
-    }
-}
-
-pub fn default_style(theme: &Theme, status: Status) -> Style {
-    let Status {
-        button: button_status,
-        selected,
-        highlighted,
-    } = status;
-    listview_item_style(theme, button_status, selected, highlighted)
-}
-
-fn listview_item_style(
-    theme: &Theme,
-    status: button::Status,
-    selected: bool,
-    highlighted: bool,
-) -> button::Style {
-    let palette = theme.palette();
-
-    let text_color = match status {
-        button::Status::Disabled => palette.secondary.strong.color,
-        _ => palette.background.base.text,
-    };
-
-    let tint = |color: iced::Color, alpha: f32| iced::Color { a: alpha, ..color };
-
-    let background = match (status, selected) {
-        (button::Status::Disabled, _) => None,
-
-        (button::Status::Active, true) => Some(tint(palette.primary.base.color, 0.25).into()),
-        (button::Status::Hovered, true) => Some(tint(palette.primary.base.color, 0.35).into()),
-        (button::Status::Pressed, true) => Some(tint(palette.primary.base.color, 0.45).into()),
-
-        (button::Status::Active, false) => None,
-        (button::Status::Hovered, false) => Some(tint(palette.background.base.text, 0.06).into()),
-        (button::Status::Pressed, false) => Some(tint(palette.background.base.text, 0.12).into()),
-    };
-
-    let (border, shadow) = if highlighted {
-        let accent = palette.warning.base.color;
-        (
-            iced::Border {
-                color: accent,
-                width: 1.5,
-                radius: 0.0.into(),
-            },
-            iced::Shadow {
-                color: iced::Color { a: 0.45, ..accent },
-                offset: iced::Vector::new(0.0, 0.0),
-                blur_radius: 6.0,
-            },
-        )
-    } else {
-        (
-            iced::Border {
-                color: iced::Color::TRANSPARENT,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            iced::Shadow::default(),
-        )
-    };
-
-    button::Style {
-        background,
-        text_color,
-        border,
-        shadow,
-        snap: false,
-    }
-}
-
-/// The default estimated height of an item that has not been measured yet.
-pub static ITEM_HEIGHT: f32 = 40.8;
-
-pub struct ListView<'a, 'b, T, Message> {
-    id: Option<Id>,
-    items: Vec<T>,
-    single_selection: bool,
-    selected: HashSet<usize>,
-    filtered_ids: Option<HashSet<usize>>,
-    highlights: Option<HashSet<&'a usize>>,
-    view_item: Box<dyn Fn(usize, T, bool) -> Element<'a, Message> + 'b>,
-    on_selected: Option<Box<dyn Fn(usize, f32) -> Message + 'b>>,
-    on_deselected: Option<Box<dyn Fn(usize) -> Message + 'b>>,
-    clear_selection_maybe: Option<Message>,
-    class: <Theme as Catalog>::Class<'a>,
-    estimated_item_height: f32,
-}
-
-impl<'a, 'b, T, Message> ListView<'a, 'b, T, Message> {
-    pub fn new<F, E>(items: impl IntoIterator<Item = T>, view_item: F) -> Self
-    where
-        F: Fn(usize, T, bool) -> E + 'b,
-        E: Widget<Message> + 'a,
-    {
-        Self {
-            id: None,
-            items: items.into_iter().collect(),
-            single_selection: false,
-            selected: HashSet::new(),
-            filtered_ids: None,
-            highlights: None,
-            view_item: Box::new(move |idx, item, selected| view_item(idx, item, selected).boxed()),
-            on_selected: None,
-            on_deselected: None,
-            clear_selection_maybe: None,
-            class: <Theme as Catalog>::default(),
-            estimated_item_height: ITEM_HEIGHT,
-        }
-    }
-
-    pub fn id(mut self, id: impl Into<Id>) -> Self {
-        self.id = Some(id.into());
-        self
-    }
-
-    pub fn single_selection(mut self) -> Self {
-        self.single_selection = true;
-        self
-    }
-
-    pub fn multiple_selection(mut self) -> Self {
-        self.single_selection = false;
-        self
-    }
-
-    pub fn select(mut self, idx: usize) -> Self {
-        self.selected.insert(idx);
-        self
-    }
-
-    pub fn select_maybe(mut self, idx: Option<usize>) -> Self {
-        if let Some(idx) = idx {
-            self.selected.insert(idx);
-        }
-        self
-    }
-
-    pub fn filter(mut self, filtered_ids: impl IntoIterator<Item = usize>) -> Self {
-        self.filtered_ids = Some(HashSet::from_iter(filtered_ids));
-        self
-    }
-
-    pub fn filter_maybe(mut self, filtered_ids: Option<impl IntoIterator<Item = usize>>) -> Self {
-        self.filtered_ids = filtered_ids.map(HashSet::from_iter);
-        self
-    }
-
-    pub fn on_selected(mut self, on_selected: impl Fn(usize, f32) -> Message + 'b) -> Self {
-        self.on_selected = Some(Box::new(on_selected));
-        self
-    }
-
-    pub fn on_deselected(mut self, on_deselected: impl Fn(usize) -> Message + 'b) -> Self {
-        self.on_deselected = Some(Box::new(on_deselected));
-        self
-    }
-
-    pub fn clear_selection_maybe(mut self, on_selection_cleared: Option<Message>) -> Self {
-        self.clear_selection_maybe = on_selection_cleared;
-        self
-    }
-
-    pub fn style(mut self, style: impl Fn(&Theme, Status) -> Style + 'a) -> Self {
-        self.class = Rc::new(style);
-        self
-    }
-
-    pub fn class(mut self, class: impl Into<<Theme as Catalog>::Class<'a>>) -> Self {
-        self.class = class.into();
-        self
-    }
-
-    /// Sets the height assumed for items that have not been measured yet.
-    ///
-    /// Unmeasured items are laid out with this height (which sizes the
-    /// scroller and the offsets passed to `on_selected`) until they come
-    /// into view and report their real height. It also scales the distance
-    /// at which items start being rendered before they become visible.
-    ///
-    /// Defaults to [`ITEM_HEIGHT`].
-    pub fn estimated_item_height(mut self, height: impl Into<Pixels>) -> Self {
-        self.estimated_item_height = height.into().0;
-        self
-    }
-
-    pub fn highlight(mut self, highlights: impl IntoIterator<Item = &'a usize>) -> Self {
-        self.highlights = Some(HashSet::from_iter(highlights));
-        self
-    }
-
-    fn make_hash(&self, state: &mut State) {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        if let Some(filtered_ids) = &self.filtered_ids {
-            filtered_ids.iter().for_each(|item| item.hash(&mut hasher));
-        } else {
-            self.items
-                .iter()
-                .enumerate()
-                .for_each(|(idx, _item)| idx.hash(&mut hasher));
-        }
-        state.hash = hasher.finish();
-    }
-
-    pub fn offset(&self, state: &State, idx: usize) -> f32 {
-        let filtered_heights_until_idx = state.heights.iter().filter(|(i, _)| {
-            self.filtered_ids.as_ref().is_none_or(|fi| fi.contains(i)) && **i < idx
-        });
-
-        filtered_heights_until_idx.fold(0.0, |offset, (i, eh)| {
-            let h = eh.height(state.selected.contains(i));
-            let height = match h {
-                Height::Unknown => self.estimated_item_height,
-                Height::Known(height) => height,
-            };
-            offset + height
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct State {
-    initialized: bool,
-    selected: HashSet<usize>,
-    visible: HashSet<usize>,
-    hash: u64,
-    heights: HashMap<usize, ElementHeight>,
-    filtered_ids: Option<HashSet<usize>>,
-}
-impl State {
-    fn clear_selection(&mut self) {
-        self.selected.clear();
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum Event<Message> {
-    Select(usize),
-    Deselect(usize),
-    ShowItem(usize, f32),
-    HideItem(usize),
-    ItemResize(usize, f32),
-    Content(Message),
-}
-
-impl<'a, T: Clone, Message: Clone + 'static> Component<'a, Message>
-    for ListView<'a, '_, T, Message>
-{
-    type State = State;
-
-    type Event = Event<Message>;
-
-    fn listen(
-        &self,
-        _state: &Self::State,
-        _event: &iced::Event,
-        _bounds: iced::Rectangle,
-        _cursor: iced_core::mouse::Cursor,
-    ) -> Action<Self::Event> {
-        if let Some(message) = &self.clear_selection_maybe {
-            return Action::publish(Event::Content(message.clone()));
-        }
-        Action::none()
-    }
-
-    fn update(
-        &self,
-        state: &mut Self::State,
-        event: Self::Event,
-        _renderer: &Renderer,
-    ) -> Option<Message> {
-        match event {
-            Event::Select(idx) => {
-                if self.single_selection && !state.selected.is_empty() {
-                    state.selected.clear();
-                    state.selected.insert(idx);
-                } else {
-                    state.selected.insert(idx);
-                }
-                let offset = self.offset(state, idx);
-                return self.on_selected.as_ref().map(|f| f(idx, offset));
-            }
-            Event::Deselect(idx) => {
-                state.selected.remove(&idx);
-                return self.on_deselected.as_ref().map(|f| f(idx));
-            }
-            Event::ShowItem(idx, height) => {
-                log::trace!("ShowItem: idx:{idx}, h: {height}");
-                state.visible.insert(idx);
-                if let Some(h) = state.heights.get_mut(&idx) {
-                    if self.selected.contains(&idx) {
-                        h.selected(height);
-                    } else {
-                        h.unselected(height);
-                    }
-                } else {
-                    let mut h = ElementHeight::unknown();
-                    if self.selected.contains(&idx) {
-                        h.selected(height);
-                    } else {
-                        h.unselected(height);
-                    }
-                    state.heights.insert(idx, h);
-                }
-            }
-            Event::HideItem(idx) => {
-                log::trace!("HideItem: idx:{idx}");
-                state.visible.remove(&idx);
-            }
-            Event::ItemResize(idx, height) => {
-                log::trace!("ItemResize: idx:{idx}, h: {height}");
-                if let Some(h) = state.heights.get_mut(&idx) {
-                    if self.selected.contains(&idx) {
-                        h.selected(height);
-                    } else {
-                        h.unselected(height);
-                    }
-                } else {
-                    let mut h = ElementHeight::unknown();
-                    if self.selected.contains(&idx) {
-                        h.selected(height);
-                    } else {
-                        h.unselected(height);
-                    }
-                    state.heights.insert(idx, h);
-                }
-            }
-            Event::Content(message) => {
-                return Some(message);
-            }
-        };
-        None
-    }
-
-    fn view(&self, state: &Self::State) -> impl Widget<Self::Event, Theme, Renderer> + 'a {
-        let content = self
-            .items
-            .iter()
-            .enumerate()
-            .fold(column![], |col, (idx, item)| {
-                if self
-                    .filtered_ids
-                    .as_ref()
-                    .is_none_or(|fi| fi.contains(&idx))
-                {
-                    let selected = self.selected.contains(&idx);
-                    let highlighted = self.highlights.as_ref().is_some_and(|h| h.contains(&idx));
-                    let el_height = state
-                        .heights
-                        .get(&idx)
-                        .map(|eh| match eh.height(selected) {
-                            Height::Unknown => self.estimated_item_height,
-                            Height::Known(height) => height,
-                        })
-                        .unwrap_or(self.estimated_item_height);
-                    let el: Element<_> = if state.visible.contains(&idx) {
-                        let item = container(
-                            (self.view_item)(idx, item.clone(), selected).map(Event::Content),
-                        );
-                        let class = self.class.clone();
-                        button(item)
-                            .on_press(if !selected {
-                                Event::Select(idx)
-                            } else {
-                                Event::Deselect(idx)
-                            })
-                            .style(move |theme: &Theme, button_status| {
-                                <Theme as Catalog>::style(
-                                    theme,
-                                    &class,
-                                    Status {
-                                        button: button_status,
-                                        selected,
-                                        highlighted,
-                                    },
-                                )
-                            })
-                            .boxed()
-                    } else {
-                        space::horizontal().height(el_height).boxed()
-                    };
-                    let s = sensor(el)
-                        .on_show(move |size| Event::ShowItem(idx, size.height))
-                        .on_hide(Event::HideItem(idx))
-                        .on_resize(move |size| Event::ItemResize(idx, size.height))
-                        .key(state.hash)
-                        .anticipate(self.estimated_item_height * 5.0);
-                    col.push(s)
-                } else {
-                    col
-                }
-            });
-
-        content.width(Fill).height(Fit)
-    }
-
-    fn diff(&mut self, state: &mut Self::State) {
-        if !state.initialized {
-            state.heights = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| (idx, ElementHeight::unknown()))
-                .collect();
-            state.initialized = true;
-        }
-
-        if state.heights.len() != self.items.len() {
-            // Measured heights survive a change in length. Resetting them to the estimate
-            // would resize every placeholder above the viewport and make the view jump. The
-            // heights are keyed by index, so past the changed position they describe a
-            // neighbor, which is still much closer than the estimate and is corrected once
-            // the item is shown again.
-            let len = self.items.len();
-            state.heights.retain(|&idx, _| idx < len);
-            state.visible.retain(|&idx| idx < len);
-            for idx in 0..len {
-                state
-                    .heights
-                    .entry(idx)
-                    .or_insert_with(ElementHeight::unknown);
-            }
-        }
-
-        if self.filtered_ids != state.filtered_ids {
-            state.filtered_ids = self.filtered_ids.clone();
-            state.clear_selection();
-            self.make_hash(state);
-        }
-
-        if self.clear_selection_maybe.is_some() {
-            state.clear_selection();
-        }
-
-        if self.selected != state.selected {
-            state.selected = self.selected.clone();
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ElementHeight {
-    selected: Height,
-    unselected: Height,
-}
-impl ElementHeight {
-    fn unknown() -> Self {
-        Self {
-            selected: Height::Unknown,
-            unselected: Height::Unknown,
-        }
-    }
-
-    fn selected(&mut self, height: impl Into<Height>) {
-        self.selected = height.into();
-    }
-
-    fn unselected(&mut self, height: impl Into<Height>) {
-        self.unselected = height.into();
-    }
-
-    fn height(&self, selected: bool) -> Height {
-        if selected {
-            self.selected
-        } else {
-            self.unselected
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Height {
-    Unknown,
-    Known(f32),
-}
-impl From<f32> for Height {
-    fn from(value: f32) -> Self {
-        Height::Known(value)
-    }
-}
-
-pub fn listview<'a, 'b, T: 'a, Message, F, E>(
-    items: impl IntoIterator<Item = T>,
-    view_item: F,
-) -> ListView<'a, 'b, T, Message>
-where
-    F: Fn(usize, T, bool) -> E + 'b,
-    E: Widget<Message> + 'a,
-{
-    ListView::new(items, view_item)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unmeasured_items_use_the_estimated_height() {
-        let mut list = ListView::<_, ()>::new(0..10, |_, _, _| space::horizontal())
-            .estimated_item_height(50.0);
-        let mut state = State::default();
-        list.diff(&mut state);
-
-        assert_eq!(list.offset(&state, 3), 150.0);
-
-        state.heights.get_mut(&1).unwrap().unselected(20.0);
-        assert_eq!(list.offset(&state, 3), 120.0);
-    }
-
-    #[test]
-    fn measured_heights_survive_a_change_in_length() {
-        let view = |_, _, _| space::horizontal();
-        let mut list = ListView::<_, ()>::new(0..10, view).estimated_item_height(50.0);
-        let mut state = State::default();
-        list.diff(&mut state);
-        for idx in 0..10 {
-            state.heights.get_mut(&idx).unwrap().unselected(20.0);
-        }
-        state.visible.extend([8, 9]);
-
-        let mut shorter = ListView::<_, ()>::new(0..9, view).estimated_item_height(50.0);
-        shorter.diff(&mut state);
-        assert_eq!(shorter.offset(&state, 5), 100.0);
-        assert_eq!(state.heights.len(), 9);
-        assert!(!state.visible.contains(&9));
-
-        let mut longer = ListView::<_, ()>::new(0..11, view).estimated_item_height(50.0);
-        longer.diff(&mut state);
-        assert_eq!(longer.offset(&state, 10), 9.0 * 20.0 + 50.0);
-    }
-}
+use widget::item_limits;

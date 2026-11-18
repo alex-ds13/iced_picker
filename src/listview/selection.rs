@@ -77,6 +77,7 @@ impl<K: Clone + Eq + Hash> Selection<K> {
         Self::default()
     }
 
+    /// Whether `key` is selected.
     pub fn contains(&self, key: &K) -> bool {
         self.selected.contains(key)
     }
@@ -86,10 +87,12 @@ impl<K: Clone + Eq + Hash> Selection<K> {
         self.selected.iter()
     }
 
+    /// The number of selected keys.
     pub fn len(&self) -> usize {
         self.selected.len()
     }
 
+    /// Whether no key is selected.
     pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
     }
@@ -281,7 +284,10 @@ impl<K> Action<K> {
 }
 
 /// A selection change, resolved by the list against its sequence.
+///
+/// More changes may come in later versions: a `match` on it needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Change<K> {
     /// Select only this key: a plain click or arrow.
     Select(K),
@@ -290,9 +296,14 @@ pub enum Change<K> {
     /// Select `keys`, the items from `anchor` to `cursor` in the list's order,
     /// replacing the selection unless `additive` (Ctrl+Shift).
     Range {
+        /// Where the range starts: the selection's anchor, else its cursor, else
+        /// `cursor` itself.
         anchor: K,
+        /// The item the range was extended to, the new cursor.
         cursor: K,
+        /// The items from `anchor` to `cursor`, in the list's order.
         keys: Vec<K>,
+        /// Add the keys to the selection instead of replacing it.
         additive: bool,
     },
     /// Move the cursor only: Ctrl with a move key, in multiple selection.

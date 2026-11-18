@@ -48,6 +48,7 @@ impl<K: Clone + Eq + Hash> Model<K> {
     }
 
     /// The last height measured for the first item with `key`.
+    #[cfg(test)]
     pub(super) fn cached(&self, key: &K) -> Option<f32> {
         self.measured.get(key).copied()
     }
@@ -122,10 +123,13 @@ impl<K: Clone + Eq + Hash> Model<K> {
         }
 
         Some(Rebuilt {
+            #[cfg(test)]
             old_keys,
             old_positions,
             moves,
+            #[cfg(test)]
             duplicates,
+            #[cfg(test)]
             warned,
         })
     }
@@ -164,16 +168,20 @@ impl<K: Clone + Eq + Hash> Model<K> {
 /// How a structural change moved the previous keys.
 #[derive(Debug)]
 pub(super) struct Rebuilt<K> {
+    #[cfg(test)]
     old_keys: Vec<K>,
     old_positions: HashMap<K, u32>,
     /// The new position of each old position. `None` when its key was removed, or
     /// when it was a later duplicate, which cannot be followed by key.
     moves: Vec<Option<u32>>,
+    #[cfg(test)]
     duplicates: usize,
+    #[cfg(test)]
     warned: bool,
 }
 
 impl<K: Eq + Hash> Rebuilt<K> {
+    #[cfg(test)]
     pub(super) fn old_len(&self) -> usize {
         self.old_keys.len()
     }
@@ -183,6 +191,7 @@ impl<K: Eq + Hash> Rebuilt<K> {
     }
 
     /// The old positions that cannot be followed: removed keys and later duplicates.
+    #[cfg(test)]
     pub(super) fn removed(&self) -> impl Iterator<Item = (usize, &K)> + '_ {
         self.moves
             .iter()
@@ -193,11 +202,13 @@ impl<K: Eq + Hash> Rebuilt<K> {
     }
 
     /// Items in the new sequence whose key was already used by an earlier item.
+    #[cfg(test)]
     pub(super) fn duplicates(&self) -> usize {
         self.duplicates
     }
 
     /// Whether this rebuild logged the duplicate warning, which happens once per list.
+    #[cfg(test)]
     pub(super) fn warned(&self) -> bool {
         self.warned
     }
@@ -222,7 +233,7 @@ fn to_u32(position: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{Model, Rebuilt};
-    use crate::listview::v2::heights::{Estimate, Heights};
+    use crate::listview::heights::{Estimate, Heights};
 
     use std::fmt::Debug;
     use std::hash::Hash;

@@ -11,7 +11,7 @@ use super::geometry::Visible;
 use super::heights::Estimate;
 use super::tasks::{FocusItem, ScrollTo, Settle};
 use super::window::{Anchor, Core, Walk};
-use super::{Action, Align, Change, Selection, Status, Style, StyleFn, list_view};
+use super::{Action, Align, Change, Selection, Status, Style, list_view};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1368,8 +1368,18 @@ impl Harness {
         self.list().1.state.downcast_ref()
     }
 
+    /// The walks so far, none for a list without `u32` keys, which only some tests
+    /// inspect.
     fn walks(&self) -> usize {
-        self.core().walks.len()
+        fn find(tree: &Tree) -> Option<&Core<u32>> {
+            if tree.tag == tree::Tag::of::<Core<u32>>() {
+                return Some(tree.state.downcast_ref());
+            }
+
+            tree.children.iter().find_map(find)
+        }
+
+        find(&self.tree).map_or(0, |core| core.walks.len())
     }
 
     fn last_walk(&self) -> Walk {
@@ -2272,27 +2282,38 @@ fn child_first_nonselectable_events_and_traversal() {
 }
 
 #[test]
-fn candidate_implements_widget_for_production_renderer() {
-    fn assert_widget<W: Widget<(), Theme, iced::Renderer>>(_widget: &W) {}
+fn public_api_constructs_with_null_and_production_renderers() {
+    use crate::listview::{
+        self as public, Action, Align, Catalog, Change, ListView, Selection, Status,
+        Style as PublicStyle, StyleFn as PublicStyleFn, list_view as constructor,
+    };
+
+    fn assert_widget<M, W: Widget<M, Theme, iced::Renderer>>(_widget: &W) {}
+
+    /// A message that is not `Clone`.
+    struct Selected(Action<u32>);
 
     let items = [3_u32, 1, 2];
 
-    let list = list_view(&items, |_, number: &u32| text(number.to_string()))
+    // Stable keys, homogeneous rows, every builder.
+    let list = constructor(&items, |_, number: &u32| text(number.to_string()))
         .key(|number: &u32| *number)
         .id(LIST)
+        .scroller(SCROLL)
         .width(Fill)
         .padding(4)
         .spacing(2)
         .estimated_height(20)
         .anticipate(2)
         .highlight([1])
-        .style(super::default);
-    assert_widget(&list);
+        .style(public::default);
+    assert_widget::<(), _>(&list);
     let _: Element<'_, (), Theme, iced::Renderer> = list.boxed();
 
-    // Boxed rows of mixed widgets, indexed keys and a class.
-    let class: StyleFn<'_, Theme> = Box::new(|_theme, _status| Style::default());
-    let list = list_view(&items, |index, number: &u32| {
+    // Boxed rows of mixed widgets, index keys and a class.
+    let class: PublicStyleFn<'_, Theme> =
+        Box::new(|_theme, _status: Status| PublicStyle::default());
+    let list = constructor(&items, |index, number: &u32| {
         if index == 0 {
             text(number.to_string()).boxed()
         } else {
@@ -2300,7 +2321,47 @@ fn candidate_implements_widget_for_production_renderer() {
         }
     })
     .class(class);
-    assert_widget(&list);
+    assert_widget::<(), _>(&list);
+    let _ = <Theme as Catalog>::default();
+
+    // A selection, borrowed or owned, with a message that is not `Clone`.
+    let selection = Selection::new();
+    let list: ListView<'_, u32, u32, _, Selected, Theme, iced::Renderer> =
+        constructor(&items, |_, number: &u32| text(number.to_string()))
+            .key(|number: &u32| *number)
+            .selection(&selection, Selected)
+            .multiple(true)
+            .on_activate(|key| Selected(Change::Select(key).into()));
+    assert_widget::<Selected, _>(&list);
+
+    let owned = constructor(&items, |_, number: &u32| text(number.to_string()))
+        .key(|number: &u32| *number)
+        .selection(selection.clone(), Selected);
+    assert_widget::<Selected, _>(&owned);
+
+    // The tasks, for the same message and key types.
+    let _: iced::Task<Selected> = public::scroll_to(LIST, 1_u32, Align::Start, Animation::Instant);
+    let _: iced::Task<Selected> = public::focus(LIST, 1_u32, field(1));
+    let _: iced::Task<Selected> = public::settle(LIST);
+
+    // An application reads the action out of its message.
+    let _ = |message: Selected| message.0.reveal().copied();
+
+    // The same constructor with the null renderer, laid out and drawn.
+    let log = Rc::new(Log::default());
+    let items: Vec<Item> = rows(0..20, 40.0);
+    let mut root: Root<'_> = scrollable(
+        constructor(&items, |_, item| row(item, &log))
+            .key(|item: &Item| item.key)
+            .id(LIST)
+            .selection(Selection::new(), |_| ()),
+    )
+    .id(SCROLL)
+    .height(Fill)
+    .boxed();
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+    log.assert_covered(0.0, 600.0);
 }
 
 #[test]
@@ -7653,4 +7714,181 @@ fn working_copy_is_kept_until_a_receipt_or_the_selection_changes() {
     ui.key(&mut root, named(Named::ArrowDown), NONE);
     assert_eq!(counts(&ui), (applied + 200 + 100 + 1, rebases + 2));
     app.log.actions.take();
+}
+
+#[test]
+fn example_filter_reorder_expand_remove_and_selection_flow() {
+    // The application keeps its data and passes the items that match its query,
+    // with stable keys: here the even keys, 40 px each. Its update applies each
+    // action before it returns the reveal task.
+    let data = RefCell::new(rows(0..400, 40.0));
+    let divisor = Cell::new(2);
+    let mut app = App::estimated(Vec::new(), 40.0).selectable(true);
+    let filter = |app: &mut App| {
+        app.items = data
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|item| item.key % divisor.get() == 0)
+            .collect();
+    };
+    filter(&mut app);
+
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 2000.0);
+    assert_eq!(app.log.screen()[&100], 0.0);
+
+    // A click, then keys whose reveal tasks go through the scroller.
+    ui.click(&mut root, Point::new(100.0, 100.0), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(104));
+    reveal_step(&mut ui, &mut root, &app, Named::ArrowDown);
+    assert_eq!(ui.translation(&mut root), 2000.0);
+    reveal_step(&mut ui, &mut root, &app, Named::End);
+    assert_eq!(screen_bottom(&app.log, 398), 600.0);
+    reveal_step(&mut ui, &mut root, &app, Named::Home);
+    assert_eq!(app.log.screen()[&0], 0.0);
+
+    ui.scroll(&mut root, 2000.0);
+    ui.click(&mut root, Point::new(100.0, 100.0), NONE);
+    ui.click(&mut root, Point::new(100.0, 140.0), CTRL);
+    ui.click(&mut root, Point::new(100.0, 180.0), CTRL);
+    delivered(&mut ui, &mut root, &app);
+    let selection = Rc::clone(app.selection.as_ref().unwrap());
+    let selected = || {
+        let mut keys: Vec<u32> = selection.borrow().iter().copied().collect();
+        keys.sort_unstable();
+        keys
+    };
+    assert_eq!(selected(), [104, 106, 108]);
+    let serial = ui.serials()[&100];
+    drop(root);
+
+    // A reorder of the same length above the viewport moves nothing on screen.
+    data.borrow_mut().swap(10, 20);
+    filter(&mut app);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    assert_eq!(ui.serials()[&100], serial);
+    drop(root);
+
+    // A new query: the application drops the selected keys that left.
+    divisor.set(4);
+    filter(&mut app);
+    let present: HashSet<u32> = app.items.iter().map(|item| item.key).collect();
+    app.selection
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .retain(|key| present.contains(key));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    assert_eq!(selected(), [104, 108]);
+    drop(root);
+
+    // Expanding an item just above the viewport, and removing one, keep the first
+    // visible item in place. Removing a selected item drops it from the selection.
+    data.borrow_mut()[96].height = Height::Group {
+        header: 30.0,
+        items: 4,
+        item: 40.0,
+    };
+    data.borrow_mut()
+        .retain(|item| item.key != 92 && item.key != 104);
+    filter(&mut app);
+    app.selection
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .retain(|&key| key != 104);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&100], 0.0);
+    assert_eq!(ui.core().geometry.heights.height(23), 190.0);
+    assert_eq!(selected(), [108]);
+    ui.assert_invariants();
+}
+
+#[test]
+fn migration_keeps_index_height_cache_contract() {
+    // The two regressions of the previous widget, through the public constructor
+    // without keys, where an item's index is its key. Rows are 20 px, estimated at
+    // 50 px.
+    fn indexed<'a>(items: &'a [Item], log: &Rc<Log>) -> Root<'a> {
+        let log = Rc::clone(log);
+
+        scrollable(
+            crate::listview::list_view(items, move |_, item| row(item, &log)).estimated_height(50),
+        )
+        .id(SCROLL)
+        .height(Fill)
+        .boxed()
+    }
+
+    let log = Rc::new(Log::default());
+    let view = |items| indexed(items, &log);
+    let offset = |ui: &Harness, position: usize| {
+        let tree = ui.tree.children[0].state.downcast_ref::<Core<usize>>();
+        tree.geometry.heights.offset_of(position)
+    };
+
+    // Unmeasured items count with the estimate, measured ones with their height.
+    let items = rows(0..1000, 20.0);
+    let mut root = view(&items);
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+    let measured = (0..1000)
+        .take_while(|&position| {
+            ui.tree.children[0]
+                .state
+                .downcast_ref::<Core<usize>>()
+                .geometry
+                .heights
+                .is_measured(position)
+        })
+        .count();
+    assert!(measured > 30 && measured < 100);
+    assert_eq!(
+        offset(&ui, 500),
+        20.0 * measured as f64 + 50.0 * (500 - measured) as f64
+    );
+    drop(root);
+
+    // Measured heights survive a change in length: they follow the index. A
+    // returning index gets its height back too, where the previous widget used
+    // the estimate.
+    let items = rows(0..100, 20.0);
+    let mut root = view(&items);
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+
+    for y in [400.0, 800.0, 1200.0, 1400.0] {
+        ui.scroll(&mut root, y);
+    }
+
+    assert_eq!(offset(&ui, 100), 2000.0);
+    drop(root);
+
+    let shorter = rows(0..99, 20.0);
+    let mut root = view(&shorter);
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(offset(&ui, 50), 1000.0);
+    assert_eq!(offset(&ui, 99), 1980.0);
+    drop(root);
+
+    // The new index counts with the estimate until a layout measures it.
+    let longer = rows(0..101, 20.0);
+    let mut root = view(&longer);
+    ui.diff_only(&mut root);
+    assert_eq!(offset(&ui, 100), 2000.0);
+    assert_eq!(offset(&ui, 101), 2050.0);
+    ui.layout(&mut root);
+    assert_eq!(offset(&ui, 101), 2020.0);
 }

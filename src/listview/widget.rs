@@ -1,36 +1,16 @@
-//! Candidate for the virtualized list view that will replace this module's widget.
-//!
-//! It only builds for debug tests until it is complete, because the headless tests
-//! use iced's null renderer, which only exists in debug builds.
+//! The [`ListView`] widget, its builders and its `Widget` implementation.
 //!
 //! A [`ListView`] is content, like a column: the application puts it in its own
 //! scrollable. It builds, lays out and draws only a window of items around the
 //! visible region it learns on every redraw, and keeps the visible items still across
 //! measurements and structural changes by moving a phantom spacer above them.
 
-mod geometry;
-mod heights;
-mod local;
-mod model;
-mod resolve;
-mod selection;
-mod style;
-mod tasks;
-mod window;
-
-#[cfg(test)]
-mod tests;
-
-pub use selection::{Action, Change, Selection};
-
-use selection::Supplied;
-pub use style::{Catalog, Status, Style, StyleFn, default};
-pub use tasks::{Align, focus, scroll_to, settle};
-
-use geometry::Settings;
-use local::LocalLayout;
-use tasks::Exchange;
-use window::{Core, Slot};
+use super::geometry::{self, Settings};
+use super::local::LocalLayout;
+use super::selection::Supplied;
+use super::tasks::Exchange;
+use super::window::{self, Core, Slot};
+use super::{Action, Catalog, Selection, Status, Style, StyleFn};
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -68,26 +48,26 @@ pub struct ListView<'a, T, K, W, Message, Theme = iced::Theme, Renderer = iced::
 where
     Theme: Catalog,
 {
-    items: &'a [T],
-    view: Box<dyn Fn(usize, &'a T) -> W + 'a>,
-    key: Box<dyn Fn(usize, &'a T) -> K + 'a>,
-    id: Option<Id>,
-    scroller: Option<Id>,
-    width: Length,
-    padding: Padding,
-    spacing: f32,
-    estimated_height: Option<f32>,
-    anticipate: usize,
-    highlight: HashSet<K>,
-    selection: Option<Supplied<'a, K>>,
-    on_select: Option<Box<dyn Fn(Action<K>) -> Message + 'a>>,
-    multiple: bool,
-    on_activate: Option<Box<dyn Fn(K) -> Message + 'a>>,
-    class: Theme::Class<'a>,
+    pub(super) items: &'a [T],
+    pub(super) view: Box<dyn Fn(usize, &'a T) -> W + 'a>,
+    pub(super) key: Box<dyn Fn(usize, &'a T) -> K + 'a>,
+    pub(super) id: Option<Id>,
+    pub(super) scroller: Option<Id>,
+    pub(super) width: Length,
+    pub(super) padding: Padding,
+    pub(super) spacing: f32,
+    pub(super) estimated_height: Option<f32>,
+    pub(super) anticipate: usize,
+    pub(super) highlight: HashSet<K>,
+    pub(super) selection: Option<Supplied<'a, K>>,
+    pub(super) on_select: Option<Box<dyn Fn(Action<K>) -> Message + 'a>>,
+    pub(super) multiple: bool,
+    pub(super) on_activate: Option<Box<dyn Fn(K) -> Message + 'a>>,
+    pub(super) class: Theme::Class<'a>,
     /// The widgets of the window, aligned with the tree's children. Built in `diff`
     /// and extended by the walk in `layout`.
-    rows: Vec<W>,
-    _widget: PhantomData<fn(Message) -> Renderer>,
+    pub(super) rows: Vec<W>,
+    pub(super) _widget: PhantomData<fn(Message) -> Renderer>,
 }
 
 /// Creates a [`ListView`] of `items`, building each visible item with `view`.
@@ -171,8 +151,9 @@ where
         }
     }
 
-    /// Names the scrollable that contains the list, which [`scroll_to`], [`focus`] and
-    /// [`settle`] move.
+    /// Names the scrollable that contains the list, which
+    /// [`scroll_to`](super::scroll_to), [`focus`](super::focus) and
+    /// [`settle`](super::settle) move.
     ///
     /// It must be a vertical, start-anchored ancestor with a unique id. Operations
     /// cannot tell a scrollable's direction or anchor, so this is not checked beyond
@@ -211,7 +192,8 @@ where
         self
     }
 
-    /// Sets the height assumed for items that have not been measured yet.
+    /// Sets the height assumed for items that have not been measured yet, at least
+    /// 1 px.
     ///
     /// Without it, the first positive measurement is used, and 32 px before that.
     pub fn estimated_height(mut self, height: impl Into<Pixels>) -> Self {
@@ -277,9 +259,10 @@ where
     /// takes the keyboard focus. Touch presses are left to the scrollable. Keys act
     /// only while the list itself has the focus, not a widget inside an item, and
     /// the keys the list does not handle reach other widgets. A key it handles
-    /// cancels a [`focus`] that is still waiting, like a press. Keyboard actions
-    /// carry [`Action::reveal`]: the list cannot scroll itself, so the application
-    /// brings the new cursor into view with [`scroll_to`].
+    /// cancels a [`focus`](super::focus) that is still waiting, like a press.
+    /// Keyboard actions carry [`Action::reveal`]: the list cannot scroll itself, so
+    /// the application brings the new cursor into view with
+    /// [`scroll_to`](super::scroll_to).
     ///
     /// A stuck `Sticky` header is drawn by an overlay, where the list sees no
     /// cursor: a press on it selects nothing, and leaves the list unfocused when it
@@ -329,7 +312,7 @@ where
         self
     }
 
-    fn settings(&self) -> Settings {
+    pub(super) fn settings(&self) -> Settings {
         Settings {
             padding: self.padding,
             spacing: self.spacing,
@@ -359,7 +342,7 @@ where
 
 /// The limits of every item (section 4.3): the content width, and a height that is
 /// compressed to the intrinsic one, so `Fill` items take their natural height.
-fn item_limits(width: f32, limits: &layout::Limits) -> layout::Limits {
+pub(super) fn item_limits(width: f32, limits: &layout::Limits) -> layout::Limits {
     layout::Limits::with_flags(
         Size::new(width, 0.0),
         Size::new(width, limits.max.height),

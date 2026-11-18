@@ -138,16 +138,21 @@ pub(super) struct Slot<K> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Walk {
     /// Rows built, which got a new tree.
+    #[cfg(test)]
     pub(super) built: usize,
     /// Rows laid out, each at most once.
+    #[cfg(test)]
     pub(super) measured: usize,
     /// Measured rows whose indexed height changed, or whose height was invalid.
     pub(super) changed: usize,
     /// Rows dropped at the end.
+    #[cfg(test)]
     pub(super) evicted: usize,
     /// Rows built and dropped by the same walk, which is wasted work.
+    #[cfg(test)]
     pub(super) discarded: usize,
     /// The walk ran inside a redraw with cached limits, not in a full layout.
+    #[cfg(test)]
     pub(super) local: bool,
 }
 
@@ -485,7 +490,8 @@ impl<K: Clone + Eq + Hash> Core<K> {
     }
 
     /// Checks invariants I1 and I2 (section 4.4) and the alignment of the window with
-    /// the tree and the rows.
+    /// the tree and the rows, in debug builds.
+    #[cfg(debug_assertions)]
     fn check(&self, visible: Visible, children: &[Tree], rows: usize) {
         let geometry = &self.geometry;
 
@@ -542,6 +548,9 @@ where
         x: f32,
         local: bool,
     ) -> Walk {
+        #[cfg(not(test))]
+        let _ = local;
+
         let visible = core.geometry.visible.unwrap_or(Visible::GUESS);
 
         let mut walker = Walker {
@@ -553,8 +562,10 @@ where
             renderer,
             limits: *limits,
             fresh: Vec::new(),
+            #[cfg(test)]
             new: Vec::new(),
             walk: Walk {
+                #[cfg(test)]
                 local,
                 ..Walk::default()
             },
@@ -565,6 +576,8 @@ where
         walker.place(x);
         walker.core.geometry.laid_out = Some(visible);
         walker.core.geometry.dirty = false;
+
+        #[cfg(debug_assertions)]
         walker
             .core
             .check(visible, walker.children, walker.rows.len());
@@ -587,7 +600,9 @@ struct Walker<'w, 'a, T, K, W, Message, Theme, Renderer> {
     limits: Limits,
     /// Whether each window row was laid out in this walk, aligned with the window.
     fresh: Vec<bool>,
-    /// Whether each window row was built by this walk, aligned with the window.
+    /// Whether each window row was built by this walk, aligned with the window, for
+    /// the statistics of the tests.
+    #[cfg(test)]
     new: Vec<bool>,
     walk: Walk,
     _widget: PhantomData<fn(Message, Theme)>,
@@ -602,10 +617,18 @@ where
         let len = self.core.model.len();
         let anticipate = self.core.geometry.settings().anticipate;
         self.fresh = vec![false; self.core.window.len()];
-        self.new = vec![false; self.core.window.len()];
+
+        #[cfg(test)]
+        {
+            self.new = vec![false; self.core.window.len()];
+        }
 
         if len == 0 {
-            self.walk.evicted = self.core.window.len();
+            #[cfg(test)]
+            {
+                self.walk.evicted = self.core.window.len();
+            }
+
             self.core.window.clear();
             self.rows.clear();
             self.children.clear();
@@ -687,12 +710,16 @@ where
             .map(|slot| (lowest..=highest).contains(&slot.position))
             .collect();
 
-        self.walk.evicted = keep.iter().filter(|&&keep| !keep).count();
-        self.walk.discarded = keep
-            .iter()
-            .zip(&self.new)
-            .filter(|&(&keep, &new)| !keep && new)
-            .count();
+        #[cfg(test)]
+        {
+            self.walk.evicted = keep.iter().filter(|&&keep| !keep).count();
+            self.walk.discarded = keep
+                .iter()
+                .zip(&self.new)
+                .filter(|&(&keep, &new)| !keep && new)
+                .count();
+        }
+
         retain(&mut self.core.window, &keep);
         retain(self.rows, &keep);
         retain(self.children, &keep);
@@ -789,7 +816,10 @@ where
             .model
             .record(position, height, &mut core.geometry.heights);
 
-        self.walk.measured += 1;
+        #[cfg(test)]
+        {
+            self.walk.measured += 1;
+        }
 
         if recorded != Recorded::Unchanged {
             self.walk.changed += 1;
@@ -816,8 +846,12 @@ where
                 self.rows.insert(index, row);
                 self.children.insert(index, tree);
                 self.fresh.insert(index, false);
-                self.new.insert(index, true);
-                self.walk.built += 1;
+
+                #[cfg(test)]
+                {
+                    self.new.insert(index, true);
+                    self.walk.built += 1;
+                }
 
                 index
             }

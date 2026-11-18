@@ -59,6 +59,7 @@ impl Estimate {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn value(self) -> f32 {
         to_pixels(i64::from(self.units())) as f32
     }
@@ -98,6 +99,8 @@ pub(super) struct Heights {
     /// In units, at most `MAX_UNITS`.
     spacing: u32,
     estimate: Estimate,
+    /// A measurement was clamped to `MAX_UNITS` and logged.
+    clamped: bool,
     /// Fenwick nodes visited, to check that lookups and updates stay logarithmic.
     #[cfg(test)]
     probes: Cell<usize>,
@@ -112,6 +115,7 @@ impl Heights {
             sum: 0,
             spacing: 0,
             estimate,
+            clamped: false,
             #[cfg(test)]
             probes: Cell::new(0),
         }
@@ -174,6 +178,7 @@ impl Heights {
         to_pixels(i64::from(self.heights[position])) as f32
     }
 
+    #[cfg(test)]
     pub(super) fn is_measured(&self, position: usize) -> bool {
         self.measured[position]
     }
@@ -216,6 +221,15 @@ impl Heights {
 
         let units = quantize(height);
         let previous = self.heights[position];
+
+        if units == MAX_UNITS && !self.clamped {
+            self.clamped = true;
+            log::warn!(
+                "list_view: the height {height} of the item at position {position} is \
+                 clamped to {} px",
+                MAX_UNITS / UNIT
+            );
+        }
         self.measured[position] = true;
 
         let recorded = if units == previous {
@@ -676,6 +690,12 @@ mod tests {
         index.rebuild([None, Some(1.0e9)]);
         assert_eq!(index.height(1), max);
         assert_eq!(index.total(), 3.0 * f64::from(max));
+
+        // A measurement past the maximum is clamped, and noted for a single warning.
+        assert!(!index.clamped);
+        index.set(0, 5.0e6);
+        assert_eq!(index.height(0), max);
+        assert!(index.clamped);
 
         // Jitter below half a unit is not a change. Half a unit or more is.
         let mut index = Heights::new(Estimate::given(10.0));

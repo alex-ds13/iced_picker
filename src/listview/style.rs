@@ -3,7 +3,11 @@
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 /// The state of one drawn item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// More fields may come in later versions, so it cannot be built with a struct
+/// literal outside this crate. `Status::default()` has every field `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Status {
     /// The cursor is over the item.
     pub hovered: bool,
