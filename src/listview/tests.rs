@@ -8124,3 +8124,88 @@ fn shrink_runs_once_per_redraw_while_the_parent_clamps() {
     assert_eq!(ui.core().geometry.shrunk_at, Some(ui.now));
     ui.assert_invariants();
 }
+
+#[test]
+fn estimate_adopts_the_median_of_the_first_walk() {
+    use super::heights::Estimate;
+
+    let estimate = |ui: &Harness| ui.core().geometry.heights.estimate();
+
+    // A tall first row, like an expanded item, among normal rows: the unmeasured
+    // rows count with the normal height, not the tall one.
+    let mut items = rows(0..1000, 40.0);
+    items[0].height = Height::Fixed(100.0);
+    let app = App::new(items);
+    let mut root = app.view();
+    let ui = Harness::new(&mut root, &app.log);
+    assert_eq!(estimate(&ui), Estimate::Measured(40 * 256));
+    assert_eq!(ui.list().1.size.height, 100.0 + 999.0 * 40.0);
+    drop(root);
+
+    // Mixed heights: their median, the lower middle one of an even count.
+    let items: Vec<Item> = (0..1000)
+        .map(|key| Item {
+            key,
+            height: Height::Fixed([20.0, 50.0, 30.0, 90.0][key as usize % 4]),
+        })
+        .collect();
+    let app = App::new(items);
+    let mut root = app.view();
+    let ui = Harness::new(&mut root, &app.log);
+    assert_eq!(estimate(&ui), Estimate::Measured(30 * 256));
+    drop(root);
+
+    // A first walk of empty rows adopts nothing. The next walk that measures
+    // positive heights does.
+    let app = App::new(rows(0..10, 0.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    assert_eq!(estimate(&ui), Estimate::Provisional);
+
+    for key in 0..10 {
+        app.log.overrides.borrow_mut().insert(key, 25.0);
+    }
+
+    ui.rebuild(&mut root);
+    assert_eq!(estimate(&ui), Estimate::Measured(25 * 256));
+    drop(root);
+
+    // An explicit estimate is never replaced.
+    let app = App::estimated(rows(0..1000, 40.0), 100.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 20_000.0);
+    assert_eq!(estimate(&ui), Estimate::Given(100 * 256));
+}
+
+#[test]
+fn adopting_an_estimate_keeps_the_visible_rows_still() {
+    use super::heights::Estimate;
+
+    // Rows of 30 px estimated at 80, scrolled into the middle, where most rows above
+    // were never measured. Dropping the estimate goes back to the provisional one,
+    // and the next walk adopts 30: the unmeasured rows above change height, and the
+    // visible rows stay where they are.
+    let mut app = App::estimated(rows(0..2000, 30.0), 80.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 40_000.0);
+    let screen = app.log.screen();
+    drop(root);
+
+    app.estimate = None;
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(
+        ui.core().geometry.heights.estimate(),
+        Estimate::Measured(30 * 256)
+    );
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(app.log.screen(), screen);
+    ui.assert_invariants();
+    assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+}

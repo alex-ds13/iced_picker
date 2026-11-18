@@ -684,6 +684,15 @@ where
         };
 
         walker.run(visible);
+
+        // Without an estimate from the application, the end of the first walk that
+        // measured positive heights adopts their median. The unmeasured items above
+        // the anchor change height then, which is absorbed before the rows are placed,
+        // so nothing visible moves.
+        if walker.core.geometry.heights.adopt() {
+            walker.core.absorb();
+        }
+
         walker.place(x);
         walker.core.geometry.laid_out = Some(visible);
         walker.core.geometry.dirty = false;

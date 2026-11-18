@@ -39,9 +39,9 @@ fn to_pixels(units: i64) -> f64 {
 pub(super) enum Estimate {
     /// Set by the application. Measurements never replace it.
     Given(u32),
-    /// No positive measurement exists yet.
+    /// No positive measurement was adopted yet.
     Provisional,
-    /// Adopted from the first positive measurement.
+    /// Adopted from the median of the positive heights measured in a walk.
     Measured(u32),
 }
 
@@ -151,7 +151,8 @@ impl Heights {
     /// Applies the application's estimate, `None` when it gives none.
     ///
     /// Returns whether the estimate changed. Dropping a given estimate goes back to
-    /// the provisional one until the next positive measurement.
+    /// the provisional one until the end of the next walk, where [`Heights::adopt`]
+    /// takes the median of the measured heights.
     pub(super) fn set_estimate(&mut self, given: Option<f32>) -> bool {
         let estimate = match (given, self.estimate) {
             (Some(height), _) => Estimate::given(height),
@@ -206,9 +207,7 @@ impl Heights {
         self.build_tree();
     }
 
-    /// Records a measured height, rounded to the nearest 1/256 px. O(log n), except
-    /// for the one-time adoption of the first positive measurement as the estimate,
-    /// which rewrites every unmeasured item.
+    /// Records a measured height, rounded to the nearest 1/256 px. O(log n).
     ///
     /// [`Recorded::Unchanged`] compares the rounded heights, so jitter below half a
     /// unit is not a change. Local relayout relies on this comparison to decide
@@ -239,15 +238,48 @@ impl Heights {
             Recorded::Changed
         };
 
-        if self.estimate == Estimate::Provisional && units > 0 {
-            self.estimate = Estimate::Measured(units.max(Estimate::MIN_UNITS));
-            // The rebuild also picks up this item's new height.
-            self.rewrite_unmeasured();
-        } else if recorded == Recorded::Changed {
+        if recorded == Recorded::Changed {
             self.add(position, i64::from(units) - i64::from(previous));
         }
 
         recorded
+    }
+
+    /// While the estimate is provisional, adopts the median of the current heights of
+    /// the measured items with a positive height, one value per item, the lower of
+    /// the two middle ones for an even count, at least [`Estimate::MIN`], and rewrites
+    /// every unmeasured item with it. Once: the estimate then stays, because changing
+    /// it moves every unmeasured item. Without a measured positive height nothing
+    /// happens, and the estimate stays provisional. Nothing is kept between calls.
+    /// O(n).
+    ///
+    /// The median reduces the effect of an unusual item, such as an expanded first
+    /// row, when several typical ones are measured. Returns whether the estimate
+    /// changed.
+    pub(super) fn adopt(&mut self) -> bool {
+        if self.estimate != Estimate::Provisional {
+            return false;
+        }
+
+        let mut heights: Vec<u32> = self
+            .heights
+            .iter()
+            .zip(&self.measured)
+            .filter(|&(&height, &measured)| measured && height > 0)
+            .map(|(&height, _)| height)
+            .collect();
+
+        if heights.is_empty() {
+            return false;
+        }
+
+        let middle = (heights.len() - 1) / 2;
+        let (_, &mut median, _) = heights.select_nth_unstable(middle);
+
+        self.estimate = Estimate::Measured(median.max(Estimate::MIN_UNITS));
+        self.rewrite_unmeasured();
+
+        true
     }
 
     /// The top of the item at `position`. At `len` it is the bottom of the last item
@@ -736,11 +768,21 @@ mod tests {
         assert_eq!(index.position_at(f64::from(Estimate::PROVISIONAL)), 2);
         assert_eq!(index.total(), 4.0 * f64::from(Estimate::PROVISIONAL));
 
-        // The first positive measurement is adopted once and only rewrites unknown rows.
+        // Only zeros so far: nothing to adopt, and the estimate stays provisional.
+        assert!(!index.adopt());
+        assert_eq!(index.estimate(), Estimate::Provisional);
+
+        // Positive heights are kept until a walk ends and adopts their median, the
+        // lower middle one of an even count. It only rewrites unknown rows, and only
+        // once.
         assert_eq!(index.set(2, 20.0), Recorded::Changed);
+        assert_eq!(index.set(3, 50.0), Recorded::Changed);
+        assert_eq!(index.estimate(), Estimate::Provisional);
+        assert!(index.adopt());
         assert_eq!(index.estimate(), Estimate::Measured(20 * UNIT));
         assert_eq!(index.estimate().value(), 20.0);
-        assert_eq!(index.set(3, 50.0), Recorded::Changed);
+        assert_eq!(index.set(3, 50.0), Recorded::Unchanged);
+        assert!(!index.adopt());
         assert_eq!(index.estimate(), Estimate::Measured(20 * UNIT));
 
         let heights: Vec<f32> = (0..5).map(|position| index.height(position)).collect();
@@ -757,10 +799,11 @@ mod tests {
         assert_eq!(index.height(1), 20.0);
         assert_eq!(index.position_at(0.0), 1);
 
-        // A positive height below the minimum adopts the minimum.
+        // A median below the minimum adopts the minimum.
         let mut tiny = Heights::new(Estimate::Provisional);
         tiny.rebuild([None, None]);
         tiny.set(0, 0.25);
+        assert!(tiny.adopt());
         assert_eq!(tiny.estimate(), Estimate::Measured(Estimate::MIN_UNITS));
         assert_eq!(tiny.height(0), 0.25);
         assert_eq!(tiny.height(1), Estimate::MIN);
@@ -773,11 +816,13 @@ mod tests {
         given.rebuild([None; 3]);
         given.set(0, 0.0);
         given.set(1, 25.0);
+        assert!(!given.adopt());
         assert_eq!(given.estimate(), Estimate::Given(10 * UNIT));
         assert_eq!(given.height(2), 10.0);
 
         // Changing the given estimate rewrites only unknown rows. Dropping it goes back
-        // to the provisional estimate, which the next positive measurement replaces.
+        // to the provisional estimate, which the median of the next positive
+        // measurements replaces.
         assert!(given.set_estimate(Some(12.0)));
         assert!(!given.set_estimate(Some(12.0)));
         assert_eq!(
@@ -789,6 +834,7 @@ mod tests {
         assert_eq!(given.height(2), Estimate::PROVISIONAL);
         assert!(!given.set_estimate(None));
         given.set(1, 30.0);
+        assert!(given.adopt());
         assert_eq!(given.estimate(), Estimate::Measured(30 * UNIT));
         assert_eq!(given.height(2), 30.0);
         assert_eq!(given.total(), 60.0);
@@ -848,5 +894,44 @@ mod tests {
         index.rebuild([Some(f32::NAN), Some(-2.0), Some(3.0)]);
         assert!(!index.is_measured(0) && !index.is_measured(1));
         assert_eq!(index.total(), 67.0);
+    }
+
+    #[test]
+    fn adoption_takes_the_median_of_measured_heights() {
+        let median = |heights: &[f32]| {
+            let mut index = Heights::new(Estimate::Provisional);
+            index.rebuild(vec![None; heights.len() + 1]);
+
+            for (position, &height) in heights.iter().enumerate() {
+                index.set(position, height);
+            }
+
+            assert!(index.adopt());
+            index.estimate().value()
+        };
+
+        // One tall first row does not set the estimate of the others.
+        assert_eq!(median(&[100.0, 40.0, 40.0, 40.0, 40.0]), 40.0);
+        // Odd and even counts, the lower middle of an even one. Zeros do not count.
+        assert_eq!(median(&[30.0, 10.0, 20.0]), 20.0);
+        assert_eq!(median(&[30.0, 10.0, 20.0, 40.0]), 20.0);
+        assert_eq!(median(&[0.0, 0.0, 50.0, 0.0]), 50.0);
+        // On the 1/256 px grid.
+        assert_eq!(median(&[10.3, 10.2, 10.1]), 2611.0 / 256.0);
+
+        // One value per item: measuring one tall item again and again, as repeated
+        // scroll_to resolutions do, does not outweigh the other measured items.
+        let mut index = Heights::new(Estimate::Provisional);
+        index.rebuild([None; 5]);
+
+        for _ in 0..1000 {
+            index.set(0, 100.0);
+        }
+
+        index.set(1, 40.0);
+        index.set(2, 40.0);
+        assert!(index.adopt());
+        assert_eq!(index.estimate().value(), 40.0);
+        assert_eq!(index.height(4), 40.0);
     }
 }

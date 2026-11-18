@@ -114,7 +114,15 @@
 //!   reach into the viewport, the items move up to the viewport's top, or to their
 //!   natural position when they are too few to fill it.
 //! * **Estimates.** Unmeasured items count with [`ListView::estimated_height`], at
-//!   least 1 px, or with the first positive measurement, 32 px before that. A jump
+//!   least 1 px. Without it, the estimate is the median of the heights of the items
+//!   measured so far (those of 0 px left out, and items measured by [`scroll_to`]
+//!   or [`focus`] included), the lower middle one for an even count, taken once at
+//!   the end of the first layout that measured a positive height. 32 px is used
+//!   before that. The median reduces the effect of an unusual item, such as an
+//!   expanded first row, when several typical items are measured, but with few of
+//!   them (for example with `.anticipate(0)` and a tall first item) the unusual one
+//!   can still set it. An explicit estimate avoids that. The adoption is absorbed like any
+//!   measurement, so nothing visible moves, and the estimate then stays. A jump
 //!   into unmeasured content whose estimate is much larger than the real height can
 //!   build and discard extra items in that frame.
 //! * **Numeric range.** Heights and spacing are kept on a 1/256 px grid. A single

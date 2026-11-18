@@ -195,7 +195,13 @@ where
     /// Sets the height assumed for items that have not been measured yet, at least
     /// 1 px.
     ///
-    /// Without it, the first positive measurement is used, and 32 px before that.
+    /// Without it, the estimate is the median of the heights of the items measured so
+    /// far (those of 0 px left out, items measured by tasks included), the lower
+    /// middle one for an even count, taken once at the end of the first layout that
+    /// measured a positive height, and 32 px before that. With few measured items an
+    /// unusual one, such as a tall first item, can still set it, which an explicit
+    /// estimate avoids. An explicit estimate is never replaced. Dropping it goes back to
+    /// 32 px until the next walk adopts a median.
     pub fn estimated_height(mut self, height: impl Into<Pixels>) -> Self {
         self.estimated_height = Some(height.into().0);
         self
