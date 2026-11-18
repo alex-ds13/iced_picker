@@ -13,6 +13,7 @@ mod heights;
 mod local;
 mod model;
 mod resolve;
+mod selection;
 mod style;
 mod tasks;
 mod window;
@@ -20,6 +21,9 @@ mod window;
 #[cfg(test)]
 mod tests;
 
+pub use selection::{Action, Change, Selection};
+
+use selection::Supplied;
 pub use style::{Catalog, Status, Style, StyleFn, default};
 pub use tasks::{Align, focus, scroll_to, settle};
 
@@ -28,6 +32,7 @@ use local::LocalLayout;
 use tasks::Exchange;
 use window::{Core, Slot};
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -37,12 +42,9 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::shell::Invalidation;
-use iced::advanced::widget::operation::Focusable;
 use iced::advanced::widget::{Id, Meta, Operation, Tree, tree};
 use iced::advanced::{Shell, Widget};
-use iced::{
-    Background, Color, Event, Length, Padding, Pixels, Rectangle, Size, Vector, mouse, touch,
-};
+use iced::{Background, Color, Event, Length, Padding, Pixels, Rectangle, Size, Vector, mouse};
 
 /// The items materialized beyond each edge of the viewport by default.
 const ANTICIPATE: usize = 4;
@@ -77,6 +79,10 @@ where
     estimated_height: Option<f32>,
     anticipate: usize,
     highlight: HashSet<K>,
+    selection: Option<Supplied<'a, K>>,
+    on_select: Option<Box<dyn Fn(Action<K>) -> Message + 'a>>,
+    multiple: bool,
+    on_activate: Option<Box<dyn Fn(K) -> Message + 'a>>,
     class: Theme::Class<'a>,
     /// The widgets of the window, aligned with the tree's children. Built in `diff`
     /// and extended by the walk in `layout`.
@@ -108,6 +114,10 @@ where
         estimated_height: None,
         anticipate: ANTICIPATE,
         highlight: HashSet::new(),
+        selection: None,
+        on_select: None,
+        multiple: false,
+        on_activate: None,
         class: Theme::default(),
         rows: Vec::new(),
         _widget: PhantomData,
@@ -121,8 +131,9 @@ where
     /// Identifies items by `key` instead of their index.
     ///
     /// Measured heights and widget state follow the key, so inserting, removing or
-    /// reordering items moves neither. Call it before [`Self::highlight`], whose keys
-    /// it drops.
+    /// reordering items moves neither. Call it before [`Self::highlight`],
+    /// [`Self::selection`] and [`Self::on_activate`], which it drops because they
+    /// use the key type.
     pub fn key<Key>(
         self,
         key: impl Fn(&'a T) -> Key + 'a,
@@ -132,6 +143,10 @@ where
     {
         if !self.highlight.is_empty() {
             log::warn!("list_view: `key` drops the keys passed to `highlight` before it");
+        }
+
+        if self.selection.is_some() || self.on_activate.is_some() {
+            log::warn!("list_view: `key` drops the `selection` and `on_activate` before it");
         }
 
         ListView {
@@ -146,13 +161,16 @@ where
             estimated_height: self.estimated_height,
             anticipate: self.anticipate,
             highlight: HashSet::new(),
+            selection: None,
+            on_select: None,
+            multiple: self.multiple,
+            on_activate: None,
             class: self.class,
             rows: Vec::new(),
             _widget: PhantomData,
         }
     }
 
-    /// Sets the [`Id`] of the list.
     /// Names the scrollable that contains the list, which [`scroll_to`], [`focus`] and
     /// [`settle`] move.
     ///
@@ -166,6 +184,7 @@ where
         self
     }
 
+    /// Sets the [`Id`] of the list, which its tasks and focus operations use.
     pub fn id(mut self, id: impl Into<Id>) -> Self {
         self.id = Some(id.into());
         self
@@ -212,6 +231,84 @@ where
         K: Eq + Hash,
     {
         self.highlight.extend(keys);
+        self
+    }
+
+    /// Makes the items selectable: clicks, taps and keys emit `on_select` with the
+    /// [`Action`] to apply to `selection`, which the application owns
+    /// ([`Selection::perform`]). Without it the list captures no input.
+    ///
+    /// `selection` is a reference, or an owned copy where the selection cannot be
+    /// borrowed for as long as the list, as in a `Component`'s state. The list
+    /// draws the selection it is given. Input that arrives before the application
+    /// handled the list's earlier actions is resolved against the selection with
+    /// those actions applied. They belong to the list that emitted them: lists that
+    /// share a selection see each other's actions only once the application handled
+    /// them. Until then the list assumes each action took effect as emitted: an
+    /// owner that applies something else instead is followed once it handled the
+    /// message, for example when a `Component` that notifies its parent has the
+    /// parent handle it.
+    ///
+    /// | Input | Single | Multiple |
+    /// | --- | --- | --- |
+    /// | Click | `Select` | `Select` |
+    /// | Ctrl click | `Clear` on the selected item, else `Select` | `Toggle` |
+    /// | Shift click | `Select` | `Range` from the anchor, replacing |
+    /// | Ctrl+Shift click | `Select` | `Range` from the anchor, added |
+    /// | Click below the last item | `Clear` | `Clear` |
+    /// | Tap (the finger moved at most 5 px) | `Select` | `Select` |
+    /// | Up, Down, Page Up, Page Down, Home, End | `Select` | `Select`, Ctrl: `Cursor`, Shift and Ctrl+Shift: `Range` |
+    /// | Space | `Select` the cursor | `Select`, Ctrl: `Toggle` the cursor |
+    /// | Ctrl+A | not handled | `All` |
+    /// | Escape | `Clear` a selection | `Clear` a selection |
+    /// | Enter | `on_activate` the cursor | `on_activate` the cursor |
+    /// | Double click | `on_activate` the item | `on_activate` the item |
+    ///
+    /// A range starts at the selection's anchor, else its cursor, else the clicked
+    /// item, and lists the items between in the sequence's order. Moves start at the
+    /// cursor, else at the first visible item, and skip later duplicates of a key. A
+    /// page is the visible height by the indexed heights, which are estimates for
+    /// the items not measured yet, and a page point in the spacing between two
+    /// items goes to the item below.
+    ///
+    /// A left press that a widget inside an item took belongs to that widget, and
+    /// unfocuses the list. A selectable list captures the other left presses on its
+    /// items, which also keeps the runtime from starting a text selection there, and
+    /// takes the keyboard focus. Touch presses are left to the scrollable. Keys act
+    /// only while the list itself has the focus, not a widget inside an item, and
+    /// the keys the list does not handle reach other widgets. A key it handles
+    /// cancels a [`focus`] that is still waiting, like a press. Keyboard actions
+    /// carry [`Action::reveal`]: the list cannot scroll itself, so the application
+    /// brings the new cursor into view with [`scroll_to`].
+    ///
+    /// A stuck `Sticky` header is drawn by an overlay, where the list sees no
+    /// cursor: a press on it selects nothing, and leaves the list unfocused when it
+    /// reaches the list (an overlay that captures it does not pass it on). Give the
+    /// header its own button for the group.
+    pub fn selection(
+        mut self,
+        selection: impl Into<Cow<'a, Selection<K>>>,
+        on_select: impl Fn(Action<K>) -> Message + 'a,
+    ) -> Self
+    where
+        K: Clone + Eq + Hash,
+    {
+        self.selection = Some(selection.into().into());
+        self.on_select = Some(Box::new(on_select));
+        self
+    }
+
+    /// Allows selecting several items, with Ctrl, Shift and Ctrl+A. Single selection
+    /// by default.
+    pub fn multiple(mut self, multiple: bool) -> Self {
+        self.multiple = multiple;
+        self
+    }
+
+    /// Emits `on_activate` with the key of a double clicked item, or of the cursor
+    /// on Enter. Only a selectable list handles them.
+    pub fn on_activate(mut self, on_activate: impl Fn(K) -> Message + 'a) -> Self {
+        self.on_activate = Some(Box::new(on_activate));
         self
     }
 
@@ -325,8 +422,9 @@ where
         let core = state.downcast_mut::<Core<K>>();
 
         // A new widget may bring new limits or settings. Only a full layout caches
-        // them again.
+        // them again. It may also bring another selection.
         core.geometry.local = None;
+        core.input.rebase = true;
 
         let configured = core.configure(self.settings());
 
@@ -444,21 +542,7 @@ where
             row.update(tree, event, layout, cursor, renderer, shell, viewport);
         }
 
-        // A press outside the list, or one any widget took, also before the list,
-        // unfocuses the list and cancels a deferred focus (section 4.7). Any other
-        // press inside still cancels the deferred focus: the user acted before it
-        // landed.
-        if let Event::Mouse(mouse::Event::ButtonPressed(_))
-        | Event::Touch(touch::Event::FingerPressed { .. }) = event
-        {
-            let focus = &mut tree.state.downcast_mut::<Core<K>>().focus;
-
-            if !cursor.is_over(layout.bounds()) || shell.is_event_captured() {
-                focus.unfocus();
-            } else {
-                focus.deferred = None;
-            }
-        }
+        self.input(tree, event, layout, cursor, shell);
 
         // A row that changes its geometry in the redraw asks for a root layout, which
         // the list never downgrades. The remaining passes of the redraw stay full.
@@ -499,6 +583,11 @@ where
         viewport: &Rectangle,
     ) {
         let core = tree.state.downcast_ref::<Core<K>>();
+        let cursor_key = self
+            .selection
+            .as_deref()
+            .and_then(Selection::cursor)
+            .filter(|_| core.focus.focused);
 
         core.draw_landing(geometry::Visible::new(*viewport, layout.bounds()));
 
@@ -521,6 +610,11 @@ where
             let status = Status {
                 hovered: cursor.is_over(bounds),
                 highlighted: self.highlight.contains(&slot.key),
+                selected: self
+                    .selection
+                    .as_deref()
+                    .is_some_and(|selection| selection.contains(&slot.key)),
+                cursor: cursor_key == Some(&slot.key),
             };
             let appearance = <Theme as Catalog>::style(theme, &self.class, status);
 

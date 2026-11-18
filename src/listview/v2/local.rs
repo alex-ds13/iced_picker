@@ -22,8 +22,8 @@ use std::hash::Hash;
 
 use iced::advanced::layout::{Layout, Limits};
 use iced::advanced::shell::Invalidation;
-use iced::advanced::widget::Tree;
-use iced::advanced::widget::operation::focusable;
+use iced::advanced::widget::operation::Focusable;
+use iced::advanced::widget::{Id, Operation, Tree};
 use iced::advanced::{Shell, Widget};
 use iced::time::Instant;
 use iced::{Length, Rectangle, Size};
@@ -143,9 +143,13 @@ where
         allowed.then_some(local)
     }
 
-    /// Focuses the deferred widget once its item is laid out (section 4.7), with the
-    /// fork's global focus operation on the item's subtree. The first part of the
-    /// focus task already unfocused every other widget.
+    /// Focuses the deferred widget once its item is laid out (section 4.7), in the
+    /// item's subtree. The first part of the focus task already unfocused every other
+    /// widget.
+    ///
+    /// Only the item's base tree is visited. A widget that is only in an overlay
+    /// then, like one in a stuck `Sticky` header, is not found: the waiting focus is
+    /// dropped and the list keeps the focus.
     fn commit_focus(
         &mut self,
         tree: &mut Tree,
@@ -176,13 +180,18 @@ where
             return;
         };
 
-        // The list held the focus for the item, and hands it over.
-        core.focus.focused = false;
-
-        let mut focus = focusable::focus::<()>(widget);
+        let mut commit = Commit {
+            target: widget,
+            found: false,
+        };
 
         if let Some((layout, tree)) = layout.iter_mut(&mut tree.children).nth(index) {
-            self.rows[index].operate(tree, layout, viewport, renderer, &mut focus);
+            self.rows[index].operate(tree, layout, viewport, renderer, &mut commit);
+        }
+
+        // The list held the focus for the item, and hands it over.
+        if commit.found {
+            tree.state.downcast_mut::<Core<K>>().focus.focused = false;
         }
     }
 
@@ -223,5 +232,27 @@ where
         }
 
         neutral
+    }
+}
+
+/// Focuses the widget with the target id and unfocuses the others it visits, like
+/// the fork's `focus` operation, and tells whether it found the target.
+struct Commit {
+    target: Id,
+    found: bool,
+}
+
+impl Operation for Commit {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+        if id == Some(&self.target) {
+            state.focus();
+            self.found = true;
+        } else {
+            state.unfocus();
+        }
     }
 }

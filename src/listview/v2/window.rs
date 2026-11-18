@@ -4,6 +4,7 @@
 use super::geometry::{Geometry, Settings, Span, Target, Visible};
 use super::heights::Recorded;
 use super::model::{Model, Rebuilt};
+use super::selection::Input;
 use super::{Catalog, ListView};
 
 use std::cell::{Cell, RefCell};
@@ -35,6 +36,7 @@ pub(super) struct Core<K> {
     /// their jump, which the stored visible region does not show yet.
     pub(super) landing: Option<Landing>,
     pub(super) focus: Focus<K>,
+    pub(super) input: Input<K>,
     /// Positions measured by `resolve`, for the tests.
     #[cfg(test)]
     pub(super) resolved: Vec<usize>,
@@ -173,6 +175,7 @@ impl<K: Clone + Eq + Hash> Core<K> {
                 focused: false,
                 deferred: None,
             },
+            input: Input::default(),
             #[cfg(test)]
             resolved: Vec::new(),
             #[cfg(test)]

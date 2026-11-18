@@ -74,21 +74,25 @@ where
 /// scrolled into view first and focused on the first redraw it is laid out in,
 /// unless something interrupts it. Until then the list holds the focus for it.
 ///
-/// It is interrupted by a later focus change, by the removal of its key, and by any
-/// press the list receives: outside the list or taken by a widget, the press also
-/// unfocuses the list, and inside it only cancels the waiting focus, because the
-/// user acted before it landed. A press that never reaches the list, because a
-/// capturing overlay or a `Component` around an earlier widget stopped it, cannot
-/// cancel it. iced's own text inputs have the same limit: they unfocus themselves
-/// only when they receive a press outside them.
+/// It is interrupted by a later focus change, by the removal of its key, by a key a
+/// selectable list handles, and by any press the list receives: outside the list or
+/// taken by a widget, the press also unfocuses the list, and inside it only cancels
+/// the waiting focus, because the user acted before it landed. A press that never
+/// reaches the list, because a capturing overlay or a `Component` around an earlier
+/// widget stopped it, cannot cancel it. iced's own text inputs have the same limit:
+/// they unfocus themselves only when they receive a press outside them.
 ///
 /// Focusing an item off the window does nothing to the focus, or to what is on
 /// screen, when the item has no height or the scroller's viewport has none: there is
 /// nothing to lay it out in. Measuring the item to find that out is still recorded,
 /// and the next redraw lays out the list again if it changed. Nothing changes either
-/// if the list or the key is not found, or if a needed scroller is not. The widget
-/// must be in the item itself, not in an overlay, and an item's widget state is lost
-/// when it leaves the window.
+/// if the list or the key is not found, or if a needed scroller is not. An item's
+/// widget state is lost when it leaves the window.
+///
+/// A widget in an overlay of a materialized item, like a stuck `Sticky` header, is
+/// focused through the overlays. A waiting focus commits in the item's own widgets
+/// only: if its widget is in an overlay by then, the list keeps the focus and
+/// nothing waits any more.
 pub fn focus<M, K>(list: impl Into<Id>, key: K, widget: impl Into<Id>) -> Task<M>
 where
     M: Send + 'static,

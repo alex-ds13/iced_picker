@@ -9,6 +9,10 @@ pub struct Status {
     pub hovered: bool,
     /// The item's key was passed to [`ListView::highlight`](super::ListView::highlight).
     pub highlighted: bool,
+    /// The item is in the list's [`Selection`](super::Selection).
+    pub selected: bool,
+    /// The item is the selection's cursor and the list has the keyboard focus.
+    pub cursor: bool,
 }
 
 /// The appearance of one item, drawn behind its widget.
@@ -52,14 +56,19 @@ impl Catalog for Theme {
 }
 
 /// The default item style, with the colors of the current list widget: a light
-/// tint under the cursor and an accented border around highlighted items.
+/// tint under the cursor, a primary tint behind selected items, and an accented
+/// border around highlighted items. The keyboard cursor of a focused list gets a
+/// thin primary border unless the item is highlighted.
 pub fn default(theme: &Theme, status: Status) -> Style {
     let palette = theme.palette();
     let tint = |color: Color, alpha: f32| Color { a: alpha, ..color };
 
-    let background = status
-        .hovered
-        .then(|| tint(palette.background.base.text, 0.06).into());
+    let background = match (status.selected, status.hovered) {
+        (true, false) => Some(tint(palette.primary.base.color, 0.25).into()),
+        (true, true) => Some(tint(palette.primary.base.color, 0.35).into()),
+        (false, true) => Some(tint(palette.background.base.text, 0.06).into()),
+        (false, false) => None,
+    };
 
     let (border, shadow) = if status.highlighted {
         let accent = palette.warning.base.color;
@@ -75,6 +84,15 @@ pub fn default(theme: &Theme, status: Status) -> Style {
                 offset: Vector::ZERO,
                 blur_radius: 6.0,
             },
+        )
+    } else if status.cursor {
+        (
+            Border {
+                color: palette.primary.base.color,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            Shadow::default(),
         )
     } else {
         (Border::default(), Shadow::default())

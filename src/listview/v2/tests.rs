@@ -11,7 +11,7 @@ use super::geometry::Visible;
 use super::heights::Estimate;
 use super::tasks::{FocusItem, ScrollTo, Settle};
 use super::window::{Anchor, Core, Walk};
-use super::{Align, Status, Style, StyleFn, list_view};
+use super::{Action, Align, Change, Selection, Status, Style, StyleFn, list_view};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,17 +22,21 @@ use std::time::Duration;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay::Group;
 use iced::advanced::renderer;
-use iced::advanced::shell::{Bus, Diff, Invalidation, Waker};
+use iced::advanced::shell::{Bus, Diff, Invalidation, Tracking, Waker};
 use iced::advanced::widget::operation::scrollable::{AbsoluteOffset, Scrollable, scroll_to};
 use iced::advanced::widget::operation::{Animation, Focusable, Operation, Outcome, focusable};
 use iced::advanced::widget::{Id, Meta, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::time::Instant;
-use iced::widget::{Component, column, component, scrollable, sensor, space, sticky, text};
+use iced::widget::{
+    Component, Row, button, column, component, scrollable, sensor, space, sticky, text,
+};
 use iced::{
     Color, Element, Event, Fill, Length, Padding, Point, Rectangle, Size, Theme, Vector,
     Widget as _, mouse, touch,
 };
+use iced_core::keyboard::key::{Named, NativeCode, Physical};
+use iced_core::keyboard::{self, Key, Location, Modifiers};
 use iced_core::window::{self, RedrawRequest};
 
 type Root<'a> = Element<'a, (), Theme, ()>;
@@ -54,6 +58,15 @@ enum Height {
     /// `column![sticky(header), items..]`. The header's key is the item's key, and
     /// item `i` (from 1) has key `key * 1000 + i`.
     Group {
+        header: f32,
+        items: u32,
+        item: f32,
+    },
+    /// A probe inside a `button` that publishes on release.
+    Button(f32),
+    /// `column![sticky(header), items..]` with a real header: text, and a 50 px
+    /// button on the right that publishes. Items as in [`Height::Group`].
+    Header {
         header: f32,
         items: u32,
         item: f32,
@@ -124,6 +137,10 @@ struct Log {
     pass: Cell<usize>,
     /// The passes in which a row grew or the footer changed a row.
     changed_in: RefCell<Vec<usize>>,
+    /// The selection actions the list emitted.
+    actions: RefCell<Vec<Action<u32>>>,
+    /// The keys the list activated.
+    activated: RefCell<Vec<u32>>,
 }
 
 impl Log {
@@ -228,7 +245,11 @@ impl Widget<(), Theme, ()> for Probe {
             width: Length::Fill,
             height: match self.item.height {
                 Height::Fill(_) => Length::Fill,
-                Height::Fixed(_) | Height::Area(_) | Height::Group { .. } => Length::Shrink,
+                Height::Fixed(_)
+                | Height::Area(_)
+                | Height::Group { .. }
+                | Height::Button(_)
+                | Height::Header { .. } => Length::Shrink,
             },
         }
     }
@@ -257,7 +278,9 @@ impl Widget<(), Theme, ()> for Probe {
             _ if let Some(height) = grown => height,
             Height::Fixed(height) | Height::Fill(height) => height,
             Height::Area(area) => area / limits.max.width,
-            Height::Group { .. } => unreachable!("a group is a column, not a probe"),
+            Height::Group { .. } | Height::Button(_) | Height::Header { .. } => {
+                unreachable!("not a probe")
+            }
         };
         let size = self.size();
 
@@ -513,6 +536,24 @@ fn row(item: &Item, log: &Rc<Log>) -> Root<'static> {
                 .chain((1..=items).map(|index| probe(item.key * 1000 + index, height).boxed())),
         )
         .boxed(),
+        Height::Button(height) => button(probe(item.key, height)).on_press(()).boxed(),
+        Height::Header {
+            header,
+            items,
+            item: height,
+        } => {
+            let header = Row::with_children([
+                text("group").width(Fill).boxed(),
+                button(space()).width(50).height(Fill).on_press(()).boxed(),
+            ])
+            .height(header);
+
+            column(
+                std::iter::once(sticky(header).boxed())
+                    .chain((1..=items).map(|index| probe(item.key * 1000 + index, height).boxed())),
+            )
+            .boxed()
+        }
         _ if log.sensors.borrow().contains(&item.key) => sensor(Probe {
             item: *item,
             log: Rc::clone(log),
@@ -544,6 +585,10 @@ struct App {
     padding: Padding,
     highlight: Vec<u32>,
     text_color: Option<Color>,
+    /// The application's selection, cloned into each view.
+    selection: Option<Rc<RefCell<Selection<u32>>>>,
+    multiple: bool,
+    activate: bool,
 }
 
 impl App {
@@ -562,6 +607,9 @@ impl App {
             padding: Padding::ZERO,
             highlight: Vec::new(),
             text_color: None,
+            selection: None,
+            multiple: false,
+            activate: false,
         }
     }
 
@@ -644,7 +692,47 @@ impl App {
             list = list.scroller(scroller.clone());
         }
 
+        // The tests change the selection between views, so each view gets a copy.
+        if let Some(selection) = &self.selection {
+            let log = Rc::clone(&self.log);
+
+            list = list
+                .selection(selection.borrow().clone(), move |action| {
+                    log.actions.borrow_mut().push(action)
+                })
+                .multiple(self.multiple);
+
+            if self.activate {
+                let log = Rc::clone(&self.log);
+                list = list.on_activate(move |key| log.activated.borrow_mut().push(key));
+            }
+        }
+
         list.boxed()
+    }
+
+    /// Makes the list selectable, in multiple selection or not.
+    fn selectable(mut self, multiple: bool) -> Self {
+        self.selection = Some(Rc::default());
+        self.multiple = multiple;
+        self
+    }
+
+    /// The application's update for the list's messages: applies the logged actions
+    /// to the selection, and returns the keys they ask to reveal.
+    fn apply(&self) -> Vec<u32> {
+        let selection = self.selection.as_ref().expect("a selectable list");
+
+        self.log
+            .actions
+            .take()
+            .into_iter()
+            .filter_map(|action| {
+                let reveal = action.reveal().copied();
+                selection.borrow_mut().perform(action);
+                reveal
+            })
+            .collect()
     }
 }
 
@@ -686,8 +774,10 @@ struct Harness {
     /// The runtime's overlay state: `Some` with the overlays' mouse interaction when
     /// the last update had overlays (`runtime/src/user_interface.rs:279-283`).
     overlay: Option<mouse::Interaction>,
-    /// Messages published since the application last handled them.
-    messages: usize,
+    /// The messages published since the application last handled them, with their
+    /// receipts, which the shell drops after the application's update for them
+    /// (`winit/src/lib.rs:1247-1249`).
+    bus: Bus<()>,
 }
 
 impl Harness {
@@ -707,7 +797,7 @@ impl Harness {
             rebuilds: 0,
             walk_start: 0,
             overlay: None,
-            messages: 0,
+            bus: Bus::new(),
         };
 
         harness.rebuild(root);
@@ -796,7 +886,7 @@ impl Harness {
         let layout = Layout::new(self.tree.size);
         let viewport = self.viewport();
         let window = self.window;
-        let mut bus = Bus::new();
+        let mut bus = std::mem::take(&mut self.bus);
         let mut invalidation = Invalidation::None;
         let mut redraw = RedrawRequest::Wait;
         let mut captured = false;
@@ -879,7 +969,7 @@ impl Harness {
             invalidation = invalidation.max(base);
         }
 
-        self.messages += bus.len();
+        self.bus = bus;
 
         let interaction = if overlaid == mouse::Interaction::None {
             root.mouse_interaction(
@@ -951,9 +1041,10 @@ impl Harness {
         view: Option<&dyn Fn() -> Root<'a>>,
         update: Option<&dyn Fn(usize)>,
     ) -> Frame {
-        while passes.len() < 3 && (passes.last() != Some(&Invalidation::None) || self.messages > 0)
+        while passes.len() < 3
+            && (passes.last() != Some(&Invalidation::None) || self.messages() > 0)
         {
-            if self.messages > 0 || passes.last() == Some(&Invalidation::Widgets) {
+            if self.messages() > 0 || passes.last() == Some(&Invalidation::Widgets) {
                 self.handle(root, view, update);
             }
 
@@ -962,7 +1053,7 @@ impl Harness {
         }
 
         self.draw(root);
-        let late = self.messages > 0;
+        let late = self.messages() > 0;
 
         if late {
             self.handle(root, view, update);
@@ -975,6 +1066,68 @@ impl Harness {
         }
     }
 
+    /// The messages published since the application last handled them.
+    fn messages(&self) -> usize {
+        self.bus.len()
+    }
+
+    /// Handles the messages of updates outside a frame, as the shell does before the
+    /// next redraw. Returns how many there were.
+    fn deliver<'a>(
+        &mut self,
+        root: &mut Root<'a>,
+        view: &dyn Fn() -> Root<'a>,
+        update: &dyn Fn(usize),
+    ) -> usize {
+        let messages = self.messages();
+
+        if messages > 0 {
+            self.handle(root, Some(view), Some(update));
+        }
+
+        messages
+    }
+
+    /// A left press and release at `point`, with `modifiers` held, as the runtime
+    /// delivers them. Returns the press's update.
+    fn click(&mut self, root: &mut Root<'_>, point: Point, modifiers: Modifiers) -> Updated {
+        self.modifiers(root, modifiers);
+        self.cursor = mouse::Cursor::Available(point);
+        let press = self.update(
+            root,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        );
+        let release = self.update(
+            root,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        );
+        assert!(!release.captured, "the list never captures a release");
+        press
+    }
+
+    fn modifiers(&mut self, root: &mut Root<'_>, modifiers: Modifiers) {
+        self.update(
+            root,
+            &Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
+        );
+    }
+
+    /// A key press with `modifiers`.
+    fn key(&mut self, root: &mut Root<'_>, key: Key, modifiers: Modifiers) -> Updated {
+        self.update(
+            root,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            }),
+        )
+    }
+
     /// The application handles the pending messages, and the view is rebuilt and
     /// laid out (`winit/src/lib.rs:817-830`).
     fn handle<'a>(
@@ -983,11 +1136,14 @@ impl Harness {
         view: Option<&dyn Fn() -> Root<'a>>,
         update: Option<&dyn Fn(usize)>,
     ) {
-        let messages = std::mem::take(&mut self.messages);
+        let messages = self.messages();
 
         if messages > 0 {
             update.expect("messages need the application's update")(messages);
         }
+
+        // The receipts go once the application handled their messages.
+        self.bus = Bus::new();
 
         let view = view.expect("a rebuild needs the view");
         *root = view();
@@ -2076,6 +2232,8 @@ fn child_first_nonselectable_events_and_traversal() {
             Status {
                 hovered: row.key == 12,
                 highlighted: row.key == 12,
+                selected: false,
+                cursor: false,
             }
         );
     }
@@ -5826,4 +5984,1673 @@ fn instant_landing_property() {
         started.elapsed(),
         &passes[1..]
     );
+}
+
+/// Delivers the messages of the last input to the application, which applies the
+/// logged actions to its selection. Returns those actions.
+fn delivered<'a>(ui: &mut Harness, root: &mut Root<'a>, app: &'a App) -> Vec<Action<u32>> {
+    let actions = app.log.actions.borrow().clone();
+    ui.deliver(root, &|| app.view(), &|_| {
+        app.apply();
+    });
+    actions
+}
+
+/// The one action of the last input, which must not ask for a reveal.
+fn pointed<'a>(ui: &mut Harness, root: &mut Root<'a>, app: &'a App) -> Change<u32> {
+    let actions = delivered(ui, root, app);
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0].reveal(), None);
+    actions[0].change.clone()
+}
+
+/// The one action of the last key, which must ask to reveal `reveal`.
+fn typed<'a>(
+    ui: &mut Harness,
+    root: &mut Root<'a>,
+    app: &'a App,
+    reveal: Option<u32>,
+) -> Change<u32> {
+    let actions = delivered(ui, root, app);
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0].reveal().copied(), reveal);
+    actions[0].change.clone()
+}
+
+/// Replaces the application's selection, and rebuilds the view.
+fn reselect<'a>(ui: &mut Harness, root: &mut Root<'a>, app: &'a App, selection: Selection<u32>) {
+    *app.selection.as_ref().unwrap().borrow_mut() = selection;
+    *root = app.view();
+    ui.rebuild(root);
+}
+
+fn selected(changes: impl IntoIterator<Item = Change<u32>>) -> Selection<u32> {
+    let mut selection = Selection::new();
+
+    for change in changes {
+        selection.perform(Action::mouse(change));
+    }
+
+    selection
+}
+
+fn span(
+    anchor: u32,
+    cursor: u32,
+    keys: impl IntoIterator<Item = u32>,
+    additive: bool,
+) -> Change<u32> {
+    Change::Range {
+        anchor,
+        cursor,
+        keys: keys.into_iter().collect(),
+        additive,
+    }
+}
+
+const NONE: Modifiers = Modifiers::empty();
+const CTRL: Modifiers = Modifiers::COMMAND;
+const SHIFT: Modifiers = Modifiers::SHIFT;
+
+fn both() -> Modifiers {
+    Modifiers::COMMAND | Modifiers::SHIFT
+}
+
+/// The middle of row `key` of 40 px rows at translation 0.
+fn on_row(key: u32) -> Point {
+    Point::new(100.0, 40.0 * key as f32 + 20.0)
+}
+
+fn named(named: Named) -> Key {
+    Key::Named(named)
+}
+
+#[test]
+fn selection_perform_matches_resolved_actions() {
+    let sorted = |selection: &Selection<u32>| {
+        let mut keys: Vec<u32> = selection.iter().copied().collect();
+        keys.sort_unstable();
+        keys
+    };
+    let state = |selection: &Selection<u32>| {
+        (
+            sorted(selection),
+            selection.anchor().copied(),
+            selection.cursor().copied(),
+        )
+    };
+
+    let mut selection = Selection::new();
+    assert!(selection.is_empty() && selection.cursor().is_none());
+
+    selection.perform(Action::mouse(Change::Select(3)));
+    assert_eq!(state(&selection), (vec![3], Some(3), Some(3)));
+
+    selection.perform(Action::mouse(Change::Toggle(5)));
+    assert_eq!(state(&selection), (vec![3, 5], Some(5), Some(5)));
+
+    selection.perform(Action::mouse(Change::Toggle(3)));
+    assert_eq!(state(&selection), (vec![5], Some(3), Some(3)));
+
+    selection.perform(Action::mouse(span(5, 8, 5..=8, false)));
+    assert_eq!(state(&selection), (vec![5, 6, 7, 8], Some(5), Some(8)));
+
+    selection.perform(Action::mouse(span(1, 2, [1, 2], true)));
+    assert_eq!(
+        state(&selection),
+        (vec![1, 2, 5, 6, 7, 8], Some(1), Some(2))
+    );
+
+    selection.perform(Action::keyboard(Change::Cursor(9)));
+    assert_eq!(
+        state(&selection),
+        (vec![1, 2, 5, 6, 7, 8], Some(1), Some(9))
+    );
+
+    selection.perform(Action::keyboard(Change::All(vec![4, 9])));
+    assert_eq!(state(&selection), (vec![4, 9], Some(1), Some(9)));
+    assert!(selection.contains(&4) && !selection.contains(&1));
+    assert_eq!(selection.len(), 2);
+
+    // Empty data.
+    selection.perform(Action::keyboard(Change::All(Vec::new())));
+    assert_eq!(state(&selection), (vec![], Some(1), Some(9)));
+
+    selection.perform(Action::mouse(span(2, 6, 2..=6, false)));
+    selection.perform(Action::keyboard(Change::Clear));
+    assert_eq!(state(&selection), (vec![], Some(2), Some(6)));
+
+    // Removed keys are dropped by the application, with the anchor and cursor.
+    selection.perform(Action::mouse(span(3, 6, 3..=6, false)));
+    selection.retain(|key| key % 2 == 0);
+    assert_eq!(state(&selection), (vec![4, 6], None, Some(6)));
+
+    selection.select(7);
+    assert_eq!(state(&selection), (vec![7], Some(7), Some(7)));
+    selection.clear();
+    assert_eq!(state(&selection), (vec![], Some(7), Some(7)));
+
+    // Ranges follow the filtered sequence the application passes, in its order.
+    let mut app = App::new(rows(0..1, 40.0)).selectable(true);
+    app.items = [10, 3, 7, 42, 5]
+        .into_iter()
+        .map(|key| Item {
+            key,
+            height: Height::Fixed(40.0),
+        })
+        .collect();
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.click(&mut root, on_row(1), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(3));
+    ui.click(&mut root, on_row(3), SHIFT);
+    assert_eq!(
+        pointed(&mut ui, &mut root, &app),
+        span(3, 42, [3, 7, 42], false)
+    );
+    ui.cursor = mouse::Cursor::Unavailable;
+    drop(root);
+
+    // The anchor left the sequence: the range starts at the cursor, and without
+    // either at the clicked item.
+    app.items.remove(1);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    ui.click(&mut root, on_row(3), SHIFT);
+    assert_eq!(
+        pointed(&mut ui, &mut root, &app),
+        span(42, 5, [42, 5], false)
+    );
+
+    reselect(&mut ui, &mut root, &app, selected([Change::Select(99)]));
+    ui.click(&mut root, on_row(1), SHIFT);
+    assert_eq!(pointed(&mut ui, &mut root, &app), span(7, 7, [7], false));
+}
+
+#[test]
+fn click_table_and_origin_are_distinct() {
+    // Ten 40 px rows and a 30 px bottom padding, which is the empty area below the
+    // items, at screen y 400..430.
+    let below = Point::new(100.0, 415.0);
+    let app = |multiple| {
+        let mut app = App::new(rows(0..10, 40.0)).selectable(multiple);
+        app.padding = Padding {
+            bottom: 30.0,
+            ..Padding::ZERO
+        };
+        app
+    };
+
+    // Single selection: plain, Shift and Ctrl+Shift select, also the selected item
+    // (review P5-R1 F2), and Ctrl clears the selected item and selects another.
+    let single = app(false);
+    let mut root = single.view();
+    let mut ui = Harness::new(&mut root, &single.log);
+    ui.frame(&mut root);
+
+    for (key, modifiers, change) in [
+        (2, NONE, Change::Select(2)),
+        (4, SHIFT, Change::Select(4)),
+        (5, both(), Change::Select(5)),
+        (5, both(), Change::Select(5)),
+        (5, CTRL, Change::Clear),
+        (6, CTRL, Change::Select(6)),
+    ] {
+        let press = ui.click(&mut root, on_row(key), modifiers);
+        assert!(press.captured);
+        assert_eq!(pointed(&mut ui, &mut root, &single), change, "{key}");
+        assert!(ui.core().focus.focused);
+    }
+
+    ui.click(&mut root, below, NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &single), Change::Clear);
+    drop(root);
+
+    // Multiple selection: plain selects, Ctrl toggles, Shift replaces with a range
+    // from the anchor and Ctrl+Shift adds it.
+    let multiple = app(true);
+    let mut root = multiple.view();
+    let mut ui = Harness::new(&mut root, &multiple.log);
+    ui.frame(&mut root);
+
+    for (key, modifiers, change) in [
+        (2, NONE, Change::Select(2)),
+        (4, CTRL, Change::Toggle(4)),
+        (6, SHIFT, span(4, 6, 4..=6, false)),
+        (1, both(), span(4, 1, 1..=4, true)),
+    ] {
+        assert!(ui.click(&mut root, on_row(key), modifiers).captured);
+        assert_eq!(pointed(&mut ui, &mut root, &multiple), change, "{key}");
+    }
+
+    ui.click(&mut root, below, NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &multiple), Change::Clear);
+
+    // The anchor falls back to the cursor, then to the clicked item.
+    reselect(
+        &mut ui,
+        &mut root,
+        &multiple,
+        selected([Change::Select(99), Change::Cursor(3)]),
+    );
+    ui.click(&mut root, on_row(7), SHIFT);
+    assert_eq!(
+        pointed(&mut ui, &mut root, &multiple),
+        span(3, 7, 3..=7, false)
+    );
+
+    reselect(
+        &mut ui,
+        &mut root,
+        &multiple,
+        selected([Change::Select(99)]),
+    );
+    ui.click(&mut root, on_row(7), both());
+    assert_eq!(
+        pointed(&mut ui, &mut root, &multiple),
+        span(7, 7, [7], true)
+    );
+
+    // The same change from the keyboard reveals its cursor key, from the mouse not.
+    reselect(&mut ui, &mut root, &multiple, selected([Change::Select(2)]));
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(
+        typed(&mut ui, &mut root, &multiple, Some(3)),
+        Change::Select(3)
+    );
+    ui.click(&mut root, on_row(3), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &multiple), Change::Select(3));
+
+    ui.key(&mut root, named(Named::ArrowDown), SHIFT);
+    assert_eq!(
+        typed(&mut ui, &mut root, &multiple, Some(4)),
+        span(3, 4, 3..=4, false)
+    );
+    ui.click(&mut root, on_row(4), SHIFT);
+    assert_eq!(
+        pointed(&mut ui, &mut root, &multiple),
+        span(3, 4, 3..=4, false)
+    );
+    drop(root);
+
+    // A double click on the same item activates once. A triple click does not
+    // activate again, nor do quick clicks on two items.
+    let mut activating = app(true);
+    activating.activate = true;
+    let mut root = activating.view();
+    let mut ui = Harness::new(&mut root, &activating.log);
+    ui.frame(&mut root);
+
+    for key in [3, 3, 3] {
+        ui.click(&mut root, on_row(key), NONE);
+        delivered(&mut ui, &mut root, &activating);
+    }
+
+    assert_eq!(*activating.log.activated.borrow(), [3]);
+
+    ui.click(&mut root, on_row(5), NONE);
+    ui.click(&mut root, on_row(6), NONE);
+    delivered(&mut ui, &mut root, &activating);
+    assert_eq!(*activating.log.activated.borrow(), [3]);
+    drop(root);
+
+    // Two clicks at the same point on different items, because item 5 was removed
+    // in between, are not a double click either.
+    let mut root = activating.view();
+    ui.rebuild(&mut root);
+    ui.click(&mut root, on_row(5), NONE);
+    delivered(&mut ui, &mut root, &activating);
+    drop(root);
+
+    activating.items.remove(5);
+    let mut root = activating.view();
+    ui.rebuild(&mut root);
+    ui.click(&mut root, on_row(5), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &activating), Change::Select(6));
+    assert_eq!(*activating.log.activated.borrow(), [3]);
+}
+
+#[test]
+fn keyboard_table_uses_current_heights_and_focus() {
+    // Rows of 40 px, rows 10..=19 100 px, 2 px spacing: row 5 is at 210, row 10 at
+    // 420 and row 13 at 726.
+    let app = |multiple| {
+        let mut items = rows(0..100, 40.0);
+
+        for item in &mut items[10..20] {
+            item.height = Height::Fixed(100.0);
+        }
+
+        let mut app = App::new(items).selectable(multiple);
+        app.spacing = 2.0;
+        app.activate = true;
+        app
+    };
+
+    let single = app(false);
+    let mut root = single.view();
+    let mut ui = Harness::new(&mut root, &single.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 1500.0);
+    ui.scroll(&mut root, 0.0);
+
+    // Not focused: keys reach other widgets.
+    let key = ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert!(!key.captured && single.log.actions.borrow().is_empty());
+
+    // Focused without a cursor, moves start at the first visible item.
+    ui.run_task(&mut root, focusable::focus(LIST));
+    assert!(ui.key(&mut root, named(Named::ArrowDown), NONE).captured);
+    assert_eq!(
+        typed(&mut ui, &mut root, &single, Some(0)),
+        Change::Select(0)
+    );
+
+    for (key, modifiers, target) in [
+        (Named::ArrowDown, NONE, 1),
+        (Named::ArrowUp, NONE, 0),
+        (Named::ArrowUp, NONE, 0),
+        (Named::End, NONE, 99),
+        (Named::Home, NONE, 0),
+        (Named::ArrowDown, CTRL, 1),
+        (Named::ArrowDown, SHIFT, 2),
+        (Named::ArrowDown, both(), 3),
+        (Named::ArrowDown, NONE, 4),
+        (Named::ArrowDown, NONE, 5),
+        (Named::PageDown, NONE, 13),
+        (Named::PageUp, NONE, 3),
+    ] {
+        assert!(ui.key(&mut root, named(key), modifiers).captured);
+        assert_eq!(
+            typed(&mut ui, &mut root, &single, Some(target)),
+            Change::Select(target),
+            "{key:?} {modifiers:?}"
+        );
+    }
+
+    // Page moves use the heights as measured now: row 12 becomes 300 px.
+    single.log.overrides.borrow_mut().insert(12, 300.0);
+    root = single.view();
+    ui.rebuild(&mut root);
+    reselect(&mut ui, &mut root, &single, selected([Change::Select(5)]));
+    ui.key(&mut root, named(Named::PageDown), NONE);
+    assert_eq!(
+        typed(&mut ui, &mut root, &single, Some(12)),
+        Change::Select(12)
+    );
+
+    // Space selects the cursor, Ctrl+A is not handled in single selection, Escape
+    // clears a selection and Enter activates the cursor.
+    ui.key(&mut root, named(Named::Space), CTRL);
+    assert_eq!(
+        typed(&mut ui, &mut root, &single, Some(12)),
+        Change::Select(12)
+    );
+    assert!(!ui.key(&mut root, Key::Character("a".into()), CTRL).captured);
+    assert!(ui.key(&mut root, named(Named::Escape), NONE).captured);
+    assert_eq!(typed(&mut ui, &mut root, &single, None), Change::Clear);
+    assert!(!ui.key(&mut root, named(Named::Escape), NONE).captured);
+    assert!(ui.key(&mut root, named(Named::Enter), NONE).captured);
+    assert_eq!(ui.deliver(&mut root, &|| single.view(), &|_| ()), 1);
+    assert_eq!(*single.log.activated.borrow(), [12]);
+
+    // Keys the list does not handle are left alone, also Tab.
+    for key in [named(Named::Tab), Key::Character("x".into())] {
+        assert!(!ui.key(&mut root, key, NONE).captured);
+    }
+
+    assert!(single.log.actions.borrow().is_empty());
+
+    // A press elsewhere unfocuses the list, and keys are not handled again.
+    ui.cursor = mouse::Cursor::Unavailable;
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    assert!(!ui.key(&mut root, named(Named::ArrowDown), NONE).captured);
+    drop(root);
+
+    // Multiple selection: Ctrl moves the cursor only, Shift and Ctrl+Shift make
+    // ranges from the anchor, Ctrl+Space toggles and Ctrl+A selects all.
+    let multiple = app(true);
+    let mut root = multiple.view();
+    let mut ui = Harness::new(&mut root, &multiple.log);
+    ui.frame(&mut root);
+    reselect(&mut ui, &mut root, &multiple, selected([Change::Select(2)]));
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    for (key, modifiers, reveal, change) in [
+        (Named::ArrowDown, CTRL, Some(3), Change::Cursor(3)),
+        (Named::ArrowDown, SHIFT, Some(4), span(2, 4, 2..=4, false)),
+        (Named::ArrowDown, both(), Some(5), span(2, 5, 2..=5, true)),
+        (Named::Space, CTRL, Some(5), Change::Toggle(5)),
+        (Named::Home, SHIFT, Some(0), span(5, 0, 0..=5, false)),
+        (Named::Space, NONE, Some(0), Change::Select(0)),
+    ] {
+        assert!(ui.key(&mut root, named(key), modifiers).captured);
+        assert_eq!(
+            typed(&mut ui, &mut root, &multiple, reveal),
+            change,
+            "{key:?} {modifiers:?}"
+        );
+    }
+
+    assert!(ui.key(&mut root, Key::Character("a".into()), CTRL).captured);
+    assert_eq!(
+        typed(&mut ui, &mut root, &multiple, None),
+        Change::All((0..100).collect())
+    );
+    drop(root);
+
+    // An empty list handles nothing.
+    let mut empty = app(true);
+    empty.items.clear();
+    let mut root = empty.view();
+    let mut ui = Harness::new(&mut root, &empty.log);
+    ui.frame(&mut root);
+    ui.run_task(&mut root, focusable::focus(LIST));
+    assert!(!ui.key(&mut root, named(Named::ArrowDown), NONE).captured);
+    assert!(!ui.key(&mut root, Key::Character("a".into()), CTRL).captured);
+    assert!(empty.log.actions.borrow().is_empty());
+}
+
+/// A key, the application's update, the reveal task it returns, and the next frame.
+fn reveal_step<'a>(ui: &mut Harness, root: &mut Root<'a>, app: &'a App, key: Named) {
+    ui.key(root, named(key), NONE);
+    let reveals = RefCell::new(Vec::new());
+    ui.deliver(root, &|| app.view(), &|_| {
+        reveals.borrow_mut().extend(app.apply());
+    });
+
+    for key in reveals.take() {
+        ui.run_task(root, scroll_task(key, Align::Nearest, Animation::Instant));
+    }
+
+    ui.frame(root);
+}
+
+#[test]
+fn keyboard_reveal_goes_through_the_scroll_task() {
+    // The application applies the action and returns `scroll_to` for its reveal key,
+    // which the shell runs before the next frame. Row 14 ends at the viewport's
+    // bottom, so Down to row 15 scrolls it into view at the bottom.
+    let app = App::new(rows(0..100, 40.0)).selectable(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    reselect(&mut ui, &mut root, &app, selected([Change::Select(14)]));
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    reveal_step(&mut ui, &mut root, &app, Named::ArrowDown);
+    assert_eq!(ui.translation(&mut root), 40.0);
+    assert_eq!(screen_bottom(&app.log, 15), 600.0);
+
+    // In view: the reveal does not scroll.
+    reveal_step(&mut ui, &mut root, &app, Named::ArrowUp);
+    assert_eq!(ui.translation(&mut root), 40.0);
+
+    // A page down lands its target at the bottom, and Home at the top.
+    reveal_step(&mut ui, &mut root, &app, Named::PageDown);
+    assert_eq!(screen_bottom(&app.log, 29), 600.0);
+    reveal_step(&mut ui, &mut root, &app, Named::Home);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(app.log.screen()[&0], 0.0);
+}
+
+#[test]
+fn row_button_wins_and_nonselectable_text_press_is_ignored() {
+    // Row 3 is a probe in a `button`, 50 px tall with the button's padding, at
+    // screen y 120..170.
+    let mut items = rows(0..10, 40.0);
+    items[3].height = Height::Button(40.0);
+    let app = App::new(items.clone()).selectable(true);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    // An item press the list handles is captured once, and focuses the list.
+    let press = ui.click(&mut root, on_row(1), NONE);
+    assert!(press.captured);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(1));
+    assert!(ui.core().focus.focused);
+
+    // The button takes its press: the list drops the focus and selects nothing. The
+    // button publishes on the release, which the list does not capture.
+    let rebuilds = ui.rebuilds;
+    let press = ui.click(&mut root, Point::new(100.0, 145.0), NONE);
+    assert!(press.captured);
+    assert!(!ui.core().focus.focused);
+    assert!(app.log.actions.borrow().is_empty());
+    assert_eq!(delivered(&mut ui, &mut root, &app), []);
+    assert_eq!(
+        ui.rebuilds,
+        rebuilds + 1,
+        "the button's message was handled"
+    );
+
+    // A right press selects nothing and is not captured.
+    ui.cursor = mouse::Cursor::Available(on_row(5));
+    let press = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+    );
+    assert!(!press.captured && app.log.actions.borrow().is_empty());
+    drop(root);
+
+    // Without a selection the list captures nothing, so the runtime can select the
+    // text of the items, and takes no focus.
+    let plain = App::new(items);
+    let mut root = plain.view();
+    let mut ui = Harness::new(&mut root, &plain.log);
+    ui.frame(&mut root);
+    let press = ui.click(&mut root, on_row(1), NONE);
+    assert!(!press.captured);
+    assert!(!ui.core().focus.focused);
+    assert_eq!(ui.messages(), 0);
+}
+
+#[test]
+fn touch_tap_selects_without_claiming_scroll_press() {
+    let app = App::new(rows(0..100, 40.0)).selectable(true);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let finger = touch::Finger(1);
+    let touch = |ui: &mut Harness,
+                 root: &mut Root<'_>,
+                 event: fn(touch::Finger, Point) -> touch::Event,
+                 y: f32| {
+        let position = Point::new(100.0, y);
+        ui.cursor = mouse::Cursor::Available(position);
+        ui.update(root, &Event::Touch(event(finger, position)))
+    };
+    let pressed = |id, position| touch::Event::FingerPressed { id, position };
+    let moved = |id, position| touch::Event::FingerMoved { id, position };
+    let lifted = |id, position| touch::Event::FingerLifted { id, position };
+    let lost = |id, position| touch::Event::FingerLost { id, position };
+
+    // A drag scrolls the parent, which got the press, and selects nothing.
+    touch(&mut ui, &mut root, pressed, 300.0);
+    touch(&mut ui, &mut root, moved, 260.0);
+    touch(&mut ui, &mut root, lifted, 260.0);
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 40.0);
+    assert!(app.log.actions.borrow().is_empty());
+
+    // A tap selects the item under the finger, with no reveal, and focuses the list.
+    touch(&mut ui, &mut root, pressed, 100.0);
+    touch(&mut ui, &mut root, lifted, 103.0);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(3));
+    assert!(ui.core().focus.focused);
+
+    // A lost finger, and a finger that moved too far, do not tap.
+    touch(&mut ui, &mut root, pressed, 100.0);
+    touch(&mut ui, &mut root, lost, 100.0);
+    touch(&mut ui, &mut root, lifted, 100.0);
+    touch(&mut ui, &mut root, pressed, 100.0);
+    touch(&mut ui, &mut root, moved, 110.0);
+    touch(&mut ui, &mut root, lifted, 110.0);
+    assert!(app.log.actions.borrow().is_empty());
+}
+
+/// Rows of 40 px with item 20 a group of a 30 px header and five 40 px items at
+/// content y 800..1030, the header made of `header`.
+fn grouped(header: bool) -> App {
+    let mut items = rows(0..100, 40.0);
+    items[20].height = if header {
+        Height::Header {
+            header: 30.0,
+            items: 5,
+            item: 40.0,
+        }
+    } else {
+        Height::Group {
+            header: 30.0,
+            items: 5,
+            item: 40.0,
+        }
+    };
+    App::estimated(items, 40.0)
+}
+
+/// The bounds the probe with `key` was drawn at in the last frame.
+fn drawn_at(log: &Log, key: u32) -> Vec<Rectangle> {
+    log.drawn
+        .borrow()
+        .iter()
+        .filter(|drawn| drawn.key == key)
+        .map(|drawn| drawn.bounds)
+        .collect()
+}
+
+#[test]
+fn sticky_group_local_and_full_paths_keep_parent_bounds() {
+    // Item 50 is a group of a 30 px header and twenty 40 px items, 830 px at content
+    // y 2000. End on it from the top is a full-path jump that leaves its header above
+    // the viewport while the group fills it: the header sticks at the top.
+    let mut items = rows(0..100, 40.0);
+    items[50].height = Height::Group {
+        header: 30.0,
+        items: 20,
+        item: 40.0,
+    };
+    let app = App::estimated(items, 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(50, Align::End, Animation::Instant));
+    app.log.clear();
+    let frame = ui.frame(&mut root);
+    assert!(frame.root_layouts > 0);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(ui.translation(&mut root), 2230.0);
+
+    let group = Rectangle::new(Point::new(0.0, 2000.0), Size::new(800.0, 830.0));
+    let stuck = Rectangle::new(Point::ORIGIN, Size::new(800.0, 30.0));
+    assert_eq!(drawn_at(&app.log, 50), [stuck]);
+    app.log.assert_covered(2230.0, 2830.0);
+
+    // The new sticky got each pass's redraw at most once: it sticks on its first
+    // one, and the overlay passes on the next.
+    let header: Vec<_> = app
+        .log
+        .redraws
+        .borrow()
+        .iter()
+        .filter(|redraw| redraw.0 == 50)
+        .copied()
+        .collect();
+    assert_eq!(header, [(50, Some(group), stuck)]);
+
+    // A local shift inside the group keeps it stuck without a root layout. The
+    // items get their group as parent.
+    app.log.clear();
+    let frame = ui.scroll(&mut root, 2400.0);
+    assert_eq!(frame.root_layouts, 0);
+    assert_eq!(drawn_at(&app.log, 50), [stuck]);
+    assert!(
+        app.log
+            .redraws
+            .borrow()
+            .iter()
+            .filter(|redraw| redraw.0 > 50_000)
+            .all(|redraw| redraw.1 == Some(group))
+    );
+    app.log.assert_covered(2430.0, 3000.0);
+
+    // Back above, the header is in the base tree again.
+    ui.scroll(&mut root, 1900.0);
+    assert_eq!(
+        drawn_at(&app.log, 50),
+        [Rectangle::new(
+            Point::new(0.0, 2000.0),
+            Size::new(800.0, 30.0)
+        )]
+    );
+    assert_eq!(ui.overlay, None);
+}
+
+#[test]
+fn stuck_header_button_is_the_only_group_click_handler() {
+    // Review R1 M6: at 850 the group's header is stuck at screen y 0..30, drawn by
+    // an overlay: text, and a button at x 750..800.
+    let app = grouped(true).selectable(true);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 850.0);
+    ui.click(&mut root, Point::new(100.0, 300.0), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(24));
+
+    // Over the text the overlay is idle, the base cursor levitates, and the press
+    // selects nothing. As for iced's text inputs it is outside the list.
+    let text = Point::new(100.0, 10.0);
+    ui.cursor = mouse::Cursor::Available(text);
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::CursorMoved { position: text }),
+    );
+    assert_eq!(ui.overlay, Some(mouse::Interaction::Idle));
+    assert!(ui.base_cursor().is_levitating());
+
+    let press = ui.click(&mut root, text, NONE);
+    assert!(!press.captured);
+    assert!(app.log.actions.borrow().is_empty());
+    assert!(!ui.core().focus.focused);
+    assert_eq!(ui.messages(), 0);
+
+    // The header's button handles its click: it publishes the application's
+    // message on the release, and the list selects nothing.
+    let button = Point::new(775.0, 10.0);
+    ui.cursor = mouse::Cursor::Available(button);
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::CursorMoved { position: button }),
+    );
+    let press = ui.click(&mut root, button, NONE);
+    assert!(press.captured);
+    assert_eq!(ui.messages(), 1);
+    assert_eq!(delivered(&mut ui, &mut root, &app), []);
+    ui.cursor = mouse::Cursor::Unavailable;
+
+    // Not stuck, the header is in the base tree, where a press on its text selects
+    // the group like any part of the item.
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 700.0);
+    assert_eq!(ui.overlay, None);
+    ui.click(&mut root, Point::new(100.0, 115.0), NONE);
+    assert_eq!(pointed(&mut ui, &mut root, &app), Change::Select(20));
+}
+
+#[test]
+fn third_pass_draw_has_covered_rows_and_stuck_header() {
+    // Review R1 M1, the Sticky case: a full-path jump whose third pass still asks
+    // for new overlays is drawn right after it. Rows are 60 px, estimated at 40, so
+    // the scroller clamps the jump on the first pass and reaches it on the second,
+    // where the new header sticks. The footer asks for new overlays on the third.
+    // Item 80 is a group of a 30 px header and twenty 60 px items, 1230 px.
+    let mut items = rows(0..100, 60.0);
+    items[80].height = Height::Group {
+        header: 30.0,
+        items: 20,
+        item: 60.0,
+    };
+    let app = App::estimated(items, 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(80, Align::End, Animation::Instant));
+    app.log.inject.borrow_mut()[1].extend([None, None, Some(Invalidation::Overlay)]);
+    app.log.clear();
+    let frame = ui.frame(&mut root);
+    assert_eq!(
+        frame.passes,
+        [
+            Invalidation::Layout(Diff::Skip),
+            Invalidation::Layout(Diff::Skip),
+            Invalidation::Overlay
+        ]
+    );
+
+    // The frame drawn after that pass shows the stuck header at the top, and rows
+    // under it cover the viewport.
+    let translation = ui.translation(&mut root);
+    let stuck = Rectangle::new(Point::ORIGIN, Size::new(800.0, 30.0));
+    assert_eq!(drawn_at(&app.log, 80), [stuck]);
+    app.log.assert_covered(translation, translation + 600.0);
+    assert_eq!(screen_bottom(&app.log, 80_020), 600.0);
+}
+
+#[test]
+fn keys_while_a_focus_waits() {
+    // A waiting focus holds the list's focus. Keys the list does not handle leave
+    // it waiting. A key it handles cancels it, as a press would: the user acted
+    // before it landed.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0).selectable(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert!(ui.core().focus.deferred.is_some());
+
+    for key in [
+        named(Named::Tab),
+        Key::Character("x".into()),
+        named(Named::Escape),
+    ] {
+        assert!(!ui.key(&mut root, key, NONE).captured);
+    }
+
+    assert!(ui.core().focus.deferred.is_some());
+
+    assert!(ui.key(&mut root, named(Named::ArrowDown), NONE).captured);
+    assert!(ui.core().focus.deferred.is_none());
+    assert_eq!(typed(&mut ui, &mut root, &app, Some(0)), Change::Select(0));
+
+    ui.frame(&mut root);
+    assert_eq!(single_focus(&mut ui, &mut root), [LIST]);
+    drop(root);
+
+    // Without one, the same key lets the focus land.
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.run_task(&mut root, FocusItem::new(LIST, 700_u32, field(700)));
+    ui.key(&mut root, named(Named::Tab), NONE);
+    ui.frame(&mut root);
+    assert_eq!(single_focus(&mut ui, &mut root), [field(700)]);
+}
+
+#[test]
+fn component_redraws_keep_selection_and_sticky() {
+    // A component re-runs the redraw of its view after it rebuilds it, so rows get
+    // a redraw twice in an invalidating pass. The header still sticks once and a
+    // click still emits one action.
+    let app = grouped(false).selectable(false);
+    let mut root = wrapped(&app, false);
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+
+    app.log.clear();
+    ui.scroll(&mut root, 850.0);
+    let stuck = Rectangle::new(Point::ORIGIN, Size::new(800.0, 30.0));
+    assert_eq!(drawn_at(&app.log, 20), [stuck]);
+    app.log.assert_covered(850.0, 1450.0);
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes, [Invalidation::None]);
+    assert_eq!(drawn_at(&app.log, 20), [stuck]);
+
+    ui.click(&mut root, Point::new(100.0, 300.0), NONE);
+    let actions = app.log.actions.take();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].change, Change::Select(24));
+}
+
+#[test]
+fn overlay_only_focus_targets_need_generic_operations() {
+    // At 850 the header of group 20, a probe with a focusable field, is stuck and
+    // exists only in the overlay. The generic focus operation, which the list's
+    // `focus` chains for a materialized item, reaches it there.
+    let app = grouped(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 850.0);
+    assert!(ui.overlay.is_some());
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 20_u32, field(20)));
+    assert_eq!(single_focus(&mut ui, &mut root), [field(20)]);
+
+    // A waiting focus commits in the item's base tree, where a stuck header is not.
+    // Then the list keeps the focus, and nothing waits any more.
+    ui.run_task(&mut root, focusable::focus(LIST));
+    let core = ui.core_mut();
+    core.focus.deferred = Some((20, field(20)));
+    ui.frame(&mut root);
+    assert!(ui.core().focus.deferred.is_none());
+    assert_eq!(single_focus(&mut ui, &mut root), [LIST]);
+}
+
+#[test]
+fn selected_and_cursor_statuses_follow_the_selection_and_focus() {
+    let mut app = App::new(rows(0..10, 40.0)).selectable(true);
+    app.text_color = Some(RED);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    reselect(
+        &mut ui,
+        &mut root,
+        &app,
+        selected([Change::Select(2), Change::Toggle(4)]),
+    );
+
+    let statuses = |ui: &mut Harness, root: &mut Root<'_>| {
+        app.log.statuses.take();
+        ui.frame(root);
+        let drawn = app.log.drawn_keys();
+        let statuses = app.log.statuses.take();
+        assert_eq!(statuses.len(), drawn.len());
+
+        drawn
+            .into_iter()
+            .zip(statuses)
+            .filter(|(_, status)| status.selected || status.cursor)
+            .map(|(key, status)| (key, status.selected, status.cursor))
+            .collect::<Vec<_>>()
+    };
+
+    // The cursor shows only while the list has the focus.
+    assert_eq!(
+        statuses(&mut ui, &mut root),
+        [(2, true, false), (4, true, false)]
+    );
+
+    ui.run_task(&mut root, focusable::focus(LIST));
+    assert_eq!(
+        statuses(&mut ui, &mut root),
+        [(2, true, false), (4, true, true)]
+    );
+}
+
+#[test]
+fn batched_input_resolves_against_emitted_actions() {
+    // Review P5-R1 F1: the runtime delivers a batch of events before the application
+    // applies any of their messages. Each event resolves against the actions the
+    // list emitted before it.
+    let mut app = App::new(rows(0..20, 40.0)).selectable(true);
+    app.text_color = Some(RED);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    reselect(&mut ui, &mut root, &app, selected([Change::Select(2)]));
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    let batch = |ui: &mut Harness, root: &mut Root<'_>, keys: &[(Named, Modifiers)]| {
+        for &(key, modifiers) in keys {
+            assert!(ui.key(root, named(key), modifiers).captured);
+        }
+
+        app.log
+            .actions
+            .borrow()
+            .iter()
+            .map(|action| (action.change.clone(), action.reveal().copied()))
+            .collect::<Vec<_>>()
+    };
+
+    let actions = batch(
+        &mut ui,
+        &mut root,
+        &[(Named::ArrowDown, NONE), (Named::ArrowDown, NONE)],
+    );
+    assert_eq!(
+        actions,
+        [(Change::Select(3), Some(3)), (Change::Select(4), Some(4))]
+    );
+
+    // The list draws the application's selection, not what it emitted.
+    app.log.statuses.take();
+    ui.draw(&mut root);
+    let statuses: Vec<_> = app
+        .log
+        .drawn_keys()
+        .into_iter()
+        .zip(app.log.statuses.take())
+        .filter(|(_, status)| status.selected)
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(statuses, [2]);
+
+    delivered(&mut ui, &mut root, &app);
+    let selection = app.selection.as_ref().unwrap().borrow().clone();
+    assert_eq!(selection.cursor(), Some(&4));
+
+    // Shift extends the range from the same anchor, and a click in the same batch
+    // starts from where the keys left the cursor.
+    let actions = batch(
+        &mut ui,
+        &mut root,
+        &[(Named::ArrowDown, SHIFT), (Named::ArrowDown, SHIFT)],
+    );
+    assert_eq!(
+        actions,
+        [
+            (span(4, 5, 4..=5, false), Some(5)),
+            (span(4, 6, 4..=6, false), Some(6)),
+        ]
+    );
+    ui.click(&mut root, on_row(9), both());
+    assert_eq!(
+        app.log.actions.borrow().last().unwrap().change,
+        span(4, 9, 4..=9, true)
+    );
+    delivered(&mut ui, &mut root, &app);
+
+    // The application ignores an action: once it handled the message, the next key
+    // starts from what it keeps, with no redraw in between.
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.deliver(&mut root, &|| app.view(), &|_| {
+        app.log.actions.take();
+    });
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(
+        typed(&mut ui, &mut root, &app, Some(10)),
+        Change::Select(10)
+    );
+
+    // The application applies something else: the next key starts from that.
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.deliver(&mut root, &|| app.view(), &|_| {
+        app.log.actions.take();
+        app.selection
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .perform(Change::Select(15).into());
+    });
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(
+        typed(&mut ui, &mut root, &app, Some(16)),
+        Change::Select(16)
+    );
+    drop(root);
+
+    // Single selection: a Ctrl click on the item a click of the same batch selected
+    // clears it.
+    let single = App::new(rows(0..20, 40.0)).selectable(false);
+    let mut root = single.view();
+    let mut ui = Harness::new(&mut root, &single.log);
+    ui.frame(&mut root);
+    ui.click(&mut root, on_row(3), NONE);
+    ui.click(&mut root, on_row(3), CTRL);
+    let changes: Vec<_> = delivered(&mut ui, &mut root, &single)
+        .into_iter()
+        .map(|action| action.change)
+        .collect();
+    assert_eq!(changes, [Change::Select(3), Change::Clear]);
+}
+
+#[test]
+fn focus_changes_from_input_request_a_redraw() {
+    // Review P5-R1 F3: the cursor's border depends on the list's focus. Ten rows and
+    // the footer at screen y 400..450.
+    let mut items = rows(0..10, 40.0);
+    items[3].height = Height::Button(40.0);
+    let app = App::new(items).selectable(true);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let focus = |ui: &mut Harness, root: &mut Root<'_>| {
+        ui.click(root, on_row(1), NONE);
+        app.log.actions.take();
+        ui.bus = Bus::new();
+        ui.cursor = mouse::Cursor::Available(Point::new(100.0, 425.0));
+        ui.update(
+            root,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(100.0, 425.0),
+            }),
+        );
+        ui.frame(root);
+        assert!(ui.core().focus.focused);
+    };
+
+    // A right press on the footer unfocuses the list without any message.
+    focus(&mut ui, &mut root);
+    let press = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+    );
+    assert!(!ui.core().focus.focused);
+    assert!(!press.captured && ui.messages() == 0);
+    assert_eq!(press.redraw, RedrawRequest::NextFrame);
+
+    // So does a press a row's button takes.
+    focus(&mut ui, &mut root);
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 145.0));
+    let press = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    assert!(press.captured && !ui.core().focus.focused);
+    assert_eq!(press.redraw, RedrawRequest::NextFrame);
+
+    // A press that changes no focus asks for nothing.
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 425.0));
+    let press = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+    );
+    assert_eq!(press.redraw, RedrawRequest::Wait);
+}
+
+#[test]
+fn moves_skip_later_duplicates() {
+    // Review P5-R1 F4: a key's later duplicates resolve to its first position, so
+    // moves step over them.
+    let keyed = |keys: &[u32]| {
+        let mut app = App::new(rows(0..1, 40.0)).selectable(false);
+        app.items = keys
+            .iter()
+            .map(|&key| Item {
+                key,
+                height: Height::Fixed(40.0),
+            })
+            .collect();
+        app
+    };
+
+    let moves = |app: &App, start: u32, steps: &[(Named, u32)]| {
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        reselect(&mut ui, &mut root, app, selected([Change::Select(start)]));
+        ui.run_task(&mut root, focusable::focus(LIST));
+
+        for &(key, target) in steps {
+            ui.key(&mut root, named(key), NONE);
+            assert_eq!(
+                typed(&mut ui, &mut root, app, Some(target)),
+                Change::Select(target),
+                "{key:?}"
+            );
+        }
+    };
+
+    // [A, A, B]
+    moves(
+        &keyed(&[1, 1, 2]),
+        1,
+        &[
+            (Named::ArrowDown, 2),
+            (Named::ArrowDown, 2),
+            (Named::ArrowUp, 1),
+            (Named::End, 2),
+        ],
+    );
+
+    // [A, B, A, C], and End on a later duplicate.
+    moves(
+        &keyed(&[1, 2, 1, 3]),
+        2,
+        &[
+            (Named::ArrowDown, 3),
+            (Named::ArrowUp, 2),
+            (Named::ArrowUp, 1),
+        ],
+    );
+    moves(&keyed(&[1, 2, 1]), 1, &[(Named::End, 2), (Named::Home, 1)]);
+
+    // Pages that end inside a run of duplicates go on to the next item down, or
+    // back to the run's first position up.
+    let mut keys = vec![0];
+    keys.extend(std::iter::repeat_n(1, 30));
+    keys.push(2);
+    moves(
+        &keyed(&keys),
+        0,
+        &[(Named::PageDown, 2), (Named::PageUp, 1)],
+    );
+}
+
+#[test]
+fn page_point_in_spacing_goes_to_the_item_below() {
+    // Rows of 40 px with 10 px spacing under a 5 px header: the visible height is
+    // 595, so a page down from row 0 points at 595, in the spacing below row 11
+    // (550..590). The item below it is the target.
+    let mut app = App::new(rows(0..100, 40.0)).selectable(false);
+    app.spacing = 10.0;
+    app.header = 5.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    reselect(&mut ui, &mut root, &app, selected([Change::Select(0)]));
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    ui.key(&mut root, named(Named::PageDown), NONE);
+    assert_eq!(
+        typed(&mut ui, &mut root, &app, Some(12)),
+        Change::Select(12)
+    );
+}
+
+#[test]
+fn applications_change_the_selection_directly() {
+    // Review P5-R1 F5: the same changes, and set-style methods, without a list.
+    let mut selection: Selection<u32> = [2, 4].into_iter().collect();
+    assert!(selection.contains(&2) && selection.contains(&4));
+    assert_eq!(selection.cursor(), None);
+
+    let action = Action::from(Change::Toggle(4));
+    assert_eq!(action.reveal(), None);
+    selection.perform(action);
+    assert_eq!(selection.iter().copied().collect::<Vec<_>>(), [2]);
+    assert_eq!(selection.cursor(), Some(&4));
+
+    selection.perform(Change::All(vec![1, 2, 3]).into());
+    selection.perform(Change::Cursor(3).into());
+    selection.perform(span(1, 2, [1, 2], false).into());
+    assert_eq!(selection.len(), 2);
+    assert_eq!(
+        (selection.anchor(), selection.cursor()),
+        (Some(&1), Some(&2))
+    );
+
+    assert!(selection.insert(9) && !selection.insert(9));
+    assert!(selection.remove(&1) && !selection.remove(&1));
+    selection.extend([5, 6]);
+    selection.set_cursor(Some(6));
+    selection.set_anchor(None);
+
+    let mut keys: Vec<u32> = selection.iter().copied().collect();
+    keys.sort_unstable();
+    assert_eq!(keys, [2, 5, 6, 9]);
+    assert_eq!((selection.anchor(), selection.cursor()), (None, Some(&6)));
+}
+
+/// A component that owns its selection in its state.
+struct Owning<'a> {
+    items: &'a [u32],
+    states: Rc<RefCell<Vec<Selection<u32>>>>,
+    /// How many of the next actions to ignore.
+    ignore: Rc<Cell<usize>>,
+    /// Every action received.
+    received: Rc<RefCell<Vec<Change<u32>>>>,
+}
+
+impl<'a> Component<'a, (), Theme, ()> for Owning<'a> {
+    type State = Selection<u32>;
+    type Event = Action<u32>;
+
+    fn update(
+        &self,
+        state: &mut Selection<u32>,
+        action: Action<u32>,
+        _renderer: &(),
+    ) -> Option<()> {
+        self.received.borrow_mut().push(action.change.clone());
+
+        if self.ignore.get() > 0 {
+            self.ignore.set(self.ignore.get() - 1);
+            return None;
+        }
+
+        state.perform(action);
+        self.states.borrow_mut().push(state.clone());
+        None
+    }
+
+    fn view(&self, state: &Selection<u32>) -> impl iced::Widget<Action<u32>, Theme, ()> + 'a {
+        list_view(self.items, |_, _| space().width(Fill).height(40))
+            .key(|key: &u32| *key)
+            .id(LIST)
+            .selection(state.clone(), |action| action)
+            .multiple(true)
+    }
+}
+
+#[test]
+fn component_owns_its_selection() {
+    // Review P5-R1 F6: a component cannot lend its state to the list for the list's
+    // lifetime, so it passes a copy, and updates the state with the actions.
+    let items: Vec<u32> = (0..20).collect();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let view = || -> Root<'_> {
+        scrollable(component(Owning {
+            items: &items,
+            states: Rc::clone(&states),
+            ignore: Rc::default(),
+            received: Rc::default(),
+        }))
+        .id(SCROLL)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
+    };
+
+    let log = Rc::new(Log::default());
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+
+    let last = |states: &Rc<RefCell<Vec<Selection<u32>>>>| {
+        let state = states.borrow().last().unwrap().clone();
+        let mut keys: Vec<u32> = state.iter().copied().collect();
+        keys.sort_unstable();
+        (keys, state.anchor().copied(), state.cursor().copied())
+    };
+
+    ui.click(&mut root, on_row(2), NONE);
+    assert_eq!(last(&states), (vec![2], Some(2), Some(2)));
+
+    // The component rebuilt the list with its new state.
+    ui.click(&mut root, on_row(5), SHIFT);
+    assert_eq!(last(&states), (vec![2, 3, 4, 5], Some(2), Some(5)));
+
+    ui.key(&mut root, named(Named::ArrowDown), SHIFT);
+    ui.key(&mut root, named(Named::ArrowDown), SHIFT);
+    assert_eq!(last(&states), (vec![2, 3, 4, 5, 6, 7], Some(2), Some(7)));
+    assert_eq!(ui.messages(), 0);
+    ui.frame(&mut root);
+}
+
+#[test]
+fn harness_keeps_receipts_until_the_application_handles_them() {
+    // Review P5-R2 E: a tracked message is processed only once the application's
+    // update handled it, as in the shell.
+    let app = App::new(rows(0..10, 40.0)).selectable(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.click(&mut root, on_row(2), NONE);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    let pending: Vec<Tracking> = ui
+        .core()
+        .input
+        .pending
+        .iter()
+        .map(|(tracking, _)| tracking.clone())
+        .collect();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|tracking| !tracking.is_processed()));
+
+    delivered(&mut ui, &mut root, &app);
+    assert!(pending.iter().all(Tracking::is_processed));
+}
+
+#[test]
+fn component_handling_drops_the_pending_action() {
+    // Review P5-R2 A: a component handles the list's actions at once, and here
+    // ignores the first one. Its state, rebuilt into the list unchanged, is the
+    // truth: the next key starts from it.
+    let items: Vec<u32> = (0..20).collect();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let ignore = Rc::new(Cell::new(0));
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let view = || -> Root<'_> {
+        scrollable(component(Owning {
+            items: &items,
+            states: Rc::clone(&states),
+            ignore: Rc::clone(&ignore),
+            received: Rc::clone(&received),
+        }))
+        .id(SCROLL)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
+    };
+
+    let log = Rc::new(Log::default());
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+    ui.click(&mut root, on_row(2), NONE);
+
+    ignore.set(1);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(
+        received.borrow()[1..],
+        [Change::Select(3), Change::Select(3)]
+    );
+    assert_eq!(states.borrow().last().unwrap().cursor(), Some(&3));
+}
+
+/// A component that forwards the list's actions to the application, and gives the
+/// list a new copy of the application's selection on every view.
+struct Forwarding<'a> {
+    items: &'a [u32],
+    selection: &'a RefCell<Selection<u32>>,
+    forwarded: &'a RefCell<Vec<Action<u32>>>,
+}
+
+impl<'a> Component<'a, (), Theme, ()> for Forwarding<'a> {
+    type State = ();
+    type Event = Action<u32>;
+
+    fn update(&self, _state: &mut (), action: Action<u32>, _renderer: &()) -> Option<()> {
+        self.forwarded.borrow_mut().push(action);
+        Some(())
+    }
+
+    fn view(&self, _state: &()) -> impl iced::Widget<Action<u32>, Theme, ()> + 'a {
+        let selection = self.selection.borrow();
+        let mut fresh: Selection<u32> = selection.iter().copied().collect();
+        fresh.set_anchor(selection.anchor().copied());
+        fresh.set_cursor(selection.cursor().copied());
+
+        list_view(self.items, |_, _| space().width(Fill).height(40))
+            .key(|key: &u32| *key)
+            .id(LIST)
+            .selection(fresh, |action| action)
+    }
+}
+
+#[test]
+fn forwarded_actions_stay_pending_over_new_copies() {
+    // Review P5-R2 B: the component rebuilds its view with a new copy of the same
+    // selection before the application handles the forwarded action, which is
+    // still pending: the next key builds on it.
+    let items: Vec<u32> = (0..20).collect();
+    let selection = RefCell::new(Selection::new());
+    selection.borrow_mut().select(2);
+    let forwarded = RefCell::new(Vec::new());
+    let view = || -> Root<'_> {
+        scrollable(component(Forwarding {
+            items: &items,
+            selection: &selection,
+            forwarded: &forwarded,
+        }))
+        .id(SCROLL)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
+    };
+    let update = |_| {
+        for action in forwarded.take() {
+            selection.borrow_mut().perform(action);
+        }
+    };
+
+    let log = Rc::new(Log::default());
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame(&mut root);
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    let changes: Vec<_> = forwarded
+        .borrow()
+        .iter()
+        .map(|action| action.change.clone())
+        .collect();
+    assert_eq!(changes, [Change::Select(3), Change::Select(4)]);
+
+    assert_eq!(ui.deliver(&mut root, &view, &update), 2);
+    assert_eq!(selection.borrow().cursor(), Some(&4));
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(
+        forwarded
+            .borrow()
+            .last()
+            .map(|action| action.change.clone()),
+        Some(Change::Select(5))
+    );
+}
+
+#[test]
+fn a_restored_state_is_not_mistaken_for_an_older_one() {
+    // Review P5-R2 C: the application applies a key's action differently, then
+    // restores the state from before it (an undo). The list resolves the next key
+    // against the restored state.
+    let app = App::new(rows(0..20, 40.0)).selectable(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    reselect(&mut ui, &mut root, &app, selected([Change::Select(2)]));
+    let before = app.selection.as_ref().unwrap().borrow().clone();
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.deliver(&mut root, &|| app.view(), &|_| {
+        app.log.actions.take();
+        app.selection.as_ref().unwrap().borrow_mut().select(15);
+    });
+
+    reselect(&mut ui, &mut root, &app, before);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(typed(&mut ui, &mut root, &app, Some(3)), Change::Select(3));
+}
+
+#[test]
+fn lists_sharing_a_selection_see_each_other_after_the_update() {
+    // Review P5-R2 D, a documented limit: pending actions belong to the list that
+    // emitted them. Two lists show one selection, cursor 2. Down in the first one
+    // and a Ctrl click on key 3 in the second, in one batch: the second list has not
+    // seen the first one's Select(3), so it selects 3 instead of clearing it.
+    let app = App::new(rows(0..5, 40.0)).selectable(false);
+    let view = || -> Root<'_> {
+        scrollable(column![app.list(), app.list()].width(Fill))
+            .id(SCROLL)
+            .width(Fill)
+            .height(Fill)
+            .boxed()
+    };
+    let update = |_| {
+        app.apply();
+    };
+
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame_app(&mut root, &view, &update);
+    ui.click(&mut root, on_row(2), NONE);
+    ui.deliver(&mut root, &view, &update);
+
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    ui.click(
+        &mut root,
+        Point::new(100.0, 200.0 + 40.0 * 3.0 + 20.0),
+        CTRL,
+    );
+    let changes: Vec<_> = app
+        .log
+        .actions
+        .borrow()
+        .iter()
+        .map(|action| action.change.clone())
+        .collect();
+    assert_eq!(changes, [Change::Select(3), Change::Select(3)]);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Notify {
+    Apply,
+    Alter,
+    Ignore,
+}
+
+/// A component that owns its selection, handles each action as `mode` says, and
+/// notifies its parent, which forwards the action's receipt.
+struct Notifying<'a> {
+    items: &'a [u32],
+    mode: Rc<Cell<Notify>>,
+    received: Rc<RefCell<Vec<Change<u32>>>>,
+}
+
+impl<'a> Component<'a, (), Theme, ()> for Notifying<'a> {
+    type State = Selection<u32>;
+    type Event = Action<u32>;
+
+    fn update(
+        &self,
+        state: &mut Selection<u32>,
+        action: Action<u32>,
+        _renderer: &(),
+    ) -> Option<()> {
+        self.received.borrow_mut().push(action.change.clone());
+
+        match (self.mode.get(), &action.change) {
+            (Notify::Alter, Change::Toggle(_)) => state.select(9),
+            (Notify::Apply | Notify::Alter, _) => state.perform(action),
+            (Notify::Ignore, _) => {}
+        }
+
+        Some(())
+    }
+
+    fn view(&self, state: &Selection<u32>) -> impl iced::Widget<Action<u32>, Theme, ()> + 'a {
+        list_view(self.items, |_, _| space().width(Fill).height(40))
+            .key(|key: &u32| *key)
+            .id(LIST)
+            .selection(state.clone(), |action| action)
+            .multiple(true)
+    }
+}
+
+#[test]
+fn replayed_effects_match_what_the_owner_already_applied() {
+    // Review P5-R3 F1: the component applies or alters an action and notifies its
+    // parent, so the action stays pending over a state that may already contain
+    // it. Replaying it changes nothing. Empty selection, cursor 2.
+    let items: Vec<u32> = (0..20).collect();
+    let mode = Rc::new(Cell::new(Notify::Apply));
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let view = || -> Root<'_> {
+        scrollable(component(Notifying {
+            items: &items,
+            mode: Rc::clone(&mode),
+            received: Rc::clone(&received),
+        }))
+        .id(SCROLL)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
+    };
+
+    let run = |handling: Notify| {
+        let log = Rc::new(Log::default());
+        let mut root = view();
+        let mut ui = Harness::new(&mut root, &log);
+        ui.frame(&mut root);
+
+        mode.set(Notify::Apply);
+        ui.click(&mut root, on_row(2), NONE);
+        ui.key(&mut root, named(Named::Escape), NONE);
+        ui.deliver(&mut root, &view, &|_| ());
+        received.take();
+
+        mode.set(handling);
+        ui.key(&mut root, named(Named::Space), CTRL);
+        assert!(ui.key(&mut root, named(Named::Escape), NONE).captured);
+        assert_eq!(received.take(), [Change::Toggle(2), Change::Clear]);
+        ui.deliver(&mut root, &view, &|_| ());
+        (ui, root)
+    };
+
+    // Applied: the toggle selected 2, so Escape clears it.
+    run(Notify::Apply);
+
+    // Altered: the list assumes the toggle until the parent handled the message,
+    // then follows the component's state, whose cursor is 9.
+    let (mut ui, mut root) = run(Notify::Alter);
+    mode.set(Notify::Apply);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(received.take(), [Change::Select(10)]);
+    drop(root);
+
+    // Ignored: the same until handled, and then nothing is selected for Escape.
+    let (mut ui, mut root) = run(Notify::Ignore);
+    assert!(!ui.key(&mut root, named(Named::Escape), NONE).captured);
+}
+
+#[test]
+fn working_copy_is_kept_until_a_receipt_or_the_selection_changes() {
+    // Review P5-R3 F2: a batch of 100 Ctrl+A on 20,000 items applies each effect
+    // once. The copy is rebuilt when a receipt is processed in the batch, or when
+    // the list is given another selection.
+    let app = App::new(rows(0..20_000, 40.0)).selectable(true);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.run_task(&mut root, focusable::focus(LIST));
+
+    let counts = |ui: &Harness| (ui.core().input.applied, ui.core().input.rebases);
+    let (applied, rebases) = counts(&ui);
+
+    for _ in 0..100 {
+        assert!(ui.key(&mut root, Key::Character("a".into()), CTRL).captured);
+    }
+
+    assert_eq!(counts(&ui), (applied + 100, rebases));
+    app.log.actions.take();
+
+    // The first message is handled: the copy is rebuilt from the other 99.
+    let mut messages: Vec<_> = ui.bus.drain().collect();
+    messages.remove(0);
+
+    for (message, receipt) in messages {
+        ui.bus.forward(message, receipt);
+    }
+
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(counts(&ui), (applied + 100 + 99 + 1, rebases + 1));
+
+    // Another view, which may supply another selection: the 100 pending effects
+    // are applied to it again, then the new one.
+    root = app.view();
+    ui.rebuild(&mut root);
+    ui.key(&mut root, named(Named::ArrowDown), NONE);
+    assert_eq!(counts(&ui), (applied + 200 + 100 + 1, rebases + 2));
+    app.log.actions.take();
 }
