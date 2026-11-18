@@ -23,6 +23,7 @@ use std::hash::Hash;
 use iced::advanced::layout::{Layout, Limits};
 use iced::advanced::shell::Invalidation;
 use iced::advanced::widget::Tree;
+use iced::advanced::widget::operation::focusable;
 use iced::advanced::{Shell, Widget};
 use iced::time::Instant;
 use iced::{Length, Rectangle, Size};
@@ -82,7 +83,7 @@ where
         let visible = super::geometry::Visible::new(*viewport, layout.bounds());
 
         match core.redraw(visible, now) {
-            Redraw::Idle => {}
+            Redraw::Idle => self.commit_focus(tree, layout, renderer, viewport),
             Redraw::Full => shell.invalidate_layout(),
             Redraw::Shift => {
                 let local = self.eligible(tree, layout, viewport, shell.invalidation(), now);
@@ -123,7 +124,13 @@ where
             Invalidation::Layout(_) | Invalidation::Widgets
         );
 
+        let core = tree.state.downcast_ref::<Core<K>>();
+
+        // A landing and a deferred focus wait for frames that only root layout
+        // brings, and keep every redraw on the full path until they are done.
         let allowed = enabled()
+            && core.landing.is_none()
+            && core.focus.deferred.is_none()
             && visible
             && !pending
             && !geometry.dirty
@@ -134,6 +141,49 @@ where
             && local.settings == self.settings();
 
         allowed.then_some(local)
+    }
+
+    /// Focuses the deferred widget once its item is laid out (section 4.7), with the
+    /// fork's global focus operation on the item's subtree. The first part of the
+    /// focus task already unfocused every other widget.
+    fn commit_focus(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+    ) {
+        let core = tree.state.downcast_mut::<Core<K>>();
+
+        // The list holds the focus for the item. Without it, something else took the
+        // focus and the item must not take it back.
+        if !core.focus.focused {
+            core.focus.deferred = None;
+            return;
+        }
+
+        let Some(index) = core.focus.deferred.as_ref().and_then(|(key, _)| {
+            let position = core.model.position(key)?;
+
+            core.window
+                .binary_search_by_key(&position, |slot| slot.position)
+                .ok()
+        }) else {
+            return;
+        };
+
+        let Some((_, widget)) = core.focus.deferred.take() else {
+            return;
+        };
+
+        // The list held the focus for the item, and hands it over.
+        core.focus.focused = false;
+
+        let mut focus = focusable::focus::<()>(widget);
+
+        if let Some((layout, tree)) = layout.iter_mut(&mut tree.children).nth(index) {
+            self.rows[index].operate(tree, layout, viewport, renderer, &mut focus);
+        }
     }
 
     /// The shared walk with the cached limits. Returns whether the geometry stayed

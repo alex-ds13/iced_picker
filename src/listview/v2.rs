@@ -12,16 +12,20 @@ mod geometry;
 mod heights;
 mod local;
 mod model;
+mod resolve;
 mod style;
+mod tasks;
 mod window;
 
 #[cfg(test)]
 mod tests;
 
 pub use style::{Catalog, Status, Style, StyleFn, default};
+pub use tasks::{Align, focus, scroll_to, settle};
 
 use geometry::Settings;
 use local::LocalLayout;
+use tasks::Exchange;
 use window::{Core, Slot};
 
 use std::collections::HashSet;
@@ -33,9 +37,12 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::shell::Invalidation;
+use iced::advanced::widget::operation::Focusable;
 use iced::advanced::widget::{Id, Meta, Operation, Tree, tree};
 use iced::advanced::{Shell, Widget};
-use iced::{Background, Color, Event, Length, Padding, Pixels, Rectangle, Size, Vector, mouse};
+use iced::{
+    Background, Color, Event, Length, Padding, Pixels, Rectangle, Size, Vector, mouse, touch,
+};
 
 /// The items materialized beyond each edge of the viewport by default.
 const ANTICIPATE: usize = 4;
@@ -63,6 +70,7 @@ where
     view: Box<dyn Fn(usize, &'a T) -> W + 'a>,
     key: Box<dyn Fn(usize, &'a T) -> K + 'a>,
     id: Option<Id>,
+    scroller: Option<Id>,
     width: Length,
     padding: Padding,
     spacing: f32,
@@ -93,6 +101,7 @@ where
         view: Box::new(view),
         key: Box::new(|index, _| index),
         id: None,
+        scroller: None,
         width: Length::Fill,
         padding: Padding::ZERO,
         spacing: 0.0,
@@ -130,6 +139,7 @@ where
             view: self.view,
             key: Box::new(move |_, item| key(item)),
             id: self.id,
+            scroller: self.scroller,
             width: self.width,
             padding: self.padding,
             spacing: self.spacing,
@@ -143,6 +153,19 @@ where
     }
 
     /// Sets the [`Id`] of the list.
+    /// Names the scrollable that contains the list, which [`scroll_to`], [`focus`] and
+    /// [`settle`] move.
+    ///
+    /// It must be a vertical, start-anchored ancestor with a unique id. Operations
+    /// cannot tell a scrollable's direction or anchor, so this is not checked beyond
+    /// the scrollable being reached before the list. With any other scrollable, the
+    /// list still virtualizes and keeps its items still, but the tasks may do nothing
+    /// or the wrong thing.
+    pub fn scroller(mut self, id: impl Into<Id>) -> Self {
+        self.scroller = Some(id.into());
+        self
+    }
+
     pub fn id(mut self, id: impl Into<Id>) -> Self {
         self.id = Some(id.into());
         self
@@ -330,6 +353,14 @@ where
             core.geometry.block_next_redraw = true;
         }
 
+        // Removing its key is the only change, besides a later focus change, that
+        // cancels a deferred focus.
+        if let Some((key, _)) = &core.focus.deferred
+            && core.model.position(key).is_none()
+        {
+            core.focus.deferred = None;
+        }
+
         self.rows = core
             .window
             .iter()
@@ -413,6 +444,22 @@ where
             row.update(tree, event, layout, cursor, renderer, shell, viewport);
         }
 
+        // A press outside the list, or one any widget took, also before the list,
+        // unfocuses the list and cancels a deferred focus (section 4.7). Any other
+        // press inside still cancels the deferred focus: the user acted before it
+        // landed.
+        if let Event::Mouse(mouse::Event::ButtonPressed(_))
+        | Event::Touch(touch::Event::FingerPressed { .. }) = event
+        {
+            let focus = &mut tree.state.downcast_mut::<Core<K>>().focus;
+
+            if !cursor.is_over(layout.bounds()) || shell.is_event_captured() {
+                focus.unfocus();
+            } else {
+                focus.deferred = None;
+            }
+        }
+
         // A row that changes its geometry in the redraw asks for a root layout, which
         // the list never downgrades. The remaining passes of the redraw stay full.
         if let Some(now) = redraw
@@ -452,6 +499,8 @@ where
         viewport: &Rectangle,
     ) {
         let core = tree.state.downcast_ref::<Core<K>>();
+
+        core.draw_landing(geometry::Visible::new(*viewport, layout.bounds()));
 
         *core.drawn_hover.borrow_mut() =
             hovered(&core.window, layout, &tree.children, cursor, viewport);
@@ -508,7 +557,22 @@ where
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        operation.container(self.id.as_ref(), layout.bounds(), viewport);
+        let bounds = layout.bounds();
+        let core = tree.state.downcast_mut::<Core<K>>();
+
+        operation.focusable(self.id.as_ref(), bounds, &mut core.focus);
+
+        // A list task asks in the first call and reads the answer in the second one.
+        // Other operations never ask, and cost one call.
+        let mut exchange = Exchange::new(self.scroller.clone());
+        operation.custom(self.id.as_ref(), bounds, &mut exchange);
+
+        if let Some(request) = exchange.request.take() {
+            exchange.answer = Some(self.answer(tree, renderer, request));
+            operation.custom(self.id.as_ref(), bounds, &mut exchange);
+        }
+
+        operation.container(self.id.as_ref(), bounds, viewport);
         operation.traverse(&mut |operation| {
             for (row, (layout, tree)) in self
                 .rows

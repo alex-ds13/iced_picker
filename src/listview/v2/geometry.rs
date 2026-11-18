@@ -94,7 +94,7 @@ pub(super) struct Geometry {
     /// The geometry changed since the last walk, so the window may be wrong.
     pub(super) dirty: bool,
     /// The redraw timestamp of the last rule S.
-    shrunk_at: Option<Instant>,
+    pub(super) shrunk_at: Option<Instant>,
     /// The constraints of the last full layout, `None` after a `diff` until the next
     /// full layout.
     pub(super) local: Option<LocalLayout>,

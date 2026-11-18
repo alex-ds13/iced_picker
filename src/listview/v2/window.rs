@@ -6,7 +6,7 @@ use super::heights::Recorded;
 use super::model::{Model, Rebuilt};
 use super::{Catalog, ListView};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
@@ -14,7 +14,8 @@ use std::mem;
 use iced::Vector;
 use iced::advanced::Widget;
 use iced::advanced::layout::Limits;
-use iced::advanced::widget::Tree;
+use iced::advanced::widget::operation::Focusable;
+use iced::advanced::widget::{Id, Tree};
 use iced::time::Instant;
 
 /// The state of a list, stored in its tree.
@@ -30,9 +31,89 @@ pub(super) struct Core<K> {
     /// event that hovers another item requests a redraw. The position tells apart
     /// items with the same key.
     pub(super) drawn_hover: RefCell<Option<(K, usize)>>,
+    /// The anchor was pinned by an instant scroll or `settle` for the viewport after
+    /// their jump, which the stored visible region does not show yet.
+    pub(super) landing: Option<Landing>,
+    pub(super) focus: Focus<K>,
+    /// Positions measured by `resolve`, for the tests.
+    #[cfg(test)]
+    pub(super) resolved: Vec<usize>,
     /// Every walk, for the tests.
     #[cfg(test)]
     pub(super) walks: Vec<Walk>,
+}
+
+/// An anchor pinned for the viewport after a jump.
+///
+/// It pins its item through every pass and every layout until the list is drawn
+/// with a window walked for the region the jump reached: the destination or, for a
+/// destination the parent cannot reach, the region the last redraw pass saw, if the
+/// list still has the height the parent clamped against in that pass. Rules Z and S,
+/// the re-pins and the refresh leave it alone until then, so rows built for the
+/// destination, messages and later siblings can change heights in that frame without
+/// moving it. The next frame releases it before anything else, and is an ordinary
+/// frame. A jump clamped to the start is released as soon as it is laid out there,
+/// and rule Z applies.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Landing {
+    /// The visible top the jump aims at, in list coordinates.
+    pub(super) top: f64,
+    /// The visible region of the latest redraw since the landing was pinned.
+    pub(super) seen: Option<Visible>,
+    /// The list's height in the latest redraw.
+    pub(super) total: Option<f64>,
+    /// The timestamp of the latest redraw.
+    pub(super) frame: Option<Instant>,
+    /// The list was drawn with the reached region laid out. Set by `draw`, which only
+    /// has a shared reference.
+    pub(super) drawn: Cell<bool>,
+}
+
+impl Landing {
+    pub(super) fn new(top: f64) -> Self {
+        Self {
+            top,
+            seen: None,
+            total: None,
+            frame: None,
+            drawn: Cell::new(false),
+        }
+    }
+
+    /// Whether the scroller may not show the destination yet. A task's view of the
+    /// scroller is stale until then.
+    pub(super) fn pending(&self) -> bool {
+        !self.drawn.get()
+    }
+}
+
+/// The list's own focus, and a focus waiting for its item to be laid out
+/// (section 4.7). While a focus waits, the list holds the focus for it, so exactly
+/// one widget is focused, and any focus change that visits the list replaces it.
+#[derive(Debug)]
+pub(super) struct Focus<K> {
+    pub(super) focused: bool,
+    /// The key of the item and the widget inside it to focus.
+    pub(super) deferred: Option<(K, Id)>,
+}
+
+impl<K> Focusable for Focus<K> {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// An explicit focus of the list replaces a deferred one.
+    fn focus(&mut self) {
+        self.focused = true;
+        self.deferred = None;
+    }
+
+    /// Every focus change that visits the list calls this or [`Self::focus`], so a
+    /// later focus change cancels the deferred one.
+    fn unfocus(&mut self) {
+        self.focused = false;
+        self.deferred = None;
+    }
 }
 
 /// The anchor (section 4.4), with its target y kept by the geometry.
@@ -87,6 +168,13 @@ impl<K: Clone + Eq + Hash> Core<K> {
             window: Vec::new(),
             anchor: None,
             drawn_hover: RefCell::new(None),
+            landing: None,
+            focus: Focus {
+                focused: false,
+                deferred: None,
+            },
+            #[cfg(test)]
+            resolved: Vec::new(),
             #[cfg(test)]
             walks: Vec::new(),
         }
@@ -186,7 +274,19 @@ impl<K: Clone + Eq + Hash> Core<K> {
     /// the same timestamp stay on the full path: after a change made outside the
     /// redraw, with no current layout or cached limits, and for rules Z and S.
     pub(super) fn redraw(&mut self, visible: Visible, now: Instant) -> Redraw {
-        if mem::take(&mut self.geometry.block_next_redraw) {
+        // A landing drawn in an earlier frame is released before rules Z and S and the
+        // refresh, so this frame treats its anchor like any other.
+        if self
+            .landing
+            .as_ref()
+            .is_some_and(|landing| landing.drawn.get() && landing.frame != Some(now))
+        {
+            self.landing = None;
+        }
+
+        // A deferred focus keeps the whole redraw on the full path, also the passes
+        // after it commits.
+        if mem::take(&mut self.geometry.block_next_redraw) || self.focus.deferred.is_some() {
             self.geometry.full_frame = Some(now);
         }
 
@@ -212,6 +312,24 @@ impl<K: Clone + Eq + Hash> Core<K> {
                 Redraw::Idle
             }
         };
+
+        if let Some(landing) = &mut self.landing {
+            let walked = current && self.geometry.laid_out == Some(visible);
+            let arrived = (visible.top - landing.top).abs() <= 1.0 || landing.seen == Some(visible);
+            landing.seen = Some(visible);
+            landing.frame = Some(now);
+            landing.total = Some(self.geometry.total());
+
+            if !(walked && arrived) {
+                return Redraw::Full;
+            } else if !visible.at_start() {
+                return shift(self);
+            }
+
+            // A jump the parent clamped to the start shows the start, where rule Z
+            // keeps the list's top in place as in any other frame there.
+            self.landing = None;
+        }
 
         if visible.at_start() {
             // Rule Z. It applies before the list is laid out too, so I1 holds at the
@@ -261,6 +379,8 @@ impl<K: Clone + Eq + Hash> Core<K> {
     /// last one before it, so a position is never paired with another one's target.
     /// This scans the run of duplicates around the visible top.
     pub(super) fn pin_first_visible(&mut self, visible: Visible) {
+        self.landing = None;
+
         if self
             .geometry
             .end_visible(visible, self.anchor == Some(Anchor::End))
@@ -315,9 +435,50 @@ impl<K: Clone + Eq + Hash> Core<K> {
         ))
     }
 
+    /// Marks a landing drawn when the list is drawn showing `visible`, laid out for it,
+    /// and `visible` is the destination, or the region of the last redraw pass while
+    /// the list keeps the height of that pass. The parent clamped that pass against
+    /// this height, so it shows the same region in the next frame.
+    pub(super) fn draw_landing(&self, visible: Visible) {
+        let Some(landing) = &self.landing else {
+            return;
+        };
+
+        let arrived = (visible.top - landing.top).abs() <= 1.0
+            || (landing.seen == Some(visible) && landing.total == Some(self.geometry.total()));
+
+        if arrived && !self.geometry.dirty && self.geometry.laid_out == Some(visible) {
+            landing.drawn.set(true);
+        }
+    }
+
+    /// The landing, while the scroller may not show its destination yet.
+    pub(super) fn pending_landing(&self) -> Option<&Landing> {
+        self.landing.as_ref().filter(|landing| landing.pending())
+    }
+
     pub(super) fn unpin(&mut self) {
         self.anchor = None;
+        self.landing = None;
         self.geometry.unpin();
+    }
+
+    /// Pins the first item visible at `top`, the top of the viewport after an instant
+    /// jump, as a landing. Always an item: the rows from it down to the target are
+    /// measured, which keeps the target exact. If the end is in view, the refresh of
+    /// the frame after the landing is drawn pins it without moving anything.
+    /// At the start there is no anchor (I1).
+    pub(super) fn pin_landing(&mut self, top: f64) {
+        let visible = Visible { top, height: 0.0 };
+
+        match self.first_visible_owner(top) {
+            Some(position) if !visible.at_start() => {
+                self.anchor = Some(Anchor::Item(self.model.key(position).clone()));
+                self.geometry.pin(Target::Row(position));
+                self.landing = Some(Landing::new(top));
+            }
+            _ => self.unpin(),
+        }
     }
 
     /// Checks invariants I1 and I2 (section 4.4) and the alignment of the window with
@@ -325,7 +486,8 @@ impl<K: Clone + Eq + Hash> Core<K> {
     fn check(&self, visible: Visible, children: &[Tree], rows: usize) {
         let geometry = &self.geometry;
 
-        if visible.at_start() {
+        // A landing pins for the viewport after the jump, not for the stored one.
+        if visible.at_start() && self.landing.is_none() {
             debug_assert_eq!(geometry.drift(), 0.0, "I1: drift at the start");
             debug_assert!(self.anchor.is_none(), "I1: anchor at the start");
         }
@@ -477,8 +639,8 @@ where
             // view, so the end is pinned before measurements shorten the list any more.
             // P4's instant scroll pins the destination's first row for the viewport
             // after the jump, which the stored visible region does not show yet. That
-            // pin must be marked on the anchor and left alone here until the next
-            // laid-out redraw refreshes it.
+            // pin is a landing, left alone here until the frame after it is drawn
+            // releases it.
             // Only a re-pin that changes the anchor counts. A refresh that picks the
             // same anchor again, as when no item covers an empty visible region, must
             // not keep the walk going.
@@ -591,6 +753,10 @@ where
     /// Whether the anchor no longer is what a refresh would pick: the end while it is
     /// visible, else an item covering visible content.
     fn stale_anchor(&self, visible: Visible) -> bool {
+        if self.core.landing.is_some() {
+            return false;
+        }
+
         let geometry = &self.core.geometry;
 
         match self.core.anchor_target() {

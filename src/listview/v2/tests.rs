@@ -9,8 +9,9 @@
 
 use super::geometry::Visible;
 use super::heights::Estimate;
+use super::tasks::{FocusItem, ScrollTo, Settle};
 use super::window::{Anchor, Core, Walk};
-use super::{Status, Style, StyleFn, list_view};
+use super::{Align, Status, Style, StyleFn, list_view};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -23,11 +24,11 @@ use iced::advanced::overlay::Group;
 use iced::advanced::renderer;
 use iced::advanced::shell::{Bus, Diff, Invalidation, Waker};
 use iced::advanced::widget::operation::scrollable::{AbsoluteOffset, Scrollable, scroll_to};
-use iced::advanced::widget::operation::{Animation, Operation};
+use iced::advanced::widget::operation::{Animation, Focusable, Operation, Outcome, focusable};
 use iced::advanced::widget::{Id, Meta, Tree, tree};
 use iced::advanced::{Shell, Widget};
 use iced::time::Instant;
-use iced::widget::{column, scrollable, space, sticky, text};
+use iced::widget::{Component, column, component, scrollable, sensor, space, sticky, text};
 use iced::{
     Color, Element, Event, Fill, Length, Padding, Point, Rectangle, Size, Theme, Vector,
     Widget as _, mouse, touch,
@@ -108,6 +109,21 @@ struct Log {
     footer: Cell<Option<Rectangle>>,
     /// Invalidations the header (0) and footer (1) request on their next redraws.
     inject: RefCell<[VecDeque<Option<Invalidation>>; 2]>,
+    /// The header captures every press.
+    capture_press: Cell<bool>,
+    /// Rows that publish a message on their next redraw.
+    publish: RefCell<HashSet<u32>>,
+    /// Heights the next message handled by `Harness::frame_app` applies.
+    on_message: RefCell<Vec<(u32, f32)>>,
+    /// Rows wrapped in a sensor that publishes a message when they are shown.
+    sensors: RefCell<HashSet<u32>>,
+    /// What the footer does on its next redraws: give a row a height and ask for a
+    /// layout, or nothing.
+    footer_changes: RefCell<VecDeque<Option<(u32, f32)>>>,
+    /// The number of the current update pass of a frame, from 1.
+    pass: Cell<usize>,
+    /// The passes in which a row grew or the footer changed a row.
+    changed_in: RefCell<Vec<usize>>,
 }
 
 impl Log {
@@ -173,6 +189,29 @@ impl Log {
 struct RowState {
     key: u32,
     serial: u64,
+    focused: bool,
+}
+
+impl Focusable for RowState {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    fn focus(&mut self) {
+        self.focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.focused = false;
+    }
+}
+
+/// A focusable widget outside the list: the header.
+const OUTSIDE: Id = Id::new("outside");
+
+/// The id of the focusable field of the probe with `key`.
+fn field(key: u32) -> Id {
+    Id::from(format!("field-{key}"))
 }
 
 /// An instrumented row.
@@ -206,6 +245,7 @@ impl Widget<(), Theme, ()> for Probe {
         tree::State::new(RowState {
             key: self.item.key,
             serial,
+            focused: false,
         })
     }
 
@@ -272,7 +312,12 @@ impl Widget<(), Theme, ()> for Probe {
                     .overrides
                     .borrow_mut()
                     .insert(self.item.key, height);
+                self.log.changed_in.borrow_mut().push(self.log.pass.get());
                 shell.invalidate_layout();
+            }
+
+            if self.log.publish.borrow_mut().remove(&self.item.key) {
+                shell.publish(());
             }
         }
     }
@@ -294,16 +339,19 @@ impl Widget<(), Theme, ()> for Probe {
 
     fn operate(
         &mut self,
-        _tree: &mut Tree,
+        tree: &mut Tree,
         layout: Layout,
         _viewport: &Rectangle,
         _renderer: &(),
-        _operation: &mut dyn Operation,
+        operation: &mut dyn Operation,
     ) {
         self.log
             .operated
             .borrow_mut()
             .push((self.item.key, layout.bounds()));
+
+        let state = tree.state.downcast_mut::<RowState>();
+        operation.focusable(Some(&field(self.item.key)), layout.bounds(), state);
     }
 
     fn overlay<'b>(
@@ -335,11 +383,51 @@ struct Sibling {
 
 impl Meta for Sibling {}
 
+/// The focus of the header, which is the [`OUTSIDE`] widget.
+#[derive(Default)]
+struct Outside(bool);
+
+impl Focusable for Outside {
+    fn is_focused(&self) -> bool {
+        self.0
+    }
+
+    fn focus(&mut self) {
+        self.0 = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.0 = false;
+    }
+}
+
 impl Widget<(), Theme, ()> for Sibling {
     fn size(&self) -> Size<Length> {
         Size {
             width: Length::Fill,
             height: Length::Fixed(self.height),
+        }
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Outside>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Outside::default())
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout,
+        _viewport: &Rectangle,
+        _renderer: &(),
+        operation: &mut dyn Operation,
+    ) {
+        if self.side == 0 {
+            let state = tree.state.downcast_mut::<Outside>();
+            operation.focusable(Some(&OUTSIDE), layout.bounds(), state);
         }
     }
 
@@ -382,6 +470,25 @@ impl Widget<(), Theme, ()> for Sibling {
             if let Some(Some(invalidation)) = injected {
                 shell.invalidate(invalidation);
             }
+
+            let change = if self.side == 1 {
+                self.log.footer_changes.borrow_mut().pop_front()
+            } else {
+                None
+            };
+
+            if let Some(Some((key, height))) = change {
+                self.log.overrides.borrow_mut().insert(key, height);
+                self.log.changed_in.borrow_mut().push(self.log.pass.get());
+                shell.invalidate_layout();
+            }
+        }
+
+        if self.side == 0
+            && self.log.capture_press.get()
+            && let Event::Mouse(mouse::Event::ButtonPressed(_)) = event
+        {
+            shell.capture_event();
         }
     }
 }
@@ -406,6 +513,12 @@ fn row(item: &Item, log: &Rc<Log>) -> Root<'static> {
                 .chain((1..=items).map(|index| probe(item.key * 1000 + index, height).boxed())),
         )
         .boxed(),
+        _ if log.sensors.borrow().contains(&item.key) => sensor(Probe {
+            item: *item,
+            log: Rc::clone(log),
+        })
+        .on_show(|_| ())
+        .boxed(),
         _ => Probe {
             item: *item,
             log: Rc::clone(log),
@@ -422,6 +535,8 @@ struct App {
     scroller: bool,
     /// The list is the scrollable's whole content: no column, header or footer.
     direct: bool,
+    /// The list's `scroller`.
+    scroller_id: Option<Id>,
     height: Length,
     estimate: Option<f32>,
     anticipate: usize,
@@ -439,6 +554,7 @@ impl App {
             header: 0.0,
             scroller: true,
             direct: false,
+            scroller_id: Some(SCROLL),
             height: Fill,
             estimate: None,
             anticipate: 4,
@@ -457,6 +573,42 @@ impl App {
     }
 
     fn view(&self) -> Root<'_> {
+        let list = self.list();
+
+        let header = Sibling {
+            side: 0,
+            height: self.header,
+            log: Rc::clone(&self.log),
+        };
+        let footer = Sibling {
+            side: 1,
+            height: FOOTER,
+            log: Rc::clone(&self.log),
+        };
+
+        if self.direct {
+            return scrollable(list)
+                .id(SCROLL)
+                .width(Fill)
+                .height(self.height)
+                .boxed();
+        }
+
+        let content = column![header, list, footer].width(Fill);
+
+        if self.scroller {
+            scrollable(content)
+                .id(SCROLL)
+                .width(Fill)
+                .height(self.height)
+                .boxed()
+        } else {
+            content.boxed()
+        }
+    }
+
+    /// The list alone, for views built by a test.
+    fn list(&self) -> Root<'_> {
         let log = Rc::clone(&self.log);
         let calls = Rc::clone(&self.log);
 
@@ -488,35 +640,11 @@ impl App {
             });
         }
 
-        let header = Sibling {
-            side: 0,
-            height: self.header,
-            log: Rc::clone(&self.log),
-        };
-        let footer = Sibling {
-            side: 1,
-            height: FOOTER,
-            log: Rc::clone(&self.log),
-        };
-        if self.direct {
-            return scrollable(list)
-                .id(SCROLL)
-                .width(Fill)
-                .height(self.height)
-                .boxed();
+        if let Some(scroller) = &self.scroller_id {
+            list = list.scroller(scroller.clone());
         }
 
-        let content = column![header, list, footer].width(Fill);
-
-        if self.scroller {
-            scrollable(content)
-                .id(SCROLL)
-                .width(Fill)
-                .height(self.height)
-                .boxed()
-        } else {
-            content.boxed()
-        }
+        list.boxed()
     }
 }
 
@@ -537,6 +665,8 @@ struct Updated {
 struct Frame {
     /// The invalidation of each update pass.
     passes: Vec<Invalidation>,
+    /// The last pass published messages, which were handled after the draw.
+    late: bool,
     root_layouts: usize,
 }
 
@@ -556,6 +686,8 @@ struct Harness {
     /// The runtime's overlay state: `Some` with the overlays' mouse interaction when
     /// the last update had overlays (`runtime/src/user_interface.rs:279-283`).
     overlay: Option<mouse::Interaction>,
+    /// Messages published since the application last handled them.
+    messages: usize,
 }
 
 impl Harness {
@@ -575,6 +707,7 @@ impl Harness {
             rebuilds: 0,
             walk_start: 0,
             overlay: None,
+            messages: 0,
         };
 
         harness.rebuild(root);
@@ -746,7 +879,7 @@ impl Harness {
             invalidation = invalidation.max(base);
         }
 
-        assert!(bus.is_empty(), "nothing publishes messages in these tests");
+        self.messages += bus.len();
 
         let interaction = if overlaid == mouse::Interaction::None {
             root.mouse_interaction(
@@ -786,41 +919,80 @@ impl Harness {
     /// A redraw whose Widgets invalidations rebuild the view with `view`.
     fn frame_with<'a>(&mut self, root: &mut Root<'a>, view: &dyn Fn() -> Root<'a>) -> Frame {
         let event = self.next_redraw();
-        self.run(root, &event, Vec::new(), Some(view))
+        self.run(root, &event, Vec::new(), Some(view), None)
+    }
+
+    /// A redraw of an application: `update` handles the messages published in a pass,
+    /// given their number, and the view is rebuilt with `view`.
+    fn frame_app<'a>(
+        &mut self,
+        root: &mut Root<'a>,
+        view: &dyn Fn() -> Root<'a>,
+        update: &dyn Fn(usize),
+    ) -> Frame {
+        let event = self.next_redraw();
+        self.run(root, &event, Vec::new(), Some(view), Some(update))
     }
 
     /// Finishes a frame whose first passes the test ran itself.
     fn complete(&mut self, root: &mut Root<'_>, event: &Event, passes: Vec<Invalidation>) -> Frame {
-        self.run(root, event, passes, None)
+        self.run(root, event, passes, None, None)
     }
 
-    /// The shell's retry loop (`winit/src/lib.rs:784-835`): at most three passes,
-    /// Overlay and Layout retry, Widgets rebuilds the view before the next pass, and
-    /// the third pass is drawn whatever it invalidated.
+    /// The shell's retry loop (`winit/src/lib.rs:784-835`): at most three passes.
+    /// Overlay and Layout retry. Messages and Widgets retry after the application
+    /// handles the messages and the view is rebuilt and laid out. The third pass is
+    /// drawn whatever it invalidated, and its messages are handled after the draw.
     fn run<'a>(
         &mut self,
         root: &mut Root<'a>,
         event: &Event,
         mut passes: Vec<Invalidation>,
         view: Option<&dyn Fn() -> Root<'a>>,
+        update: Option<&dyn Fn(usize)>,
     ) -> Frame {
-        while passes.len() < 3 && passes.last() != Some(&Invalidation::None) {
-            if passes.last() == Some(&Invalidation::Widgets) {
-                let view = view.expect("a Widgets invalidation needs the view");
-                *root = view();
-                self.rebuild(root);
-                self.rebuilds += 1;
+        while passes.len() < 3 && (passes.last() != Some(&Invalidation::None) || self.messages > 0)
+        {
+            if self.messages > 0 || passes.last() == Some(&Invalidation::Widgets) {
+                self.handle(root, view, update);
             }
 
+            self.log.pass.set(passes.len() + 1);
             passes.push(self.update(root, event).invalidation);
         }
 
         self.draw(root);
+        let late = self.messages > 0;
+
+        if late {
+            self.handle(root, view, update);
+        }
 
         Frame {
             passes,
+            late,
             root_layouts: self.root_layouts - self.frame_start,
         }
+    }
+
+    /// The application handles the pending messages, and the view is rebuilt and
+    /// laid out (`winit/src/lib.rs:817-830`).
+    fn handle<'a>(
+        &mut self,
+        root: &mut Root<'a>,
+        view: Option<&dyn Fn() -> Root<'a>>,
+        update: Option<&dyn Fn(usize)>,
+    ) {
+        let messages = std::mem::take(&mut self.messages);
+
+        if messages > 0 {
+            update.expect("messages need the application's update")(messages);
+        }
+
+        let view = view.expect("a rebuild needs the view");
+        *root = view();
+        self.rebuild(root);
+        self.rebuilds += 1;
     }
 
     /// Draws the base tree, then the overlays when the last update had some
@@ -881,6 +1053,77 @@ impl Harness {
         if !overlays.is_empty() {
             Group::new(overlays).operate(&(), operation);
         }
+    }
+
+    /// Runs an operation and every operation it chains, as the shell runs a widget
+    /// action (`winit/src/lib.rs:1694-1715`). The shell then requests a redraw, which
+    /// is the test's next frame.
+    fn run_task(&mut self, root: &mut Root<'_>, operation: impl Operation + 'static) {
+        let mut current: Option<Box<dyn Operation>> = Some(Box::new(operation));
+
+        while let Some(mut operation) = current.take() {
+            self.operate(root, operation.as_mut());
+
+            if let Outcome::Chain(next) = operation.finish() {
+                current = Some(next);
+            }
+        }
+    }
+
+    /// The ids of the focused widgets.
+    fn focused(&mut self, root: &mut Root<'_>) -> Vec<Id> {
+        #[derive(Default)]
+        struct Focused(Vec<Id>);
+
+        impl Operation for Focused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if state.is_focused()
+                    && let Some(id) = id
+                {
+                    self.0.push(id.clone());
+                }
+            }
+        }
+
+        let mut focused = Focused::default();
+        self.operate(root, &mut focused);
+        focused.0
+    }
+
+    /// The translation of every scrollable, in traversal order.
+    fn translations(&mut self, root: &mut Root<'_>) -> Vec<(Option<Id>, f32)> {
+        #[derive(Default)]
+        struct Translations(Vec<(Option<Id>, f32)>);
+
+        impl Operation for Translations {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                _content: Size,
+                translation: Vector,
+                _state: &mut dyn Scrollable,
+            ) {
+                self.0.push((id.cloned(), translation.y));
+            }
+        }
+
+        let mut translations = Translations::default();
+        self.operate(root, &mut translations);
+        translations.0
     }
 
     /// Sets the scrollable's offset like an instant `scroll_to` task.
@@ -1846,7 +2089,9 @@ fn child_first_nonselectable_events_and_traversal() {
         Some(LIST),
         Rectangle::new(Point::ORIGIN, Size::new(800.0, 4000.0))
     )));
-    assert_eq!(visits.customs, 0);
+    // The list offers its task exchange once, and nothing asks.
+    assert_eq!(visits.customs, 1);
+    assert!(ui.core().resolved.is_empty());
     assert!(app.log.layouts.borrow().is_empty());
 
     let expected: Vec<(u32, Rectangle)> = window
@@ -3679,4 +3924,1906 @@ fn update_reports_the_runtime_interaction() {
     assert_eq!(updated.invalidation, Invalidation::Overlay);
     assert_eq!(updated.interaction, mouse::Interaction::None);
     assert_eq!(ui.mouse_interaction(&root), mouse::Interaction::Pointer);
+}
+
+/// The screen y of the bottom of a drawn row.
+fn screen_bottom(log: &Log, key: u32) -> f32 {
+    let drawn = log.drawn.borrow();
+    let row = drawn
+        .iter()
+        .find(|drawn| drawn.key == key)
+        .expect("the row is drawn");
+
+    row.bounds.y + row.bounds.height - row.viewport.y
+}
+
+fn scroll_task(key: u32, align: Align, animation: Animation) -> ScrollTo<u32> {
+    ScrollTo::new(LIST, key, align, animation)
+}
+
+/// The list scrolled to `y` in a direct scrollable, 100 rows of 40 px.
+fn direct(items: Vec<Item>) -> App {
+    let mut app = App::estimated(items, 40.0);
+    app.direct = true;
+    app
+}
+
+#[test]
+fn named_scroller_is_not_an_earlier_sibling() {
+    // R1 H1: an anonymous scrollable at y 0 with 40,000 px of content comes before the
+    // list at y 220, inside the named outer scroller.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let view = || -> Root<'_> {
+        let inner = scrollable(space().height(40_000)).height(200).width(Fill);
+
+        scrollable(column![inner, space().height(20), app.list()].width(Fill))
+            .id(SCROLL)
+            .width(Fill)
+            .height(Fill)
+            .boxed()
+    };
+
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(50, Align::Start, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(
+        ui.translations(&mut root),
+        [(Some(SCROLL), 2220.0), (None, 0.0)]
+    );
+    assert_eq!(app.log.screen()[&50], 0.0);
+}
+
+#[test]
+fn only_named_scrollable_moves_with_equal_bounds() {
+    // R2-6: the list scrolls inside an anonymous scrollable with the bounds of the
+    // named one around it, whose content is that scrollable and a 100 px footer.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let view = || -> Root<'_> {
+        let inner = scrollable(app.list()).width(Fill).height(600);
+
+        scrollable(column![inner, space().height(100)].width(Fill))
+            .id(SCROLL)
+            .width(Fill)
+            .height(Fill)
+            .boxed()
+    };
+
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    // Only the named one moves, as far as it can.
+    ui.run_task(&mut root, scroll_task(50, Align::Start, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(
+        ui.translations(&mut root),
+        [(Some(SCROLL), 100.0), (None, 0.0)]
+    );
+    drop(root);
+
+    // A scroller that is not there, or reported after the list, is a no-op that
+    // changes nothing in the list.
+    let unchanged = |ui: &mut Harness, root: &mut Root<'_>| {
+        let before = (ui.anchor(), ui.core().geometry.drift());
+        ui.run_task(root, scroll_task(500, Align::Start, Animation::Instant));
+        let core = ui.core();
+        assert!(core.resolved.is_empty());
+        assert!(core.landing.is_none() && !core.geometry.block_next_redraw);
+        assert_eq!((ui.anchor(), ui.core().geometry.drift()), before);
+        ui.frame(root);
+        assert!(ui.translations(root).iter().all(|(_, y)| *y == 0.0));
+    };
+
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.scroller_id = Some(Id::new("missing"));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    unchanged(&mut ui, &mut root);
+    drop(root);
+
+    const LATER: Id = Id::new("later");
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.scroller_id = Some(LATER);
+    let view = || -> Root<'_> {
+        let later = scrollable(space().height(1000)).id(LATER).height(100);
+
+        scrollable(column![app.list(), later].width(Fill))
+            .id(SCROLL)
+            .width(Fill)
+            .height(Fill)
+            .boxed()
+    };
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    unchanged(&mut ui, &mut root);
+    drop(root);
+
+    // R1 M2, R2-7: a horizontal scroller is outside the contract. The callbacks give
+    // no direction, so the task cannot tell, and the vertical offset has no effect.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let view = || -> Root<'_> {
+        scrollable(app.list())
+            .horizontal()
+            .id(SCROLL)
+            .width(Fill)
+            .height(Fill)
+            .boxed()
+    };
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.run_task(
+        &mut root,
+        scroll_task(500, Align::Start, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(ui.translations(&mut root), [(Some(SCROLL), 0.0)]);
+}
+
+#[test]
+fn settle_rebases_anchor_and_uses_unclamped_absolute_offset() {
+    // R1 H5, R2-2: 14,000 px of rows of which the list reports 10,000, with drift
+    // -4000, the viewport at 9000.
+    let mut app = direct(rows(1000..1250, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 9000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(0..100, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -4000.0);
+    assert_eq!(ui.tree.children[0].size.height, 10_000.0);
+    assert_eq!(app.log.screen()[&1225], 0.0);
+
+    // The drift is removed and the anchor's target moves with it to 13,000. The
+    // offset is stored unclamped and reached once layout catches up.
+    ui.run_task(&mut root, Settle::new(LIST));
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(ui.anchor(), (Some(1225), Some(13_000.0)));
+    assert!(ui.core().landing.is_some() && ui.core().geometry.block_next_redraw);
+
+    let frame = ui.frame(&mut root);
+    assert!(all_full(&ui.frame_walks()));
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(ui.translation(&mut root), 13_000.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(app.log.screen()[&1225], 0.0);
+    assert!(ui.core().pending_landing().is_none());
+    ui.assert_invariants();
+    drop(root);
+
+    // Positive drift: rows above were removed.
+    let mut app = direct(rows(1000..1250, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 9000.0);
+    drop(root);
+
+    app.items.drain(0..100);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.drift(), 4000.0);
+
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 5000.0);
+    assert_eq!(app.log.screen()[&1225], 0.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    drop(root);
+
+    // Without a scroller nothing changes.
+    let mut app = direct(rows(1000..1250, 40.0));
+    app.scroller_id = None;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 9000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(0..100, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    let anchor = ui.anchor();
+    ui.run_task(&mut root, Settle::new(LIST));
+    assert_eq!(ui.core().geometry.drift(), -4000.0);
+    assert_eq!(ui.anchor(), anchor);
+    assert!(ui.core().landing.is_none() && !ui.core().geometry.block_next_redraw);
+}
+
+#[test]
+fn instant_scroll_measures_destination_before_commit() {
+    // R2-5, R3-3: row 0 was measured at 40 px and is now 2000 px tall, off-window.
+    let mut app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+    drop(root);
+
+    app.items[0].height = Height::Fixed(2000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(0, Align::End, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 1400.0);
+    assert_eq!(screen_bottom(&app.log, 0), 600.0);
+    drop(root);
+
+    // A target taller than the viewport: its bottom or its top is aligned.
+    app.items[50].height = Height::Fixed(2000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(50, Align::End, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(screen_bottom(&app.log, 50), 600.0);
+
+    ui.run_task(&mut root, scroll_task(50, Align::Start, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&50], 0.0);
+    drop(root);
+
+    // Unreachable alignments of the first rows clamp at offset 0.
+    let app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 2000.0);
+
+    ui.run_task(&mut root, scroll_task(1, Align::End, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(screen_bottom(&app.log, 1), 80.0);
+
+    ui.scroll(&mut root, 2000.0);
+    ui.run_task(&mut root, scroll_task(2, Align::Center, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 0.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn instant_scroll_survives_two_layouts_before_redraw() {
+    // R3-1: 100 rows of 40 px, top 3000, row 99 now 2000 px tall. End gives 5360.
+    let mut app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+    drop(root);
+
+    app.items[99].height = Height::Fixed(2000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+    assert!(ui.core().landing.is_some());
+    assert_eq!(ui.anchor(), (Some(99), Some(3960.0)));
+
+    // A message lays the list out again before the redraw. The landing holds.
+    drop(root);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(ui.core().landing.is_some());
+    assert_eq!(ui.anchor(), (Some(99), Some(3960.0)));
+    assert!(ui.core().geometry.block_next_redraw);
+
+    // Every convergence pass is on the full path, and the frame drawn is exact.
+    let frame = ui.frame(&mut root);
+    assert!(frame.passes.len() <= 3);
+    assert!(all_full(&ui.frame_walks()));
+    assert_eq!(ui.translation(&mut root), 5360.0);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    assert!(ui.core().pending_landing().is_none());
+    ui.assert_invariants();
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes, [Invalidation::None]);
+}
+
+#[test]
+fn same_update_size_changes_are_in_scroll_resolution() {
+    // R3-2 as accepted: row 90 grows to 1000 px in the update that returns the task,
+    // so the view rebuild and its layout run before the task.
+    let land = |row_99: f32, expected: f32| {
+        let mut app = direct(rows(0..100, 40.0));
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, 3000.0);
+        drop(root);
+
+        app.items[90].height = Height::Fixed(1000.0);
+        app.items[99].height = Height::Fixed(row_99);
+        let mut root = app.view();
+        ui.rebuild(&mut root);
+        ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+        ui.frame(&mut root);
+
+        assert_eq!(ui.translation(&mut root), expected);
+        assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    };
+
+    land(40.0, 4360.0);
+    land(2000.0, 6320.0);
+}
+
+#[test]
+fn landing_frame_size_change_documents_l10() {
+    // R4 F1: the task measures rows 85..=99 at 40 px and answers 3400. Row 90 then
+    // grows to 1000 px in the landing redraw, between the landing anchor (row 85)
+    // and the target, so the target moves by that change: L10, not exact.
+    let app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+
+    ui.core_mut().resolved.clear();
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+    let mut resolved = ui.core().resolved.clone();
+    resolved.sort_unstable();
+    assert_eq!(resolved, range(85..=99));
+    assert_eq!(ui.anchor(), (Some(85), Some(3400.0)));
+
+    app.log.grow.borrow_mut().insert(90, 1000.0);
+    ui.frame(&mut root);
+    let translation = ui.translation(&mut root);
+    assert_eq!(translation, 3400.0);
+
+    // Row 99 is now below the viewport, so its bottom comes from the geometry.
+    let bottom = ui.core().geometry.bottom_of(99) as f32 - translation;
+    assert_eq!(bottom, 1560.0);
+
+    // On a later, ordinary frame a row built by a local walk grows in that redraw:
+    // its layout request is kept, and the geometry is repaired before the draw.
+    ui.frame(&mut root);
+    app.log.grow.borrow_mut().insert(30, 80.0);
+    let frame = ui.scroll(&mut root, 1000.0);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert!(ui.frame_walks()[0].local);
+    assert_eq!(ui.core().geometry.heights.height(30), 80.0);
+    app.log.assert_covered(1000.0, 1600.0);
+}
+
+#[test]
+fn no_landing_ownership_survives_an_instant_task() {
+    // R1 H4: an upward instant request with drift -400 lands exactly. Rule S does not
+    // shrink the drift of a landing, and the drift was folded anyway.
+    let mut app = direct(rows(1000..1200, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 4000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(0..10, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -400.0);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(1050, Align::Start, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&1050], 0.0);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&1050], 0.0);
+    assert!(ui.core().landing.is_none());
+    drop(root);
+
+    // R3-4: Start on row 100, already at the top of the viewport. Nothing is pending
+    // after the frame: a scroll within the hysteresis needs no layout and refreshes
+    // the anchor, and collapsing row 100 leaves row 101 where it is.
+    let mut app = direct(rows(0..1000, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 4000.0);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(100, Align::Start, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 4000.0);
+    assert!(ui.core().pending_landing().is_none());
+
+    let frame = ui.scroll(&mut root, 4045.0);
+    assert_eq!(frame.root_layouts, 0);
+    assert_eq!(ui.anchor(), (Some(101), Some(4040.0)));
+    drop(root);
+
+    app.items[100].height = Height::Fixed(20.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert_eq!(ui.screen_y(&mut root, 101), -5.0);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&101], -5.0);
+    drop(root);
+
+    // R2-4: after an instant task and a later scroll, an anticipated row above the
+    // viewport grows, and the first visible row stays put. No target of the task is
+    // left to hold anything else.
+    let mut app = direct(rows(0..1000, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.run_task(
+        &mut root,
+        scroll_task(500, Align::Start, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 20_600.0);
+    assert_eq!(ui.anchor(), (Some(515), Some(20_600.0)));
+    drop(root);
+
+    app.items[512].height = Height::Fixed(80.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&515], 0.0);
+}
+
+#[test]
+fn instant_far_scroll_all_alignments_with_drift() {
+    // 60,010 rows: 32 px real, 40 px estimated, so every destination is unmeasured
+    // and measured by the task, and every landing leaves some drift for the next.
+    let mut app = direct(rows(0..60_000, 32.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 200_000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(100_000..100_010, 32.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_ne!(ui.core().geometry.drift(), 0.0);
+
+    // Offsets are around 2 million px, where f32 positions are 0.25 px apart.
+    let near = |actual: f32, expected: f32| (actual - expected).abs() <= 0.25;
+
+    for (key, align, above) in [
+        (52_000, Align::Start, 0),
+        (53_000, Align::Center, 9),
+        (54_000, Align::End, 18),
+        (55_000, Align::Nearest, 18),
+        (5_000, Align::Start, 0),
+        (4_000, Align::Center, 9),
+        (3_000, Align::End, 18),
+        (2_000, Align::Nearest, 0),
+    ] {
+        ui.core_mut().resolved.clear();
+        ui.run_task(&mut root, scroll_task(key, align, Animation::Instant));
+
+        // The target, the rows above it, then the rows below it down to the bottom of
+        // the destination: 18 rows of 32 px fill 600 px.
+        let position = key as usize + 10;
+        let expected: Vec<usize> = (position - above..=position)
+            .rev()
+            .chain(position + 1..=position + 18 - above)
+            .collect();
+        assert_eq!(ui.core().resolved, expected, "{key} {align:?}");
+
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+
+        let top = app.log.screen()[&key];
+        let case = format!("{key} {align:?}: top at {top}");
+
+        match align {
+            Align::Start => assert!(near(top, 0.0), "{case}"),
+            Align::Center => assert!(near(top + 16.0, 300.0), "{case}"),
+            Align::End => assert!(near(top + 32.0, 600.0), "{case}"),
+            Align::Nearest if above > 0 => assert!(near(top + 32.0, 600.0), "{case}"),
+            Align::Nearest => assert!(near(top, 0.0), "{case}"),
+        }
+
+        assert_ne!(ui.core().geometry.drift(), 0.0);
+        ui.assert_invariants();
+    }
+}
+
+#[test]
+fn smooth_overflow_downgrades_to_instant() {
+    // R4 F2: the scroller knows 4000 px of content, row 99 is now 2000 px tall and
+    // End needs 5360. A smooth scroll would clamp its target to 3400, so the task
+    // jumps instantly, with a landing, and lands exactly.
+    let mut app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+    drop(root);
+
+    app.items[99].height = Height::Fixed(2000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Smooth));
+    assert!(ui.core().landing.is_some());
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 5360.0);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    drop(root);
+
+    // Within the known content a smooth scroll stays smooth and holds no landing: the
+    // ordinary anchor follows the view on every frame of the animation.
+    let app = direct(rows(0..100, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3000.0);
+
+    ui.run_task(&mut root, scroll_task(50, Align::Start, Animation::Smooth));
+    assert!(ui.core().landing.is_none());
+
+    let mut frames = 0;
+
+    while ui.translation(&mut root) != 2000.0 {
+        ui.frame(&mut root);
+        frames += 1;
+        assert!(frames < 120, "the animation ends");
+        assert!(ui.core().landing.is_none());
+        let translation = ui.translation(&mut root);
+        app.log.assert_covered(translation, translation + 600.0);
+    }
+
+    assert!(frames > 1);
+    assert_eq!(app.log.screen()[&50], 0.0);
+}
+
+#[test]
+fn nearest_includes_header_offset() {
+    // R4 F4: row 13 is at list y 520..560, with H 600 and T 0. Below a 100 px header
+    // it ends at 660 in the scroller, so Nearest scrolls by 60.
+    let mut app = App::estimated(rows(0..100, 40.0), 40.0);
+    app.header = 100.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(13, Align::Nearest, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 60.0);
+    assert_eq!(screen_bottom(&app.log, 13), 600.0);
+    drop(root);
+
+    // Without the header it is in view: no scroll, no landing, no barrier.
+    let app = App::estimated(rows(0..100, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(13, Align::Nearest, Animation::Instant),
+    );
+    assert!(ui.core().landing.is_none() && !ui.core().geometry.block_next_redraw);
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 0.0);
+}
+
+#[test]
+fn focus_validates_before_changing_global_focus() {
+    // R1 M8, R2-8: one 40 px row in a 600 px viewport, the list fits and has no
+    // scroller. A materialized item is focused through the global focus chain.
+    let mut app = App::estimated(rows(0..1, 40.0), 40.0);
+    app.scroller_id = None;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    ui.run_task(&mut root, FocusItem::new(LIST, 0_u32, field(0)));
+    assert_eq!(ui.focused(&mut root), [field(0)]);
+
+    // An unknown key or list changes nothing.
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, FocusItem::new(LIST, 7_u32, field(7)));
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    ui.run_task(&mut root, FocusItem::new(Id::new("nope"), 0_u32, field(0)));
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    drop(root);
+
+    // An item off the window needs the missing scroller: nothing changes.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.scroller_id = None;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    assert!(ui.core().focus.deferred.is_none());
+    assert!(ui.core().resolved.is_empty());
+}
+
+#[test]
+fn deferred_focus_is_cancelled_only_by_supersession_or_key_removal() {
+    // R2-9: focus on an item off the window unfocuses everything else and waits, with
+    // the list holding the focus for it. A focus change before the redraw visits the
+    // list and cancels it, so the outside widget is the only focused one.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(ui.focused(&mut root), [LIST]);
+    assert_eq!(ui.core().focus.deferred, Some((500, field(500))));
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    assert!(ui.core().focus.deferred.is_none());
+    ui.frame(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+
+    // Removing the item's key cancels it too. The list keeps the focus it held.
+    ui.run_task(&mut root, FocusItem::new(LIST, 700_u32, field(700)));
+    assert!(ui.core().focus.deferred.is_some());
+    drop(root);
+
+    app.items.retain(|item| item.key != 700);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(ui.core().focus.deferred.is_none());
+    ui.frame(&mut root);
+    assert_eq!(ui.focused(&mut root), [LIST]);
+}
+
+#[test]
+fn clamped_intermediate_window_keeps_deferred_focus() {
+    // R4 F3: 350 rows of 40 px, 14,000 px of which the list reports 10,000, drift
+    // -4000, the viewport at 9000. Focusing the last row lands at 13,400, but the
+    // first pass can only reach 9400.
+    let mut app = direct(rows(1000..1250, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 9000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(0..100, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.drift(), -4000.0);
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 1249_u32, field(1249)));
+    assert!(ui.core().focus.deferred.is_some());
+
+    // The intermediate window lacks the item and keeps the deferred focus.
+    let redraw = ui.next_redraw();
+    let first = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(first, Invalidation::Layout(Diff::Skip));
+    assert_eq!(ui.translation(&mut root), 9400.0);
+    assert!(!ui.keys().contains(&1249));
+    assert!(ui.core().focus.deferred.is_some());
+
+    // The translation catches up, the item is laid out and the focus commits. The
+    // deferred focus kept every pass on the full path.
+    let frame = ui.complete(&mut root, &redraw, vec![first]);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert!(all_full(&ui.frame_walks()));
+    assert_eq!(ui.translation(&mut root), 13_400.0);
+    assert!(ui.core().focus.deferred.is_none());
+    assert_eq!(ui.focused(&mut root), [field(1249)]);
+    assert_eq!(screen_bottom(&app.log, 1249), 600.0);
+}
+
+#[test]
+fn ordinary_operations_do_not_measure_or_steal_focus() {
+    // R1 M5 as narrowed: generic operations reach the materialized rows and the
+    // overlays, with their chains followed, and never make the list measure.
+    let mut items = rows(0..100, 40.0);
+    items[20].height = Height::Group {
+        header: 30.0,
+        items: 5,
+        item: 40.0,
+    };
+    let app = App::estimated(items, 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    // `focus_next` counts first and focuses in its chained operation. The list is a
+    // focusable widget too, before its rows.
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [LIST]);
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [field(0)]);
+
+    // The stuck header of a group is only reached through its overlay.
+    ui.scroll(&mut root, 850.0);
+    ui.frame(&mut root);
+    assert!(ui.overlay.is_some());
+    ui.run_task(&mut root, focusable::focus(field(20)));
+    assert_eq!(ui.focused(&mut root), [field(20)]);
+
+    assert!(ui.core().resolved.is_empty());
+    assert!(ui.core().landing.is_none());
+}
+
+/// The list inside a [`Component`], alone or between siblings in the component.
+struct Wrapped<'a> {
+    app: &'a App,
+    siblings: bool,
+}
+
+impl<'a> Component<'a, (), Theme, ()> for Wrapped<'a> {
+    type State = ();
+    type Event = ();
+
+    fn update(&self, _state: &mut (), _event: (), _renderer: &()) -> Option<()> {
+        None
+    }
+
+    fn view(&self, _state: &()) -> impl iced::Widget<(), Theme, ()> + 'a {
+        if self.siblings {
+            let footer = Sibling {
+                side: 1,
+                height: FOOTER,
+                log: Rc::clone(&self.app.log),
+            };
+
+            column![space().height(30), self.app.list(), footer]
+                .width(Fill)
+                .boxed()
+        } else {
+            self.app.list()
+        }
+    }
+}
+
+fn wrapped(app: &App, siblings: bool) -> Root<'_> {
+    scrollable(component(Wrapped { app, siblings }))
+        .id(SCROLL)
+        .width(Fill)
+        .height(Fill)
+        .boxed()
+}
+
+#[test]
+fn list_inside_a_component_shifts_tasks_and_keeps_barriers() {
+    for siblings in [false, true] {
+        let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+        let mut root = wrapped(&app, siblings);
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, 400.0);
+        let offset = if siblings { 30.0 } else { 0.0 };
+
+        // A local shift asks for no root layout, but the component rebuilds its view
+        // and lays out its whole subtree after any invalidation of its children
+        // (`widget/src/component.rs:269-300`): the list walks again, and its
+        // siblings in the component are laid out too.
+        let siblings_before = app.log.sibling_layouts.get();
+        let frame = ui.scroll(&mut root, 2000.0 + offset);
+        assert_eq!(frame.root_layouts, 0, "siblings {siblings}");
+        let walks = ui.frame_walks();
+        assert!(walks[0].local);
+        assert!(walks.len() > 1 && !walks[1].local);
+        assert_eq!(
+            app.log.sibling_layouts.get() > siblings_before,
+            siblings,
+            "siblings {siblings}"
+        );
+        app.log.assert_covered(2000.0 + offset, 2600.0 + offset);
+
+        // Tasks reach the list through the component.
+        ui.run_task(
+            &mut root,
+            scroll_task(900, Align::Start, Animation::Instant),
+        );
+        ui.frame(&mut root);
+        assert_eq!(app.log.screen()[&900], 0.0);
+        drop(root);
+
+        // An operation-time barrier survives a root layout that skips the list: the
+        // component keeps its child's layout while its limits do not change.
+        app.items.splice(0..0, rows(10_000..10_010, 40.0));
+        let mut root = wrapped(&app, siblings);
+        ui.rebuild(&mut root);
+        ui.frame(&mut root);
+        assert_eq!(ui.core().geometry.drift(), -400.0);
+
+        ui.run_task(&mut root, Settle::new(LIST));
+        let walks = ui.walks();
+        ui.layout(&mut root);
+        assert_eq!(ui.walks(), walks);
+        assert!(ui.core().geometry.dirty && ui.core().geometry.block_next_redraw);
+
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+        assert!(all_full(&ui.frame_walks()));
+        assert_eq!(ui.core().geometry.drift(), 0.0);
+        assert_eq!(app.log.screen()[&900], 0.0);
+        ui.assert_invariants();
+    }
+}
+
+#[test]
+fn public_tasks_build_with_any_message_and_key() {
+    // The tasks are `Task`s of the application's message, for any key type.
+    #[derive(Debug, Clone)]
+    enum Message {}
+
+    let _: iced::Task<Message> = super::scroll_to(LIST, 7_u32, Align::Nearest, Animation::Auto);
+    let _: iced::Task<Message> = super::scroll_to(LIST, "key", Align::Center, Animation::Smooth);
+    let _: iced::Task<Message> = super::focus(LIST, 7_usize, field(7));
+    let _: iced::Task<Message> = super::settle(LIST);
+
+    for align in [Align::Start, Align::Center, Align::End, Align::Nearest] {
+        let _ = scroll_task(0, align, Animation::Instant);
+    }
+}
+
+#[test]
+fn deferred_focus_waits_for_its_item_and_blocks_local_walks() {
+    // R4 F3, the user's side: focus on an item off the window, then the user scrolls
+    // elsewhere before it is reached. The focus waits for the item, keeping every
+    // window shift on the full path, and commits when the item is laid out.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    ui.scroll_only(&mut root, 4000.0);
+    ui.frame(&mut root);
+    assert!(all_full(&ui.frame_walks()));
+    assert!(ui.core().pending_landing().is_none());
+    assert!(ui.core().focus.deferred.is_some());
+
+    for y in [4400.0, 4800.0] {
+        let frame = ui.scroll(&mut root, y);
+        assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+        assert!(all_full(&ui.frame_walks()));
+        assert!(ui.core().focus.deferred.is_some());
+    }
+
+    assert_eq!(ui.focused(&mut root), [LIST]);
+
+    ui.scroll(&mut root, 19_440.0);
+    assert!(ui.core().focus.deferred.is_none());
+    assert_eq!(ui.focused(&mut root), [field(500)]);
+
+    // Once it committed, shifts are local again.
+    let frame = ui.scroll(&mut root, 19_840.0);
+    assert_eq!(frame.passes, [Invalidation::Overlay, Invalidation::None]);
+}
+
+/// The focused widgets, which are never more than one.
+fn single_focus(ui: &mut Harness, root: &mut Root<'_>) -> Vec<Id> {
+    let focused = ui.focused(root);
+    assert!(focused.len() <= 1, "several focused widgets: {focused:?}");
+    focused
+}
+
+#[test]
+fn landing_survives_a_layout_for_the_old_viewport() {
+    // Review P4-R1 F1: rows 0..=99 are 40 px and row 100 was measured as 0 px at the
+    // end. Back at the start, row 100 becomes 1000 px off the window. End on row 99
+    // lands at 3400 with row 85 pinned. A full layout for the old viewport before the
+    // redraw clears dirty, but must not release the landing.
+    let mut items = rows(0..101, 40.0);
+    items[100].height = Height::Fixed(0.0);
+    let mut app = direct(items);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3400.0);
+    assert!(ui.keys().contains(&100));
+    ui.scroll(&mut root, 0.0);
+    drop(root);
+
+    app.items[100].height = Height::Fixed(1000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+    assert_eq!(ui.anchor(), (Some(85), Some(3400.0)));
+    drop(root);
+
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    assert!(!ui.core().geometry.dirty);
+    assert!(ui.core().landing.is_some());
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(ui.translation(&mut root), 3400.0);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    assert!(ui.core().pending_landing().is_none());
+    ui.assert_invariants();
+}
+
+#[test]
+fn landing_is_exempt_from_z_while_clamped() {
+    // Review P4-R1 F2: 100 rows of 0 px, so the parent knows no content. Rows 49 and
+    // 50 become 1000 px off the window. End on row 50 answers 400, but the first
+    // redraw is clamped to the start, where rule Z must not drop the landing: the
+    // walk there measures row 49 above it.
+    let mut app = direct(rows(0..100, 0.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    assert_eq!(ui.positions(), range(95..=99));
+    drop(root);
+
+    app.items[49].height = Height::Fixed(1000.0);
+    app.items[50].height = Height::Fixed(1000.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(50, Align::End, Animation::Instant));
+    assert!(ui.core().landing.is_some());
+
+    let redraw = ui.next_redraw();
+    let first = ui.update(&mut root, &redraw).invalidation;
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert!(ui.core().landing.is_some());
+
+    let frame = ui.complete(&mut root, &redraw, vec![first]);
+    assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+    assert_eq!(ui.translation(&mut root), 400.0);
+    assert_eq!(screen_bottom(&app.log, 50), 600.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn deferred_focus_is_held_by_the_list() {
+    // Review P4-R1 F3: while a focus waits, the list holds it, so every focus change
+    // visits the list, and exactly one widget is ever focused.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.header = 100.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let defer = |ui: &mut Harness, root: &mut Root<'_>| {
+        ui.run_task(root, focusable::focus(OUTSIDE));
+        ui.run_task(root, FocusItem::new(LIST, 500_u32, field(500)));
+        assert_eq!(single_focus(ui, root), [LIST]);
+        assert!(ui.core().focus.deferred.is_some());
+    };
+
+    let settles = |ui: &mut Harness, root: &mut Root<'_>, expected: &[Id]| {
+        assert!(ui.core().focus.deferred.is_none());
+
+        for _ in 0..3 {
+            ui.frame(root);
+            assert_eq!(single_focus(ui, root), expected);
+        }
+    };
+
+    // `focus_next` and `focus_previous` move on from the list. The next one is the
+    // field of the first row, whose state leaves with it when the jump to row 500
+    // evicts it (L5), and the item never takes the focus.
+    defer(&mut ui, &mut root);
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(single_focus(&mut ui, &mut root), [field(0)]);
+    assert!(ui.core().focus.deferred.is_none());
+
+    for _ in 0..3 {
+        ui.frame(&mut root);
+        assert!(!single_focus(&mut ui, &mut root).contains(&field(500)));
+    }
+
+    ui.scroll(&mut root, 0.0);
+    defer(&mut ui, &mut root);
+    ui.run_task(&mut root, focusable::focus_previous());
+    settles(&mut ui, &mut root, &[OUTSIDE]);
+
+    // Focusing the list replaces the item: the list stays focused.
+    ui.scroll(&mut root, 0.0);
+    defer(&mut ui, &mut root);
+    ui.run_task(&mut root, focusable::focus(LIST));
+    settles(&mut ui, &mut root, &[LIST]);
+
+    // A press outside the list unfocuses it.
+    ui.scroll(&mut root, 0.0);
+    defer(&mut ui, &mut root);
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 50.0));
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    ui.cursor = mouse::Cursor::Unavailable;
+    settles(&mut ui, &mut root, &[]);
+
+    // Uninterrupted, the list hands the focus to the item.
+    ui.scroll(&mut root, 0.0);
+    defer(&mut ui, &mut root);
+    ui.frame(&mut root);
+    assert_eq!(single_focus(&mut ui, &mut root), [field(500)]);
+}
+
+#[test]
+fn nearest_without_scroll_still_lays_out_what_it_measured() {
+    // Review P4-R1 F4: row 13 is laid out at 40 px, and its next layout gives 80 px.
+    // Nearest measures it, finds [520, 600) still in view and does not scroll, but the
+    // change must reach the layout: row 14 moves to 600 and the list grows.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    let height = ui.list().1.size.height;
+
+    app.log.overrides.borrow_mut().insert(13, 80.0);
+    ui.run_task(
+        &mut root,
+        scroll_task(13, Align::Nearest, Animation::Instant),
+    );
+    assert!(ui.core().geometry.dirty && ui.core().geometry.block_next_redraw);
+    assert!(ui.core().landing.is_none());
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(ui.screen_y(&mut root, 14), 600.0);
+    assert_eq!(ui.list().1.size.height, height + 40.0);
+    ui.assert_invariants();
+    drop(root);
+
+    // Review P4-R3 F3: with the end pinned, the growth moves the rows above it up, so
+    // Nearest decides after absorbing it. 100 rows and the footer at translation 3450:
+    // row 87 is at [3480, 3520), and 80 px tall it is at [3440, 3520), partly above
+    // the viewport, so it is aligned at the top.
+    let app = App::estimated(rows(0..100, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3450.0);
+    assert!(ui.end_pinned());
+    assert_eq!(app.log.screen()[&87], 30.0);
+
+    app.log.overrides.borrow_mut().insert(87, 80.0);
+    ui.run_task(
+        &mut root,
+        scroll_task(87, Align::Nearest, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&87], 0.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn zero_height_focus_target_is_a_no_op() {
+    // Review P4-R1 F5: an item with no height off the window cannot be revealed, so
+    // focusing it changes nothing and leaves nothing waiting.
+    let app = direct(rows(0..100, 0.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    assert!(!ui.keys().contains(&50));
+
+    ui.run_task(&mut root, focusable::focus(LIST));
+    ui.run_task(&mut root, FocusItem::new(LIST, 50_u32, field(50)));
+    assert_eq!(single_focus(&mut ui, &mut root), [LIST]);
+    assert!(ui.core().focus.deferred.is_none());
+    assert!(ui.core().landing.is_none());
+    assert!(!ui.core().geometry.block_next_redraw);
+}
+
+#[test]
+fn settle_keeps_the_screen_with_large_positive_drift() {
+    // Review P4-R1 F6: ten rows of 40 px and the footer, drift 3850 and translation
+    // 3700. Removing all the drift would need a negative offset, so settle removes
+    // what keeps the list off its start, and nothing moves.
+    let mut app = App::estimated(rows(0..200, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 4000.0);
+    drop(root);
+
+    app.items.drain(0..100);
+    app.items.truncate(10);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    assert_eq!(ui.core().geometry.drift(), 3850.0);
+    assert_eq!(ui.translation(&mut root), 3700.0);
+
+    let screen = app.log.screen();
+    let footer = |ui: &mut Harness, root: &mut Root<'_>| {
+        app.log.footer.get().unwrap().y - ui.translation(root)
+    };
+    let before = footer(&mut ui, &mut root);
+    assert_eq!(screen[&100], 150.0);
+    assert_eq!(before, 550.0);
+
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 1.0);
+    assert_eq!(ui.core().geometry.drift(), 151.0);
+    assert_eq!(app.log.screen(), screen);
+    assert_eq!(footer(&mut ui, &mut root), before);
+
+    // The rest stays until the list reaches its start.
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes, [Invalidation::None]);
+    assert_eq!(ui.core().geometry.drift(), 151.0);
+    ui.scroll(&mut root, 0.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+}
+
+#[test]
+fn landing_release_waits_for_rows_growing_in_their_first_redraw() {
+    // Review P4-R2 F1: rows 0..=99 are 40 px, row 100 was measured as 0 px at the
+    // end, and row 98 is now 1000 px off the window. End on row 99 lands at 4360 with
+    // row 98 pinned at 3920. The walk for the destination builds row 100, which grows
+    // to 1000 px in its first redraw, after the landing would have been released and
+    // the end pinned. The landing pins row 98 until its frame is drawn.
+    let land = |grow: u32| {
+        let mut items = rows(0..101, 40.0);
+        items[100].height = Height::Fixed(0.0);
+        let mut app = direct(items);
+        app.anticipate = 1;
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, 3400.0);
+        assert!(ui.keys().contains(&100));
+        ui.scroll(&mut root, 0.0);
+        drop(root);
+
+        app.items[98].height = Height::Fixed(1000.0);
+        let mut root = app.view();
+        ui.rebuild(&mut root);
+        ui.frame(&mut root);
+
+        ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+        assert_eq!(ui.anchor(), (Some(98), Some(3920.0)));
+        app.log.grow.borrow_mut().insert(grow, 1000.0);
+
+        ui.frame(&mut root);
+        assert_eq!(ui.translation(&mut root), 4360.0, "row {grow}");
+        assert_eq!(screen_bottom(&app.log, 99), 600.0, "row {grow}");
+        assert_eq!(ui.core().geometry.heights.height(grow as usize), 1000.0);
+        ui.assert_invariants();
+
+        let frame = ui.frame(&mut root);
+        assert_eq!(frame.passes.last(), Some(&Invalidation::None));
+        assert_eq!(screen_bottom(&app.log, 99), 600.0, "row {grow}");
+        assert!(ui.core().landing.is_none());
+    };
+
+    // Below the target.
+    land(100);
+
+    // Above the landing's item, which L10 does not cover either: exact as well. Rows
+    // between the landing's item and the target are L10's (see
+    // `landing_frame_size_change_documents_l10`).
+    land(97);
+}
+
+#[test]
+fn presses_cancel_a_waiting_focus_even_when_captured() {
+    // Review P4-R2 F2: a press the header captured before the list still reaches the
+    // list in the column, which unfocuses and cancels the waiting focus.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.header = 100.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(single_focus(&mut ui, &mut root), [LIST]);
+
+    app.log.capture_press.set(true);
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 300.0));
+    let updated = ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    assert!(updated.captured);
+    app.log.capture_press.set(false);
+    ui.cursor = mouse::Cursor::Unavailable;
+    assert!(ui.core().focus.deferred.is_none());
+    assert!(single_focus(&mut ui, &mut root).is_empty());
+
+    // An uncaptured press inside the list cancels the waiting focus, and the list
+    // keeps the focus it held.
+    ui.scroll(&mut root, 0.0);
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    ui.cursor = mouse::Cursor::Available(Point::new(100.0, 300.0));
+    ui.update(
+        &mut root,
+        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    ui.cursor = mouse::Cursor::Unavailable;
+    assert!(ui.core().focus.deferred.is_none());
+    ui.frame(&mut root);
+    assert_eq!(single_focus(&mut ui, &mut root), [LIST]);
+
+    // The commit needs the list to hold the focus.
+    ui.scroll(&mut root, 0.0);
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    ui.core_mut().focus.focused = false;
+    ui.frame(&mut root);
+    assert!(ui.core().focus.deferred.is_none());
+    assert!(single_focus(&mut ui, &mut root).is_empty());
+}
+
+#[test]
+fn focus_needs_room_to_lay_out_its_item() {
+    // Review P4-R2 F3: a scroller with no height cannot show the item, so focusing an
+    // item off the window does nothing.
+    let mut app = App::estimated(rows(0..1000, 40.0), 40.0);
+    app.anticipate = 0;
+    app.height = Length::Fixed(0.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(single_focus(&mut ui, &mut root), [OUTSIDE]);
+    assert!(ui.core().focus.deferred.is_none());
+    assert!(ui.core().landing.is_none());
+    drop(root);
+
+    // With room, items shorter than, as tall as and taller than the viewport, below
+    // and above it, are aligned inside the exclusive edges and their focus commits.
+    for height in [10.0, 600.0, 2000.0] {
+        let mut items = rows(0..1000, 40.0);
+        items[500].height = Height::Fixed(height);
+        items[100].height = Height::Fixed(height);
+        let mut app = App::estimated(items, 40.0);
+        app.anticipate = 0;
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+
+        for key in [500, 100] {
+            ui.run_task(&mut root, FocusItem::new(LIST, key, field(key)));
+            ui.frame(&mut root);
+            assert_eq!(single_focus(&mut ui, &mut root), [field(key)], "{height}");
+            assert!(ui.core().focus.deferred.is_none());
+        }
+    }
+}
+
+#[test]
+fn consecutive_tasks_before_a_redraw() {
+    // Review P4-R2 F4: tasks run before the redraw that applies the previous one, so
+    // the scroller's translation they see is stale.
+
+    // Two settles: the second does nothing, and nothing moves (P4-R1 F6's numbers).
+    let mut app = App::estimated(rows(0..200, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.scroll(&mut root, 4000.0);
+    drop(root);
+
+    app.items.drain(0..100);
+    app.items.truncate(10);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+    let screen = app.log.screen();
+
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 1.0);
+    assert_eq!(ui.core().geometry.drift(), 151.0);
+    assert_eq!(app.log.screen(), screen);
+    drop(root);
+
+    // Nearest after a settle measures from the settled view: row 1228 is in it, at
+    // screen y 120, so nothing scrolls.
+    let mut app = direct(rows(1000..1250, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 9000.0);
+    drop(root);
+
+    app.items.splice(0..0, rows(0..100, 40.0));
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.run_task(
+        &mut root,
+        scroll_task(1228, Align::Nearest, Animation::Instant),
+    );
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 13_000.0);
+    assert_eq!(app.log.screen()[&1228], 120.0);
+
+    // A settle after an instant scroll does nothing: the scroll wins.
+    ui.run_task(
+        &mut root,
+        scroll_task(1100, Align::Start, Animation::Instant),
+    );
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.frame(&mut root);
+    assert_eq!(app.log.screen()[&1100], 0.0);
+    drop(root);
+
+    // Two instant scrolls: the later one wins, exactly.
+    let app = direct(rows(0..1000, 40.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(
+        &mut root,
+        scroll_task(200, Align::Start, Animation::Instant),
+    );
+    ui.run_task(&mut root, scroll_task(600, Align::End, Animation::Instant));
+    ui.frame(&mut root);
+    assert_eq!(screen_bottom(&app.log, 600), 600.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn zero_height_focus_target_records_its_measurement_only() {
+    // Review P4-R2 F5: row 500 is estimated at 40 px but has no height. Checking it
+    // records the measurement, which the end-pinned list absorbs above the visible
+    // rows, but neither the focus nor anything on screen changes, and the next
+    // redraw lays the list out again.
+    let mut items = rows(0..1000, 40.0);
+    items[500].height = Height::Fixed(0.0);
+    let mut app = App::estimated(items, 40.0);
+    app.header = 100.0;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    let content = ui.tree.children[0].size.height;
+    ui.scroll(&mut root, content - WINDOW.height);
+    assert!(ui.end_pinned());
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.frame(&mut root);
+    let screen = app.log.screen();
+    let drift = ui.core().geometry.drift();
+
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(single_focus(&mut ui, &mut root), [OUTSIDE]);
+    assert!(ui.core().focus.deferred.is_none() && ui.core().landing.is_none());
+    assert_eq!(ui.core().geometry.drift(), drift + 40.0);
+    assert!(ui.core().geometry.dirty);
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes[0], Invalidation::Layout(Diff::Skip));
+    assert_eq!(app.log.screen(), screen);
+    assert_eq!(single_focus(&mut ui, &mut root), [OUTSIDE]);
+    ui.assert_invariants();
+}
+
+#[test]
+fn landing_holds_through_messages_of_its_frame() {
+    // Review P4-R3 F1: rows 0..=99 are 40 px and row 100 was measured as 0 px at the
+    // end. Row 99 has a sensor whose message, on its first redraw at the destination,
+    // makes row 100 1000 px tall. End on row 99 lands at 3400 with row 85 pinned. The
+    // message is handled and the view laid out again between two passes of the
+    // landing frame, which still pins row 85, so row 99 stays at the bottom.
+    let mut items = rows(0..101, 40.0);
+    items[100].height = Height::Fixed(0.0);
+    let mut app = direct(items);
+    app.anticipate = 1;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3400.0);
+    ui.scroll(&mut root, 0.0);
+
+    app.log.sensors.borrow_mut().insert(99);
+    let view = || app.view();
+    let update = |_| {
+        app.log.overrides.borrow_mut().insert(100, 1000.0);
+    };
+    root = view();
+    ui.rebuild(&mut root);
+    ui.frame_app(&mut root, &view, &update);
+
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+    assert_eq!(ui.anchor(), (Some(85), Some(3400.0)));
+
+    let rebuilds = ui.rebuilds;
+    let frame = ui.frame_app(&mut root, &view, &update);
+    assert_eq!(
+        ui.rebuilds,
+        rebuilds + 1,
+        "the message was handled in the frame"
+    );
+    assert_eq!(frame.passes.len(), 3);
+    assert_eq!(ui.core().geometry.heights.height(100), 1000.0);
+    assert_eq!(ui.translation(&mut root), 3400.0);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    ui.assert_invariants();
+
+    let frame = ui.frame_app(&mut root, &view, &update);
+    assert_eq!(frame.passes, [Invalidation::None]);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+    assert!(ui.core().landing.is_none());
+    assert_eq!(ui.anchor(), (Some(85), Some(3400.0)));
+}
+
+#[test]
+fn landing_holds_through_a_later_sibling_layout() {
+    // Review P4-R3 F1: the same jump in the column, where the footer asks for a
+    // layout after the list's pass, while row 100 grows to 1000 px.
+    let mut items = rows(0..101, 40.0);
+    items[100].height = Height::Fixed(0.0);
+    let mut app = App::estimated(items, 40.0);
+    app.anticipate = 1;
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 3450.0);
+    ui.scroll(&mut root, 0.0);
+
+    ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+    assert_eq!(ui.anchor(), (Some(85), Some(3400.0)));
+    app.log
+        .footer_changes
+        .borrow_mut()
+        .extend([None, Some((100, 1000.0))]);
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes.len(), 3);
+    assert_eq!(ui.core().geometry.heights.height(100), 1000.0);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+
+    let frame = ui.frame(&mut root);
+    assert_eq!(frame.passes, [Invalidation::None]);
+    assert_eq!(screen_bottom(&app.log, 99), 600.0);
+}
+
+#[test]
+fn drawn_landing_is_not_pending() {
+    // Review P4-R3 F2: rows 97 and 98 are 1000 px before the task, which measures row
+    // 98 and lands End on row 99 at 4360. The landing frame measures row 97, which
+    // leaves drift -960, and row 100 grows in its first redraw. Once that frame is
+    // drawn, tasks and the user's scrolling treat the anchor like any other.
+    let landed = || {
+        let mut items = rows(0..101, 40.0);
+        items[100].height = Height::Fixed(0.0);
+        let mut app = direct(items);
+        app.anticipate = 1;
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, 3400.0);
+        ui.scroll(&mut root, 0.0);
+        drop(root);
+
+        app.items[97].height = Height::Fixed(1000.0);
+        app.items[98].height = Height::Fixed(1000.0);
+        let mut root = app.view();
+        ui.rebuild(&mut root);
+        ui.frame(&mut root);
+
+        ui.run_task(&mut root, scroll_task(99, Align::End, Animation::Instant));
+        app.log.grow.borrow_mut().insert(100, 1000.0);
+        ui.frame(&mut root);
+        assert_eq!(ui.translation(&mut root), 4360.0);
+        assert_eq!(ui.core().geometry.drift(), -960.0);
+        assert_eq!(screen_bottom(&app.log, 99), 600.0);
+        assert!(ui.core().landing.is_some() && ui.core().pending_landing().is_none());
+        drop(root);
+
+        (app, ui)
+    };
+
+    // A settle right away removes the drift. The view is rebuilt, as after any
+    // message, which lays out the list again.
+    let (app, mut ui) = landed();
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    let screen = app.log.screen();
+    ui.run_task(&mut root, Settle::new(LIST));
+    ui.frame(&mut root);
+    assert_eq!(ui.translation(&mut root), 5320.0);
+    assert_eq!(ui.core().geometry.drift(), 0.0);
+    assert_eq!(app.log.screen(), screen);
+    drop(root);
+
+    // Scrolling up right away shrinks it (rule S).
+    let (app, mut ui) = landed();
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.scroll(&mut root, 4000.0);
+    assert!(ui.core().landing.is_none());
+    let drift = ui.core().geometry.drift();
+    assert!((drift - -960.0 * 4000.0 / 4360.0).abs() < 1.0e-6, "{drift}");
+}
+
+#[test]
+fn aligned_instant_scroll_stops_a_smooth_one() {
+    // Review P4-R3 F4: a smooth scroll to row 500 has not started when an instant
+    // Nearest on row 5, which is in view, arrives. The later task wins, and the view
+    // stays where it is.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, scroll_task(500, Align::Start, Animation::Smooth));
+    ui.run_task(
+        &mut root,
+        scroll_task(5, Align::Nearest, Animation::Instant),
+    );
+    assert!(ui.core().landing.is_none());
+
+    for _ in 0..60 {
+        ui.frame(&mut root);
+    }
+
+    assert_eq!(ui.translation(&mut root), 0.0);
+    assert_eq!(app.log.screen()[&5], 200.0);
+}
+
+/// SplitMix64, for the seeded property test.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn chance(&mut self, percent: usize) -> bool {
+        self.below(100) < percent
+    }
+
+    fn pick<T: Copy>(&mut self, choices: &[T]) -> T {
+        choices[self.below(choices.len())]
+    }
+
+    /// A row height: some empty, some fractional, some taller than the viewport.
+    fn height(&mut self) -> f32 {
+        match self.below(10) {
+            0 => 0.0,
+            1 | 2 => self.below(15_000) as f32 / 100.0,
+            3 => 300.0 + self.below(1500) as f32,
+            _ => 10.0 + self.below(110) as f32,
+        }
+    }
+}
+
+/// When a property case changes a row's height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum When {
+    /// A message handled before the task.
+    Before,
+    /// A message handled after the task, before the landing frame.
+    AfterTask,
+    /// The row's next redraw, which asks for a layout.
+    Redraw,
+    /// A message published by the target in a pass of the landing frame.
+    Message,
+    /// The footer, in a pass of the landing frame.
+    Sibling,
+}
+
+/// What a property case checks right after its landing frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Then {
+    Idle,
+    Settle,
+    ScrollUp,
+}
+
+const ALIGNS: [Align; 4] = [Align::Start, Align::Center, Align::End, Align::Nearest];
+
+/// One case of `instant_landing_property`. Returns how many passes the landing frame
+/// took, and how many frames drew before the landing was drawn.
+fn landing_case(seed: u64) -> (usize, usize) {
+    let mut rng = Rng(seed);
+    let len = 2 + rng.below(200);
+    let items = (0..len as u32)
+        .map(|key| Item {
+            key,
+            height: Height::Fixed(rng.height()),
+        })
+        .collect();
+
+    let mut app = App::new(items);
+    app.estimate = rng.pick(&[None, Some(8.0), Some(40.0), Some(33.3), Some(250.0)]);
+    app.spacing = rng.pick(&[0.0, 0.0, 2.5, 7.0]);
+    app.anticipate = rng.below(5);
+    app.direct = rng.chance(50);
+    app.header = if app.direct {
+        0.0
+    } else {
+        rng.pick(&[0.0, 37.5])
+    };
+
+    let key = rng.below(len) as u32;
+    let align = rng.pick(&ALIGNS);
+    let warm = rng.chance(60).then(|| rng.below(1000) as f32 / 1000.0);
+    let start = rng.below(1000) as f32 / 1000.0;
+    let then = rng.pick(&[Then::Idle, Then::Settle, Then::ScrollUp]);
+    let mut timings = vec![When::Before, When::AfterTask, When::Redraw, When::Message];
+
+    if !app.direct {
+        timings.push(When::Sibling);
+    }
+
+    let changes: Vec<(When, f32, usize)> = (0..rng.below(4))
+        .map(|_| (rng.pick(&timings), rng.height(), rng.below(3)))
+        .collect();
+    let case = format!(
+        "seed {seed:#x}: {len} rows, estimate {:?}, spacing {}, anticipate {}, \
+         direct {}, header {}, key {key}, {align:?}, warm {warm:?}, start {start}, \
+         {then:?}, changes {changes:?}",
+        app.estimate, app.spacing, app.anticipate, app.direct, app.header,
+    );
+
+    let log = Rc::clone(&app.log);
+    let view = || app.view();
+    let update = |_| {
+        let changes = log.on_message.take();
+        log.overrides.borrow_mut().extend(changes);
+    };
+    let changed = |row: usize, height: f32| {
+        log.overrides.borrow_mut().insert(row as u32, height);
+    };
+
+    let mut root = view();
+    let mut ui = Harness::new(&mut root, &log);
+    ui.frame_app(&mut root, &view, &update);
+
+    for fraction in warm.into_iter().chain([start]) {
+        let content = ui.tree.children[0].size.height;
+        ui.scroll_only(&mut root, (content - WINDOW.height).max(0.0) * fraction);
+        ui.frame_app(&mut root, &view, &update);
+        ui.frame_app(&mut root, &view, &update);
+    }
+
+    for &(when, height, _) in &changes {
+        if when == When::Before {
+            changed(rng.below(len), height);
+            root = view();
+            ui.rebuild(&mut root);
+        }
+    }
+
+    let before = ui.translation(&mut root);
+    ui.run_task(&mut root, scroll_task(key, align, Animation::Instant));
+
+    // The scroller reports its new translation only after its next update. Without a
+    // landing, the view is either at the start, with no anchor, or kept by Nearest.
+    let landed = ui.core().landing.is_some();
+    let aligned = !landed && ui.core().anchor.is_some();
+
+    // L10 covers the rows from the first one visible at the destination down to the
+    // target. Every other row may change.
+    let first = match ui.core().anchor {
+        None => 0,
+        Some(Anchor::Item(anchor)) => anchor as usize,
+        Some(Anchor::End) => {
+            let (origin, _) = ui.list();
+            let top = f64::from(before - origin.y);
+            ui.core().geometry.first_visible(top).unwrap_or(0)
+        }
+    };
+    let target = key as usize;
+    let covered = first.min(target)..=first.max(target);
+    let outside: Vec<usize> = (0..len).filter(|row| !covered.contains(row)).collect();
+    let near: Vec<usize> = outside
+        .iter()
+        .copied()
+        .filter(|&row| row + 3 >= *covered.start() && row <= covered.end() + 3)
+        .collect();
+
+    for &(when, height, slot) in &changes {
+        if outside.is_empty() || when == When::Before {
+            continue;
+        }
+
+        let row = if near.is_empty() || rng.chance(30) {
+            rng.pick(&outside)
+        } else {
+            rng.pick(&near)
+        };
+
+        match when {
+            When::Before => {}
+            When::AfterTask => {
+                changed(row, height);
+                root = view();
+                ui.rebuild(&mut root);
+            }
+            When::Redraw => {
+                log.grow.borrow_mut().insert(row as u32, height);
+            }
+            When::Message => {
+                log.publish.borrow_mut().insert(key);
+                log.on_message.borrow_mut().push((row as u32, height));
+            }
+            When::Sibling => {
+                let mut queue = log.footer_changes.borrow_mut();
+                queue.extend(std::iter::repeat_n(None, slot));
+                queue.push_back(Some((row as u32, height)));
+            }
+        }
+    }
+
+    log.changed_in.take();
+    let mut frame = ui.frame_app(&mut root, &view, &update);
+    let passes = frame.passes.len();
+    let mut frames = 1;
+    let changed_last = log.changed_in.borrow().contains(&3) || frame.late;
+
+    // Changes that did not happen in the landing frame (a row never redrawn, a
+    // footer pass that never ran) are dropped.
+    log.grow.take();
+    log.publish.take();
+    log.footer_changes.take();
+    log.on_message.take();
+
+    // Only a change in the third pass, after the parent clamped it, leaves the
+    // landing for the next frame: the frame is drawn with that pass's translation.
+    while ui.core().pending_landing().is_some() {
+        assert!(
+            frames < 2 && changed_last,
+            "{case}: the landing is still pending after {frames} frames: {:?}",
+            frame.passes
+        );
+        frame = ui.frame_app(&mut root, &view, &update);
+        frames += 1;
+    }
+
+    let translation = ui.translation(&mut root);
+    let content = ui.tree.children[0].size.height;
+    let viewport = WINDOW.height;
+    let reachable = |y: f32| y.clamp(0.0, (content - viewport).max(0.0));
+    let (origin, _) = ui.list();
+    let geometry = &ui.core().geometry;
+    let y = origin.y + geometry.content_y(target) as f32;
+    let height = geometry.heights.height(target);
+    let close = |a: f32, b: f32| (a - b).abs() <= 0.02;
+    let start_at = reachable(y);
+    let end_at = reachable(y - (viewport - height));
+
+    let ok = match align {
+        Align::Start => close(translation, start_at),
+        Align::Center => close(translation, reachable(y - (viewport - height) / 2.0)),
+        Align::End => close(translation, end_at),
+        Align::Nearest if aligned => {
+            close(translation, before)
+                && y >= translation - 0.02
+                && y + height <= translation + viewport + 0.02
+        }
+        Align::Nearest => close(translation, start_at) || close(translation, end_at),
+    };
+    assert!(
+        ok,
+        "{case}: translation {translation} for row {target} at {y}, {height} px tall, \
+         content {content}, passes {:?}, before {before}, landed {landed}, aligned {aligned}",
+        frame.passes
+    );
+    ui.assert_invariants();
+
+    let screen = log.screen();
+    let drift = ui.core().geometry.drift();
+    let visible = ui.core().geometry.visible.expect("a redraw happened");
+
+    match then {
+        Then::Idle => {
+            let frame = ui.frame_app(&mut root, &view, &update);
+            assert_eq!(frame.passes, [Invalidation::None], "{case}");
+            assert_eq!(log.screen(), screen, "{case}");
+        }
+        Then::Settle => {
+            let top = f64::from(translation - origin.y);
+            let removed = if drift > 0.0 {
+                drift.min((top - 1.0).max(0.0))
+            } else {
+                drift
+            };
+
+            ui.run_task(&mut root, Settle::new(LIST));
+            ui.frame_app(&mut root, &view, &update);
+            let moved = ui.translation(&mut root);
+            assert!(
+                close(moved, translation - removed as f32),
+                "{case}: settle moved to {moved}, removing {removed}"
+            );
+
+            for (key, y) in log.screen() {
+                if let Some(before) = screen.get(&key) {
+                    assert!(close(y, *before), "{case}: row {key} at {y}, was {before}");
+                }
+            }
+        }
+        Then::ScrollUp if visible.top > 2.0 => {
+            let up = (visible.top * (1 + rng.below(9)) as f64 / 10.0) as f32;
+            ui.scroll_only(&mut root, translation - up);
+            ui.frame_app(&mut root, &view, &update);
+            let shrunk = ui.core().geometry.shrunk_at == Some(ui.now);
+            assert!(ui.core().landing.is_none(), "{case}");
+            assert!(
+                drift == 0.0 || shrunk || ui.core().geometry.visible.unwrap().at_start(),
+                "{case}: rule S did not apply to drift {drift}"
+            );
+        }
+        Then::ScrollUp => {}
+    }
+
+    ui.assert_invariants();
+
+    (passes, frames)
+}
+
+#[test]
+fn instant_landing_property() {
+    // Review P4-R3: random lists, start offsets, instant scrolls and height changes
+    // outside L10's rows, at every time a change can come in.
+    let started = std::time::Instant::now();
+    let mut passes = [0; 4];
+    let mut late = Vec::new();
+
+    for case in 0..400_u64 {
+        let seed = 0x5EED_0000 + case * 0x9E37;
+        let result = std::panic::catch_unwind(|| landing_case(seed));
+
+        match result {
+            Ok((count, frames)) => {
+                passes[count] += 1;
+                if frames > 1 {
+                    late.push(format!("{seed:#x}"));
+                }
+            }
+            Err(panic) => {
+                eprintln!("instant_landing_property: case {case} failed, seed {seed:#x}");
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    eprintln!(
+        "instant_landing_property: 400 cases in {:?}, landing frames by passes {:?}, \
+         drawn one frame late: {late:?}",
+        started.elapsed(),
+        &passes[1..]
+    );
 }
