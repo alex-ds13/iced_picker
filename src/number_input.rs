@@ -95,6 +95,7 @@ where
     on_input: Option<Box<dyn Fn(T) -> Message + 'a>>,
     on_paste: Option<Box<dyn Fn(T) -> Message + 'a>>,
     on_submit: Option<Message>,
+    wheel_step: bool,
     icon: Option<Icon>,
     class: <Theme as Catalog>::Class<'a>,
     last_status: Option<Status>,
@@ -149,6 +150,7 @@ where
             on_input: None,
             on_paste: None,
             on_submit: None,
+            wheel_step: false,
             icon: None,
             class: <Theme as Catalog>::default(),
             last_status: None,
@@ -237,6 +239,18 @@ where
     /// the [`NumberInput`], if `Some`.
     pub fn on_paste_maybe(mut self, on_paste: Option<impl Fn(T) -> Message + 'a>) -> Self {
         self.on_paste = on_paste.map(|f| Box::new(f) as _);
+        self
+    }
+
+    /// Sets whether scrolling the mouse wheel over the [`NumberInput`] steps its
+    /// value.
+    ///
+    /// Off by default. When on, a wheel scroll over the widget steps the value
+    /// whether or not it is focused, and the scroll is captured (even at a bound), so
+    /// an enclosing [`Scrollable`](iced::widget::Scrollable) does not scroll. When
+    /// off, the wheel passes through untouched.
+    pub fn wheel_step(mut self, wheel_step: bool) -> Self {
+        self.wheel_step = wheel_step;
         self
     }
 
@@ -750,9 +764,16 @@ where
         let was_focused = state.was_focused;
 
         if let Some(on_input) = &self.on_input {
-            let stepped = !was_captured && self.wheel_step(state, event, layout, cursor, shell);
+            // `Input` captures the wheel over its bounds to scroll lines, which a single
+            // line field has none of. The wheel never reaches it, so an enclosing
+            // scrollable keeps scrolling unless wheel stepping is on.
+            let is_wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }));
 
-            if !stepped {
+            if is_wheel {
+                if self.wheel_step && !was_captured {
+                    self.step_on_wheel(state, event, layout, cursor, shell);
+                }
+            } else {
                 let previous_text = state.input.value();
                 let had_focus = state.input.is_focused();
                 let step_base = self.latest_value(state);
@@ -792,7 +813,16 @@ where
                             }
                         }
 
-                        text::editor::Binding::from_key_press(key_press)
+                        // A typed decimal comma (the locale separator in many
+                        // languages) counts as a point. Pasted text is not translated.
+                        text::editor::Binding::from_key_press(key_press).map(
+                            |binding| match binding {
+                                text::editor::Binding::Insert(',') => {
+                                    text::editor::Binding::Insert('.')
+                                }
+                                binding => binding,
+                            },
+                        )
                     },
                 );
 
@@ -998,22 +1028,21 @@ where
     Renderer: text::Renderer + 'static,
     T: Num + NumAssignOps + PartialOrd + Display + FromStr + Clone + Default + Bounded + 'a,
 {
-    /// Steps the value when the wheel is scrolled over the widget, returning whether
-    /// the event was consumed.
-    fn wheel_step(
+    /// Steps the value when the wheel is scrolled over the widget.
+    fn step_on_wheel(
         &self,
         state: &mut State<Renderer>,
         event: &Event,
         layout: Layout,
         cursor: mouse::Cursor,
         shell: &mut Shell<'_, Message>,
-    ) -> bool {
+    ) {
         let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
-            return false;
+            return;
         };
 
         if !cursor.is_over(layout.bounds()) {
-            return false;
+            return;
         }
 
         let y = match delta {
@@ -1021,7 +1050,7 @@ where
         };
 
         if y == 0.0 {
-            return false;
+            return;
         }
 
         if self.step(state, shell, y > 0.0) {
@@ -1029,8 +1058,6 @@ where
         }
 
         shell.capture_event();
-
-        true
     }
 }
 
@@ -1472,6 +1499,7 @@ mod tests {
             .on_input(|value| value)
             .min(0)
             .max(7)
+            .wheel_step(true)
     }
 
     /// Lays out `input` against `tree` and sends each event of one batch, as the
@@ -1641,7 +1669,8 @@ mod tests {
     fn an_outside_press_captured_by_a_sibling_still_ends_editing() {
         let renderer = headless_renderer();
         let mut input = NumberInput::<f32, f32, Theme, iced::Renderer>::new("Number", 5.0)
-            .on_input(|value| value);
+            .on_input(|value| value)
+            .wheel_step(true);
         let mut tree = Tree::new(&input);
         tree.diff(&mut input);
         input.layout(
@@ -1732,16 +1761,97 @@ mod tests {
             bus.len()
         };
 
-        let nan = NumberInput::new("Number", f32::NAN).on_input(|value| value);
+        let nan = NumberInput::new("Number", f32::NAN)
+            .on_input(|value| value)
+            .wheel_step(true);
         assert_eq!(layout_and_wheel(nan), 0);
 
         let inverted = NumberInput::new("Number", 7.0)
             .on_input(|value| value)
             .min(10.0)
-            .max(5.0);
+            .max(5.0)
+            .wheel_step(true);
         assert_eq!(layout_and_wheel(inverted), 0);
 
         assert!(is_same(&f32::NAN, &f32::NAN));
         assert!(!is_same(&f32::NAN, &1.0));
+    }
+
+    #[test]
+    fn the_wheel_passes_through_without_the_opt_in() {
+        let mut input =
+            NumberInput::<i32, i32, Theme, ()>::new("Number", 5).on_input(|value| value);
+        let mut tree = Tree::new(&input);
+        tree.diff(&mut input);
+        input.layout(
+            &mut tree,
+            &(),
+            &Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let layout = Layout::new(tree.size);
+        let mut bus = shell::Bus::new();
+
+        for event in [wheel(1.0), wheel(-1.0)] {
+            let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+            input.update(
+                &mut tree,
+                &event,
+                layout,
+                mouse::Cursor::Available(layout.bounds().center()),
+                &(),
+                &mut shell,
+                &layout.bounds(),
+            );
+            assert!(!shell.is_event_captured());
+        }
+
+        assert!(bus.is_empty());
+    }
+
+    #[test]
+    fn a_typed_decimal_comma_is_a_point() {
+        let renderer = headless_renderer();
+        let mut input = NumberInput::<f32, f32, Theme, iced::Renderer>::new("Number", 0.0)
+            .on_input(|value| value);
+        let mut tree = Tree::new(&input);
+        tree.diff(&mut input);
+        input.layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let state = tree.state.downcast_mut::<State<iced::Renderer>>();
+        state.input.focus();
+        state.input.select_all();
+        state.was_focused = true;
+
+        let layout = Layout::new(tree.size);
+        let mut bus = shell::Bus::new();
+        for text in ["2", ",", "5"] {
+            let key = keyboard::Key::Character(text.into());
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(text.into()),
+                repeat: false,
+            });
+            let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+            input.update(
+                &mut tree,
+                &event,
+                layout,
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut shell,
+                &layout.bounds(),
+            );
+        }
+
+        assert_eq!(bus.into_iter().last(), Some(2.5));
+        let state = tree.state.downcast_ref::<State<iced::Renderer>>();
+        assert_eq!(state.input.value(), "2.5");
     }
 }
