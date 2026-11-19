@@ -356,6 +356,79 @@ impl<Message, Theme> Overlay<Message, ButtonTheme<Theme>, Renderer>
     }
 }
 
+/// A nested overlay of a picker button's content, seen from the picker's own types.
+struct PickerButtonOverlay<'a, Message, Theme> {
+    inner: overlay::Element<'a, ButtonAction<Message>, ButtonTheme<Theme>, Renderer>,
+    /// Content overlays only publish `ButtonAction::Content`, but the mapping must be total.
+    on_press: Message,
+}
+
+impl<Message: Clone, Theme: Clone> Overlay<Message, Theme, Renderer>
+    for PickerButtonOverlay<'_, Message, Theme>
+{
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        cursor: Cursor,
+    ) {
+        let theme = ButtonTheme {
+            theme: theme.clone(),
+            focused: false,
+        };
+        self.inner
+            .as_overlay()
+            .draw(renderer, &theme, style, cursor);
+    }
+    fn operate(&mut self, renderer: &Renderer, operation: &mut dyn Operation) {
+        self.inner.as_overlay_mut().operate(renderer, operation);
+    }
+    fn update(
+        &mut self,
+        event: &Event,
+        cursor: Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<Message>,
+    ) {
+        let mut messages = shell::Bus::new();
+        let mut local = shell.local(&mut messages);
+        if shell.is_event_captured() {
+            local.capture_event();
+        }
+        self.inner
+            .as_overlay_mut()
+            .update(event, cursor, renderer, &mut local);
+        shell.merge(local, |action| match action {
+            ButtonAction::Content(message) => message,
+            ButtonAction::Press => self.on_press.clone(),
+        });
+    }
+    fn mouse_interaction(&self, cursor: Cursor, renderer: &Renderer) -> mouse::Interaction {
+        self.inner.as_overlay().mouse_interaction(cursor, renderer)
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        renderer: &Renderer,
+    ) -> Vec<overlay::Element<'a, Message, Theme, Renderer>> {
+        let on_press = &self.on_press;
+        self.inner
+            .as_overlay_mut()
+            .overlay(renderer)
+            .into_iter()
+            .map(|inner| {
+                overlay::Element::new(Box::new(PickerButtonOverlay {
+                    inner,
+                    on_press: on_press.clone(),
+                }))
+            })
+            .collect()
+    }
+    fn index(&self) -> f32 {
+        self.inner.as_overlay().index()
+    }
+}
+
 fn picker_button<'a, Message: Clone + 'a, Theme: button::Catalog + 'a>(
     content: impl Widget<Message, Theme, Renderer> + 'a,
     style: Option<ButtonStyleFn<'a, Theme>>,
@@ -805,6 +878,23 @@ where
         )
     }
 
+    fn operate(
+        &mut self,
+        state: &mut Tree,
+        layout: Layout,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.underlay.operate(
+            &mut state.children[0],
+            layout,
+            viewport,
+            renderer,
+            operation,
+        );
+    }
+
     fn mouse_interaction(
         &self,
         state: &Tree,
@@ -1082,9 +1172,22 @@ where
     }
 
     fn is_hex_input_focused(&mut self, layout: Layout, renderer: &Renderer) -> bool {
-        struct IsFocused(bool);
+        self.hex_input_focus(layout, renderer, None)
+    }
 
-        impl Operation for IsFocused {
+    /// Optionally focuses or unfocuses the hex input, returning whether it is focused.
+    fn hex_input_focus(
+        &mut self,
+        layout: Layout,
+        renderer: &Renderer,
+        focus: Option<bool>,
+    ) -> bool {
+        struct HexFocus {
+            focus: Option<bool>,
+            focused: bool,
+        }
+
+        impl Operation for HexFocus {
             fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
                 operate(self);
             }
@@ -1095,19 +1198,68 @@ where
                 _bounds: Rectangle,
                 state: &mut dyn operation::Focusable,
             ) {
-                self.0 = state.is_focused();
+                match self.focus {
+                    Some(true) => state.focus(),
+                    Some(false) => state.unfocus(),
+                    None => {}
+                }
+                self.focused = state.is_focused();
             }
         }
 
-        let mut is_focused = IsFocused(false);
+        let mut hex_focus = HexFocus {
+            focus,
+            focused: false,
+        };
         self.hex_input.operate(
             &mut self.tree.children[3],
             layout,
             &layout.bounds(),
             renderer,
-            &mut is_focused,
+            &mut hex_focus,
         );
-        is_focused.0
+        hex_focus.focused
+    }
+
+    /// Moves keyboard focus into or out of the hex input, which sits between the alpha bar
+    /// and the cancel button in the Tab order. Returns whether the Tab press was handled.
+    ///
+    /// The hex input keeps its own focus state, so the picker's [`Focus`] is [`Focus::None`]
+    /// while it is focused. Leaving it any other way would let Enter act on the input while
+    /// another control is highlighted.
+    fn on_tab_through_hex(&mut self, event: &Event, renderer: &Renderer) -> bool {
+        let Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            ..
+        }) = event
+        else {
+            return false;
+        };
+        let backwards = self.state.keyboard_modifiers.shift();
+        let layout = self.hex_input_layout();
+
+        if self.is_hex_input_focused(layout, renderer) {
+            let _ = self.hex_input_focus(layout, renderer, Some(false));
+            self.state.focus = if backwards {
+                Focus::Alpha
+            } else {
+                Focus::Cancel
+            };
+            // Same formatting as any other focus loss of the input.
+            self.sync_hex_text();
+            return true;
+        }
+
+        let enters_hex = if backwards {
+            self.state.focus == Focus::Cancel
+        } else {
+            self.state.focus == Focus::Alpha
+        };
+        if enters_hex {
+            let _ = self.hex_input_focus(layout, renderer, Some(true));
+            self.state.focus = Focus::None;
+        }
+        enters_hex
     }
 
     fn hex_input_layout(&self) -> Layout {
@@ -1691,63 +1843,49 @@ where
                 }
                 status = event::Status::Captured;
             } else {
+                // Converting the color loses precision, so it is only rewritten for handled keys.
                 let sat_value_handle = |key_code: &keyboard::Key, color: &mut Color, hue: u16| {
-                    let mut hsv_color: Hsv = (*color).into();
-                    let mut status = event::Status::Ignored;
-
-                    match key_code {
+                    let (saturation, value) = match key_code {
                         keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                            hsv_color.saturation -= SAT_VALUE_STEP;
-                            status = event::Status::Captured;
+                            (-SAT_VALUE_STEP, 0.0)
                         }
                         keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                            hsv_color.saturation += SAT_VALUE_STEP;
-                            status = event::Status::Captured;
+                            (SAT_VALUE_STEP, 0.0)
                         }
                         keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                            hsv_color.value -= SAT_VALUE_STEP;
-                            status = event::Status::Captured;
+                            (0.0, -SAT_VALUE_STEP)
                         }
                         keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                            hsv_color.value += SAT_VALUE_STEP;
-                            status = event::Status::Captured;
+                            (0.0, SAT_VALUE_STEP)
                         }
-                        _ => {}
-                    }
+                        _ => return event::Status::Ignored,
+                    };
 
-                    hsv_color.saturation = hsv_color.saturation.clamp(0.0, 1.0);
-                    hsv_color.value = hsv_color.value.clamp(0.0, 1.0);
+                    let mut hsv_color: Hsv = (*color).into();
+                    hsv_color.saturation = (hsv_color.saturation + saturation).clamp(0.0, 1.0);
+                    hsv_color.value = (hsv_color.value + value).clamp(0.0, 1.0);
                     hsv_color.hue = hue;
 
                     *color = Color {
                         a: color.a,
                         ..hsv_color.into()
                     };
-                    status
+                    event::Status::Captured
                 };
 
                 let mut hue_handle = |key_code: &keyboard::Key, color: &mut Color| {
-                    let mut hsv_color: Hsv = (*color).into();
-                    let mut status = event::Status::Ignored;
-
-                    let mut value = i32::from(self.state.current_hue_degrees);
-
-                    match key_code {
+                    let step = match key_code {
                         keyboard::Key::Named(
                             keyboard::key::Named::ArrowLeft | keyboard::key::Named::ArrowDown,
-                        ) => {
-                            value -= HUE_STEP;
-                            status = event::Status::Captured;
-                        }
+                        ) => -HUE_STEP,
                         keyboard::Key::Named(
                             keyboard::key::Named::ArrowRight | keyboard::key::Named::ArrowUp,
-                        ) => {
-                            value += HUE_STEP;
-                            status = event::Status::Captured;
-                        }
-                        _ => {}
-                    }
+                        ) => HUE_STEP,
+                        _ => return event::Status::Ignored,
+                    };
 
+                    let mut hsv_color: Hsv = (*color).into();
+                    let value = i32::from(self.state.current_hue_degrees) + step;
                     hsv_color.hue = value.rem_euclid(360) as u16;
                     self.state.current_hue_degrees = hsv_color.hue;
 
@@ -1756,31 +1894,24 @@ where
                         ..hsv_color.into()
                     };
 
-                    status
+                    event::Status::Captured
                 };
 
                 let rgba_bar_handle = |key_code: &keyboard::Key, value: &mut f32| {
-                    let mut byte_value = (*value * 255.0) as i16;
-                    let mut status = event::Status::Ignored;
-
-                    match key_code {
+                    let step = match key_code {
                         keyboard::Key::Named(
                             keyboard::key::Named::ArrowLeft | keyboard::key::Named::ArrowDown,
-                        ) => {
-                            byte_value -= RGBA_STEP;
-                            status = event::Status::Captured;
-                        }
+                        ) => -RGBA_STEP,
                         keyboard::Key::Named(
                             keyboard::key::Named::ArrowRight | keyboard::key::Named::ArrowUp,
-                        ) => {
-                            byte_value += RGBA_STEP;
-                            status = event::Status::Captured;
-                        }
-                        _ => {}
-                    }
+                        ) => RGBA_STEP,
+                        _ => return event::Status::Ignored,
+                    };
+
+                    let byte_value = (*value * 255.0) as i16 + step;
                     *value = f32::from(byte_value.clamp(0, 255)) / 255.0;
 
-                    status
+                    event::Status::Captured
                 };
 
                 match self.state.focus {
@@ -2029,6 +2160,12 @@ where
         if self.on_confirm_key(event, renderer, shell) {
             return;
         }
+        if self.on_tab_through_hex(event, renderer) {
+            self.state.clear();
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
 
         let color_before = self.state.color;
         if event::Status::Captured == self.on_event_keyboard(event) {
@@ -2086,15 +2223,19 @@ where
             &layout.bounds(),
         );
 
-        // Reconcile redraws and captures
-        match fake_input_shell.redraw_request() {
-            iced::window::RedrawRequest::NextFrame => shell.request_redraw(),
-            iced::window::RedrawRequest::At(instant) => shell.request_redraw_at(instant),
-            iced::window::RedrawRequest::Wait => {}
-        }
-        if fake_input_shell.event_status() == event::Status::Captured {
+        // Shell::merge would publish the input's messages, which are handled here instead,
+        // so everything else it recorded is forwarded by hand.
+        shell.request_redraw_at(fake_input_shell.redraw_request());
+        if fake_input_shell.is_event_captured() {
             shell.capture_event();
         }
+        shell.invalidate(fake_input_shell.invalidation());
+        shell
+            .input_method_mut()
+            .merge(fake_input_shell.input_method());
+        shell
+            .clipboard_mut()
+            .merge(fake_input_shell.clipboard_mut());
         drop(fake_input_shell);
 
         let mut hex_edited = false;
@@ -2204,6 +2345,64 @@ where
             shell.capture_event();
             self.state.clear();
         }
+    }
+
+    fn overlay<'c>(
+        &'c mut self,
+        renderer: &Renderer,
+    ) -> Vec<overlay::Element<'c, Message, Theme, Renderer>> {
+        let viewport = Rectangle::with_size(self.window);
+        let controls = self.layout.children().nth(1).expect("picker controls");
+        let cancel_layout = controls
+            .children()
+            .nth(2)
+            .expect("cancel button")
+            .for_widget(&self.tree.children[0]);
+        let submit_layout = controls
+            .children()
+            .nth(3)
+            .expect("submit button")
+            .for_widget(&self.tree.children[1]);
+        let on_cancel = self.on_cancel.clone();
+        let on_submit = (self.on_submit)(self.state.color);
+        let [cancel_tree, submit_tree, ..] = &mut self.tree.children[..] else {
+            unreachable!("the overlay tree has the button and hex input children");
+        };
+
+        // The geometry is already in window coordinates, so no translation is added.
+        let wrap = |on_press: Message| {
+            move |inner| {
+                overlay::Element::new(Box::new(PickerButtonOverlay {
+                    inner,
+                    on_press: on_press.clone(),
+                }))
+            }
+        };
+        let cancel = self
+            .cancel_button
+            .overlay(
+                cancel_tree,
+                cancel_layout,
+                renderer,
+                &viewport,
+                Vector::ZERO,
+                self.window,
+            )
+            .into_iter()
+            .map(wrap(on_cancel));
+        let submit = self
+            .submit_button
+            .overlay(
+                submit_tree,
+                submit_layout,
+                renderer,
+                &viewport,
+                Vector::ZERO,
+                self.window,
+            )
+            .into_iter()
+            .map(wrap(on_submit));
+        cancel.chain(submit).collect()
     }
 
     fn mouse_interaction(&self, cursor: Cursor, renderer: &Renderer) -> mouse::Interaction {
@@ -4179,7 +4378,8 @@ mod tests {
         ui.cursor = Cursor::Available(cancel.center());
         ui.redraw();
         assert!(statuses.borrow().contains(&ButtonStatus::Hovered));
-        for _ in 0..8 {
+        // Overlay through alpha, the hex input, then cancel.
+        for _ in 0..9 {
             ui.press(Named::Tab);
         }
         assert_eq!(
@@ -4591,8 +4791,8 @@ mod tests {
             (vec![Message::Submit(changed)], true)
         );
 
-        // Hue, red, green, blue, alpha, then cancel.
-        for _ in 0..6 {
+        // Hue, red, green, blue, alpha, hex input, then cancel.
+        for _ in 0..7 {
             assert!(ui.press(Named::Tab).1);
         }
         assert_eq!(ui.press(Named::Enter), (vec![Message::Cancel], true));
@@ -4693,5 +4893,237 @@ mod tests {
             ui.redraw();
             assert_eq!(ui.move_cursor(Cursor::Available(to)), RedrawRequest::Wait);
         }
+    }
+
+    fn key_pressed(key: keyboard::Key, modifiers: keyboard::Modifiers) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn hex_focused(ui: &mut Harness) -> bool {
+        struct IsFocused(bool);
+
+        impl Operation for IsFocused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                self.0 = state.is_focused();
+            }
+        }
+
+        let hex_tree = &mut ui.tree.children[1].children[3];
+        let mut is_focused = IsFocused(false);
+        ui.picker.hex_input.operate(
+            hex_tree,
+            Layout::new(hex_tree.size),
+            &Rectangle::with_size(WINDOW),
+            &ui.renderer,
+            &mut is_focused,
+        );
+        is_focused.0
+    }
+
+    #[test]
+    fn hex_input_clipboard_and_input_method_requests_reach_the_shell() {
+        let mut ui = Harness::new(original());
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        ui.select_all();
+
+        let mut messages = shell::Bus::new();
+        let mut shell = Shell::new(
+            &iced_core::window::Headless,
+            shell::Waker::noop(),
+            &mut messages,
+        );
+        let layout = ui.layout();
+        let mut overlays = ui.picker.overlay(
+            &mut ui.tree,
+            layout,
+            &ui.renderer,
+            &Rectangle::with_size(WINDOW),
+            Vector::ZERO,
+            WINDOW,
+        );
+        let overlay = overlays[0].as_overlay_mut();
+        for event in [
+            key_pressed(
+                keyboard::Key::Character("c".into()),
+                keyboard::Modifiers::CTRL,
+            ),
+            key_pressed(
+                keyboard::Key::Character("v".into()),
+                keyboard::Modifiers::CTRL,
+            ),
+            Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+        ] {
+            overlay.update(&event, ui.cursor, &ui.renderer, &mut shell);
+        }
+        assert!(shell.clipboard_mut().write.is_some());
+        assert!(!shell.clipboard_mut().reads.is_empty());
+        assert!(shell.input_method().is_enabled());
+    }
+
+    #[test]
+    fn operations_reach_the_underlay() {
+        let mut picker: ColorPicker<'_, Message> = color_picker(
+            false,
+            original(),
+            iced::widget::text_input("", "abc").on_input(|_| Message::Cancel),
+            Message::Cancel,
+            Message::Submit,
+        );
+        let mut tree = Tree::new(&picker);
+        tree.diff(&mut picker);
+        let renderer = renderer();
+        picker.layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+        let layout = Layout::new(tree.size);
+        let mut count = operation::focusable::count();
+        picker.operate(
+            &mut tree,
+            layout,
+            &layout.bounds(),
+            &renderer,
+            &mut operation::black_box(&mut count),
+        );
+        assert!(matches!(
+            count.finish(),
+            operation::Outcome::Some(count) if count.total == 1
+        ));
+    }
+
+    #[test]
+    fn tab_moves_focus_through_the_hex_input() {
+        use keyboard::key::Named;
+
+        let mut ui = Harness::new(original());
+        let hex = ui.control_bounds(1);
+        ui.click(hex);
+        assert!(hex_focused(&mut ui));
+
+        // Leaving the input forward lands on cancel, and Enter acts on cancel.
+        assert!(ui.press(Named::Tab).1);
+        assert!(!hex_focused(&mut ui));
+        let focus = |ui: &Harness| ui.tree.state.downcast_ref::<State>().overlay_state.focus;
+        assert_eq!(focus(&ui), Focus::Cancel);
+        assert_eq!(ui.press(Named::Enter), (vec![Message::Cancel], true));
+
+        // Shift+Tab from cancel enters the input, and again leaves it for the alpha bar.
+        let _ = ui.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::SHIFT,
+        )));
+        assert!(ui.press(Named::Tab).1);
+        assert!(hex_focused(&mut ui));
+        assert_eq!(focus(&ui), Focus::None);
+        assert!(ui.press(Named::Tab).1);
+        assert!(!hex_focused(&mut ui));
+        assert_eq!(focus(&ui), Focus::Alpha);
+
+        // Tab from the alpha bar enters the input, where Enter submits the typed color.
+        let _ = ui.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::empty(),
+        )));
+        assert!(ui.press(Named::Tab).1);
+        assert!(hex_focused(&mut ui));
+        ui.select_all();
+        ui.type_text("#445566");
+        assert_eq!(
+            ui.press(Named::Enter),
+            (
+                vec![Message::Submit(Color::from_rgb8(0x44, 0x55, 0x66))],
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn unhandled_keys_leave_the_focused_channel_unchanged() {
+        let color = Color::from_rgba(0.5, 0.3, 0.7, 0.9);
+        for focus in [
+            Focus::SatValue,
+            Focus::Hue,
+            Focus::Red,
+            Focus::Green,
+            Focus::Blue,
+            Focus::Alpha,
+        ] {
+            let mut ui = Harness::new(color);
+            ui.tree.state.downcast_mut::<State>().overlay_state.focus = focus;
+            let (_, status) = ui.send_with_status(key_pressed(
+                keyboard::Key::Character("q".into()),
+                keyboard::Modifiers::empty(),
+            ));
+            assert_eq!(status, event::Status::Ignored, "{focus:?}");
+            assert_eq!(ui.color(), color, "{focus:?}");
+        }
+    }
+
+    #[test]
+    fn button_content_overlays_are_forwarded() {
+        let picker = picker().submit_content(
+            crate::tooltip::tooltip(
+                iced::widget::Space::new().width(60).height(20),
+                iced::widget::Space::new().width(40).height(20),
+            )
+            .open(crate::tooltip::Open::LeftPointer),
+        );
+        let mut ui = Harness::with_picker(picker);
+        let submit = ui.control_bounds(3);
+        let content_tree = &ui.tree.children[1].children[1].children[0];
+        let content = Rectangle::new(
+            submit.position() + content_tree.translation,
+            content_tree.size,
+        );
+        ui.click(content);
+
+        let layout = ui.layout();
+        let mut overlays = ui.picker.overlay(
+            &mut ui.tree,
+            layout,
+            &ui.renderer,
+            &Rectangle::with_size(WINDOW),
+            Vector::ZERO,
+            WINDOW,
+        );
+        let mut nested = overlays[0].as_overlay_mut().overlay(&ui.renderer);
+        assert_eq!(nested.len(), 1);
+        let nested = nested[0].as_overlay_mut();
+        nested.draw(
+            &mut ui.renderer,
+            &Theme::Dark,
+            &renderer::Style::default(),
+            ui.cursor,
+        );
+        let mut messages = shell::Bus::new();
+        let mut shell = Shell::new(
+            &iced_core::window::Headless,
+            shell::Waker::noop(),
+            &mut messages,
+        );
+        nested.update(
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: content.center(),
+            }),
+            ui.cursor,
+            &ui.renderer,
+            &mut shell,
+        );
     }
 }
