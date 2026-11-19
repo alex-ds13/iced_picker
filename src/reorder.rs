@@ -185,6 +185,57 @@ fn drop_index(layout: Layout, children: &[Tree], cursor: Point) -> usize {
     ins.min(children.len().saturating_sub(1))
 }
 
+impl<Message, Theme, Renderer> Reorder<'_, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: iced::advanced::Renderer,
+{
+    /// Moves an active drag to `position`, emitting the reorder right away in live
+    /// mode. Does nothing unless a row is being dragged and `position` changed.
+    fn drag_to(
+        &self,
+        action: &mut Action,
+        layout: Layout,
+        children: &[Tree],
+        position: Point,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let Action::Dragging {
+            index,
+            grab_offset,
+            cursor,
+        } = *action
+        else {
+            return;
+        };
+
+        if cursor == position {
+            return;
+        }
+
+        let index = if self.live {
+            let to = drop_index(layout, children, position);
+            if to != index
+                && let Some(on_reorder) = &self.on_reorder
+            {
+                shell.publish(on_reorder(index, to));
+                to
+            } else {
+                index
+            }
+        } else {
+            index
+        };
+
+        *action = Action::Dragging {
+            index,
+            grab_offset,
+            cursor: position,
+        };
+        shell.request_redraw();
+    }
+}
+
 impl<Message, Theme, Renderer> Meta for Reorder<'_, Message, Theme, Renderer>
 where
     Theme: Catalog,
@@ -338,31 +389,19 @@ where
                         shell.invalidate_overlay();
                         shell.request_redraw();
                     }
-                    Action::Dragging {
-                        index, grab_offset, ..
-                    } => {
-                        let index = if self.live {
-                            let to = drop_index(layout, &tree.children, position);
-                            if to != index
-                                && let Some(on_reorder) = &self.on_reorder
-                            {
-                                shell.publish(on_reorder(index, to));
-                                to
-                            } else {
-                                index
-                            }
-                        } else {
-                            index
-                        };
-                        state.action = Action::Dragging {
-                            index,
-                            grab_offset,
-                            cursor: position,
-                        };
+                    Action::Dragging { .. } => {
+                        self.drag_to(&mut state.action, layout, &tree.children, position, shell);
                         shell.capture_event();
-                        shell.request_redraw();
                     }
                     _ => {}
+                }
+            }
+            // Content scrolled under a stationary pointer reaches the widget as a
+            // changed cursor on the next redraw, without any move event.
+            Event::Window(iced::window::Event::RedrawRequested(_)) => {
+                if let Some(position) = cursor.land().position() {
+                    let state = tree.state.downcast_mut::<State>();
+                    self.drag_to(&mut state.action, layout, &tree.children, position, shell);
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
@@ -372,6 +411,11 @@ where
                 // is gone before the release is forwarded to the children.
                 let drag = {
                     let state = tree.state.downcast_mut::<State>();
+                    // The drop follows the release position, which can differ from
+                    // the last move when the content scrolled in between.
+                    if let Some(position) = cursor.land().position() {
+                        self.drag_to(&mut state.action, layout, &tree.children, position, shell);
+                    }
                     let drag = match state.action {
                         Action::Dragging { index, cursor, .. } => Some((index, cursor)),
                         _ => None,
@@ -998,5 +1042,94 @@ mod tests {
             tree.state.downcast_ref::<State>().action,
             Action::Idle
         ));
+    }
+
+    /// Sends a redraw with the cursor at `position`, as after content scrolled under
+    /// a stationary pointer, and returns whether another redraw was requested.
+    fn send_redraw(
+        reorder: &mut TestReorder,
+        tree: &mut Tree,
+        bus: &mut Bus<(usize, usize)>,
+        position: Point,
+    ) -> bool {
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), bus);
+        let layout = Layout::new(tree.size);
+        reorder.update(
+            tree,
+            &Event::Window(window::Event::RedrawRequested(iced::time::Instant::now())),
+            layout,
+            mouse::Cursor::Available(position),
+            &(),
+            &mut shell,
+            &Rectangle::with_size(Size::new(200.0, 200.0)),
+        );
+        shell.redraw_request() != window::RedrawRequest::Wait
+    }
+
+    /// Presses row 0 and drags it over row 1.
+    fn drag_first_row(reorder: &mut TestReorder, tree: &mut Tree, bus: &mut Bus<(usize, usize)>) {
+        let origin = Point::new(8.0, 8.0);
+        send_event(
+            reorder,
+            tree,
+            bus,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            origin,
+        );
+        let over_row_1 = Point::new(8.0, 35.0);
+        send_event(
+            reorder,
+            tree,
+            bus,
+            mouse::Event::CursorMoved {
+                position: over_row_1,
+            },
+            over_row_1,
+        );
+    }
+
+    #[test]
+    fn the_drop_follows_the_release_cursor() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        drag_first_row(&mut reorder, &mut tree, &mut bus);
+
+        // Scrolled without a move event: the release lands over row 2.
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            Point::new(8.0, 75.0),
+        );
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+    }
+
+    #[test]
+    fn a_redraw_after_scrolling_moves_the_drag() {
+        let mut reorder = test_widget().live(true);
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        drag_first_row(&mut reorder, &mut tree, &mut bus);
+
+        let over_row_2 = Point::new(8.0, 75.0);
+        assert!(send_redraw(&mut reorder, &mut tree, &mut bus, over_row_2));
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Dragging { index: 2, cursor, .. } if cursor == over_row_2
+        ));
+        // An unchanged cursor must not keep requesting redraws.
+        assert!(!send_redraw(&mut reorder, &mut tree, &mut bus, over_row_2));
+
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            over_row_2,
+        );
+        // The move that starts a drag emits nothing, so the redraw emits the only step.
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), [(0, 2)]);
     }
 }
