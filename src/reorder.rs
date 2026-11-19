@@ -320,16 +320,21 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // Drop a stored index that fell out of range since the last rebuild,
-        // then decide whether a drag is active. Scoped so the state borrow ends
-        // before the children are forwarded to below.
+        // Drop a stored index that fell out of range since the last rebuild, and
+        // any drag once reordering was turned off (its release would otherwise
+        // never end it), then decide whether a drag is active. Scoped so the
+        // state borrow ends before the children are forwarded to below.
         let dragging = {
             let state = tree.state.downcast_mut::<State>();
             if state
                 .action
                 .index()
-                .is_some_and(|i| i >= self.children.len())
+                .is_some_and(|i| i >= self.children.len() || self.on_reorder.is_none())
             {
+                if matches!(state.action, Action::Dragging { .. }) {
+                    shell.invalidate_overlay();
+                    shell.request_redraw();
+                }
                 state.action = Action::Idle;
             }
             matches!(state.action, Action::Dragging { .. })
@@ -398,8 +403,10 @@ where
             }
             // Content scrolled under a stationary pointer reaches the widget as a
             // changed cursor on the next redraw, without any move event.
+            // `observe` as for moves: an enclosing scrollable obstructs the cursor
+            // outside its bounds, where a drag must still follow it.
             Event::Window(iced::window::Event::RedrawRequested(_)) => {
-                if let Some(position) = cursor.land().position() {
+                if let Some(position) = cursor.observe().position() {
                     let state = tree.state.downcast_mut::<State>();
                     self.drag_to(&mut state.action, layout, &tree.children, position, shell);
                 }
@@ -413,7 +420,7 @@ where
                     let state = tree.state.downcast_mut::<State>();
                     // The drop follows the release position, which can differ from
                     // the last move when the content scrolled in between.
-                    if let Some(position) = cursor.land().position() {
+                    if let Some(position) = cursor.observe().position() {
                         self.drag_to(&mut state.action, layout, &tree.children, position, shell);
                     }
                     let drag = match state.action {
@@ -1044,13 +1051,13 @@ mod tests {
         ));
     }
 
-    /// Sends a redraw with the cursor at `position`, as after content scrolled under
-    /// a stationary pointer, and returns whether another redraw was requested.
+    /// Sends a redraw with the given cursor, as after content scrolled under a
+    /// stationary pointer, and returns whether another redraw was requested.
     fn send_redraw(
         reorder: &mut TestReorder,
         tree: &mut Tree,
         bus: &mut Bus<(usize, usize)>,
-        position: Point,
+        cursor: mouse::Cursor,
     ) -> bool {
         let mut shell = Shell::new(&window::Headless, Waker::noop(), bus);
         let layout = Layout::new(tree.size);
@@ -1058,7 +1065,7 @@ mod tests {
             tree,
             &Event::Window(window::Event::RedrawRequested(iced::time::Instant::now())),
             layout,
-            mouse::Cursor::Available(position),
+            cursor,
             &(),
             &mut shell,
             &Rectangle::with_size(Size::new(200.0, 200.0)),
@@ -1114,13 +1121,14 @@ mod tests {
         drag_first_row(&mut reorder, &mut tree, &mut bus);
 
         let over_row_2 = Point::new(8.0, 75.0);
-        assert!(send_redraw(&mut reorder, &mut tree, &mut bus, over_row_2));
+        let cursor = mouse::Cursor::Available(over_row_2);
+        assert!(send_redraw(&mut reorder, &mut tree, &mut bus, cursor));
         assert!(matches!(
             tree.state.downcast_ref::<State>().action,
             Action::Dragging { index: 2, cursor, .. } if cursor == over_row_2
         ));
         // An unchanged cursor must not keep requesting redraws.
-        assert!(!send_redraw(&mut reorder, &mut tree, &mut bus, over_row_2));
+        assert!(!send_redraw(&mut reorder, &mut tree, &mut bus, cursor));
 
         send_event(
             &mut reorder,
@@ -1131,5 +1139,70 @@ mod tests {
         );
         // The move that starts a drag emits nothing, so the redraw emits the only step.
         assert_eq!(bus.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+    }
+
+    #[test]
+    fn redraws_and_releases_follow_a_cursor_obstructed_by_a_scrollable() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        drag_first_row(&mut reorder, &mut tree, &mut bus);
+
+        let outside = Point::new(8.0, 150.0);
+        let obstructed = mouse::Cursor::Obstructed(outside);
+        assert!(send_redraw(&mut reorder, &mut tree, &mut bus, obstructed));
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Dragging { cursor, .. } if cursor == outside
+        ));
+        drop(reorder);
+
+        // The release alone also resolves from the obstructed position.
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        drag_first_row(&mut reorder, &mut tree, &mut bus);
+        send_cursor_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            mouse::Cursor::Obstructed(Point::new(8.0, 75.0)),
+        );
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+    }
+
+    #[test]
+    fn turning_reordering_off_ends_a_drag_without_publishing() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        drag_first_row(&mut reorder, &mut tree, &mut bus);
+
+        reorder.on_reorder = None;
+        let release = Point::new(8.0, 75.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            release,
+        );
+
+        assert!(bus.is_empty());
+        assert!(matches!(
+            tree.state.downcast_ref::<State>().action,
+            Action::Idle
+        ));
+        let layout = Layout::new(tree.size);
+        assert_ne!(
+            reorder.mouse_interaction(
+                &tree,
+                layout,
+                mouse::Cursor::Available(release),
+                &layout.bounds(),
+                &(),
+            ),
+            mouse::Interaction::Grabbing
+        );
     }
 }
