@@ -382,8 +382,9 @@ struct Internal<T, R: text::Renderer> {
     option_matchers: Vec<String>,
     filtered_options: Vec<T>,
     version: u64,
-    /// The focus seen by the last `update`. An operation can focus or unfocus the
-    /// input between updates, so transitions are detected against this.
+    /// The focus the search was last opened or closed for. An operation can focus
+    /// or unfocus the input between updates, so transitions are detected against
+    /// this.
     focused: bool,
 }
 
@@ -405,6 +406,53 @@ impl<T: Display + Clone, R: text::Renderer> Internal<T, R> {
 struct Editor<R: text::Renderer> {
     input: text::Input<R>,
     selection: Option<String>,
+}
+
+impl<T, Message, Theme> ComboBox<'_, T, Message, Theme>
+where
+    T: Display + Clone,
+    Theme: Catalog,
+{
+    /// Opens or closes the search when the input's focus differs from the focus
+    /// seen last.
+    fn sync_focus<R: text::Renderer>(
+        &mut self,
+        internal: &mut Internal<T, R>,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let is_focused = internal.editor.input.is_focused();
+
+        if is_focused == internal.focused {
+            return;
+        }
+
+        internal.focused = is_focused;
+
+        if is_focused {
+            internal.editor.input.overwrite("");
+            internal.filtered_options = self.state.options.clone();
+
+            if let Some(on_option_hovered) = &self.on_option_hovered {
+                let hovered_option = internal.hovered_option.unwrap_or(0);
+
+                if let Some(option) = internal.filtered_options.get(hovered_option) {
+                    shell.publish(on_option_hovered(option.clone()));
+                }
+            }
+
+            if let Some(on_open) = self.on_open.take() {
+                shell.publish(on_open);
+            }
+        } else {
+            // diff() only rewrites the text when the selection changes, so a
+            // search draft would otherwise outlive the focus.
+            internal.editor.input.overwrite(&self.selection);
+
+            if let Some(on_close) = self.on_close.take() {
+                shell.publish(on_close);
+            }
+        }
+    }
 }
 
 impl<T, Message, Theme> widget::Meta for ComboBox<'_, T, Message, Theme> where Theme: Catalog {}
@@ -489,7 +537,9 @@ where
     ) {
         let internal = tree.state.downcast_mut::<Internal<T, Renderer>>();
 
-        let was_focused = internal.focused;
+        // An operation may have changed the focus since the last update. Settle it
+        // first, or opening would erase what this event types.
+        self.sync_focus(internal, shell);
 
         let edit = internal.editor.input.update::<Message>(
             event,
@@ -509,117 +559,89 @@ where
             internal.filter(&self.state.options, &value);
         }
 
-        let is_focused = internal.editor.input.is_focused();
-        internal.focused = is_focused;
+        self.sync_focus(internal, shell);
 
-        if is_focused {
-            if !was_focused {
-                internal.editor.input.overwrite("");
-                internal.filtered_options = self.state.options.clone();
-
-                if let Some(on_option_hovered) = &mut self.on_option_hovered {
-                    let hovered_option = internal.hovered_option.unwrap_or(0);
-
-                    if let Some(option) = internal.filtered_options.get(hovered_option) {
-                        shell.publish(on_option_hovered(option.clone()));
-                    }
-                }
-            }
-
-            if let Event::Keyboard(keyboard::Event::KeyPressed {
+        if internal.focused
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(named_key),
                 modifiers,
                 ..
             }) = event
-            {
-                match (named_key, modifiers.shift()) {
-                    (key::Named::Enter, _) => {
-                        if let Some(option) = internal
-                            .filtered_options
-                            .get(internal.hovered_option())
-                            .cloned()
-                        {
-                            internal.menu = menu::State::default();
-                            internal.editor.selection = None;
-                            internal.editor.input.overwrite("");
-                            internal.editor.input.unfocus();
+        {
+            match (named_key, modifiers.shift()) {
+                (key::Named::Enter, _) => {
+                    if let Some(option) = internal
+                        .filtered_options
+                        .get(internal.hovered_option())
+                        .cloned()
+                    {
+                        internal.menu = menu::State::default();
+                        internal.editor.selection = None;
+                        internal.editor.input.overwrite("");
+                        internal.editor.input.unfocus();
 
-                            shell.publish((self.on_selected)(option));
-                        } else if let Some(on_submit) = &self.on_submit {
-                            let value = internal.editor.input.value();
+                        shell.publish((self.on_selected)(option));
+                    } else if let Some(on_submit) = &self.on_submit {
+                        let value = internal.editor.input.value();
 
-                            if !value.is_empty() {
-                                shell.publish((on_submit)(value));
-                            }
+                        if !value.is_empty() {
+                            shell.publish((on_submit)(value));
                         }
-
-                        shell.capture_event();
-                        shell.request_redraw();
                     }
-                    (key::Named::ArrowUp, _) => {
-                        let index = internal.hovered_option();
 
-                        internal.hovered_option = Some(if index == 0 {
-                            internal.filtered_options.len().saturating_sub(1)
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
+                (key::Named::ArrowUp, _) => {
+                    let index = internal.hovered_option();
+
+                    internal.hovered_option = Some(if index == 0 {
+                        internal.filtered_options.len().saturating_sub(1)
+                    } else {
+                        index.saturating_sub(1)
+                    });
+
+                    if let Some(on_option_hovered) = &mut self.on_option_hovered
+                        && let Some(option) = internal
+                            .hovered_option
+                            .and_then(|index| internal.filtered_options.get(index))
+                    {
+                        shell.publish((on_option_hovered)(option.clone()));
+                    }
+
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
+                (key::Named::ArrowDown, _) => {
+                    let index = internal.hovered_option();
+
+                    internal.hovered_option = Some(
+                        if index >= internal.filtered_options.len().saturating_sub(1) {
+                            0
                         } else {
-                            index.saturating_sub(1)
-                        });
+                            index
+                                .saturating_add(1)
+                                .min(internal.filtered_options.len().saturating_sub(1))
+                        },
+                    );
 
-                        if let Some(on_option_hovered) = &mut self.on_option_hovered
-                            && let Some(option) = internal
-                                .hovered_option
-                                .and_then(|index| internal.filtered_options.get(index))
-                        {
-                            shell.publish((on_option_hovered)(option.clone()));
-                        }
-
-                        shell.capture_event();
-                        shell.request_redraw();
+                    if let Some(on_option_hovered) = &mut self.on_option_hovered
+                        && let Some(option) = internal
+                            .hovered_option
+                            .and_then(|index| internal.filtered_options.get(index))
+                    {
+                        shell.publish((on_option_hovered)(option.clone()));
                     }
-                    (key::Named::ArrowDown, _) => {
-                        let index = internal.hovered_option();
 
-                        internal.hovered_option = Some(
-                            if index >= internal.filtered_options.len().saturating_sub(1) {
-                                0
-                            } else {
-                                index
-                                    .saturating_add(1)
-                                    .min(internal.filtered_options.len().saturating_sub(1))
-                            },
-                        );
-
-                        if let Some(on_option_hovered) = &mut self.on_option_hovered
-                            && let Some(option) = internal
-                                .hovered_option
-                                .and_then(|index| internal.filtered_options.get(index))
-                        {
-                            shell.publish((on_option_hovered)(option.clone()));
-                        }
-
-                        shell.capture_event();
-                        shell.request_redraw();
-                    }
-                    _ => {}
+                    shell.capture_event();
+                    shell.request_redraw();
                 }
+                _ => {}
             }
         }
 
-        if was_focused != is_focused {
-            if is_focused {
-                if let Some(on_open) = self.on_open.take() {
-                    shell.publish(on_open);
-                }
-            } else {
-                // diff() only rewrites the text when the selection changes, so a
-                // search draft would otherwise outlive the focus.
-                internal.editor.input.overwrite(&self.selection);
-
-                if let Some(on_close) = self.on_close.take() {
-                    shell.publish(on_close);
-                }
-            }
-        }
+        // Enter may have unfocused the input.
+        self.sync_focus(internal, shell);
 
         let status = if internal.editor.input.is_focused() {
             text_input::Status::Focused {
@@ -941,6 +963,40 @@ mod tests {
         // Same selection, so diff() leaves the text alone.
         tree.diff::<Message, Theme, Renderer>(&mut combo);
         assert_eq!(internal(&tree).editor.input.value(), "Apple");
+    }
+
+    #[test]
+    fn first_key_after_focus_from_an_operation_is_kept() {
+        let renderer = renderer();
+        let options = State::new(vec!["Apple", "Orange"]);
+        let mut combo = combo(&options).on_open(Message::Open);
+        let mut tree = mount(&mut combo, &renderer);
+
+        let layout = Layout::new(tree.size);
+        let mut focus = focusable::focus::<()>(ID);
+        combo.operate(&mut tree, layout, &layout.bounds(), &renderer, &mut focus);
+
+        let key = keyboard::Key::Character("o".into());
+        let press = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("o".into()),
+            repeat: false,
+        });
+        let messages = update(
+            &mut combo,
+            &mut tree,
+            &renderer,
+            &press,
+            mouse::Cursor::Unavailable,
+        );
+
+        assert_eq!(messages, [Message::Open]);
+        assert_eq!(internal(&tree).editor.input.value(), "o");
+        assert_eq!(internal(&tree).filtered_options, ["Orange"]);
     }
 
     #[test]

@@ -300,6 +300,11 @@ where
     }
 
     fn layout(&mut self, tree: &mut widget::Tree, renderer: &Renderer, limits: &layout::Limits) {
+        // A layout request from the popup or its nested overlays reaches the
+        // runtime as a root layout, so this is where the cached popup layout goes
+        // stale.
+        tree.state.downcast_mut::<State>().needs_relayout = true;
+
         let size = self.content.size();
         layout::padded(
             tree,
@@ -2754,5 +2759,112 @@ mod tests {
         close_all_operation::<()>().custom(None, bounds, &mut state);
         assert_eq!(state.mode, Mode::default());
         assert!(!state.needs_relayout);
+    }
+
+    /// Grows from 20 to 80 px on its first cursor move and requests a layout.
+    struct GrowOnMove;
+
+    impl widget::Meta for GrowOnMove {}
+
+    impl Widget<(), Theme, ()> for GrowOnMove {
+        fn tag(&self) -> widget::tree::Tag {
+            widget::tree::Tag::of::<bool>()
+        }
+
+        fn state(&self) -> widget::tree::State {
+            widget::tree::State::new(false)
+        }
+
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fixed(100.0), Length::Fit)
+        }
+
+        fn layout(&mut self, tree: &mut widget::Tree, _renderer: &(), _limits: &layout::Limits) {
+            let grown = *tree.state.downcast_ref::<bool>();
+            tree.size = Size::new(100.0, if grown { 80.0 } else { 20.0 });
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut widget::Tree,
+            event: &Event,
+            _layout: Layout,
+            _cursor: mouse::Cursor,
+            _renderer: &(),
+            shell: &mut Shell<'_, ()>,
+            _viewport: &Rectangle,
+        ) {
+            let grown = tree.state.downcast_mut::<bool>();
+
+            if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) && !*grown {
+                *grown = true;
+                shell.invalidate_layout();
+            }
+        }
+
+        fn draw(
+            &self,
+            _tree: &widget::Tree,
+            _renderer: &mut (),
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+    }
+
+    #[test]
+    fn popup_layout_follows_a_layout_request_from_its_content() {
+        let mut tip = Tooltip::new(Space::new().width(100).height(30), GrowOnMove)
+            .open(Open::LeftPointer)
+            .position(Position::Bottom);
+        let window = Size::new(400.0, 300.0);
+        let limits = layout::Limits::new(Size::ZERO, window);
+        let viewport = Rectangle::with_size(window);
+        let mut tree = widget::Tree::new(&tip);
+        tree.diff(&mut tip);
+        tip.layout(&mut tree, &(), &limits);
+        let root = Layout::new(tree.size);
+        let mut bus = Bus::new();
+
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+            let cursor = mouse::Cursor::Available(Point::new(10.0, 10.0));
+            tip.update(
+                &mut tree,
+                &Event::Mouse(event),
+                root,
+                cursor,
+                &(),
+                &mut shell,
+                &viewport,
+            );
+        }
+
+        let mut overlays = tip.overlay(&mut tree, root, &(), &viewport, Vector::ZERO, window);
+        assert_eq!(overlays.len(), 1);
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+        let position = Point::new(10.0, 45.0);
+        overlays[0].as_overlay_mut().update(
+            &Event::Mouse(mouse::Event::CursorMoved { position }),
+            mouse::Cursor::Available(position),
+            &(),
+            &mut shell,
+        );
+        assert!(matches!(shell.invalidation(), Invalidation::Layout(_)));
+        drop(overlays);
+        assert_eq!(tree.children[1].size.height, 20.0);
+
+        // What the runtime does for a layout invalidation: root layout, then overlays.
+        tip.layout(&mut tree, &(), &limits);
+        let overlays = tip.overlay(&mut tree, root, &(), &viewport, Vector::ZERO, window);
+        assert_eq!(overlays.len(), 1);
+        drop(overlays);
+        assert_eq!(tree.children[1].size.height, 80.0);
     }
 }
