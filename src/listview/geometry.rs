@@ -384,7 +384,7 @@ impl Geometry {
 
         (span.first > 0 && first < span.first + margin)
             || (span.last + 1 < len && last + margin > span.last)
-            || span.len > last - first + 1 + 4 * anticipate
+            || span.len > (last - first + 1).saturating_add(anticipate.saturating_mul(4))
     }
 }
 

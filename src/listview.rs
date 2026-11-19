@@ -86,7 +86,12 @@
 //!   the viewport is removed, the next item that was on screen takes its place.
 //!   When none of the items on screen remains, nothing is held: the scrollable
 //!   shows what is now at its offset, clamped to the content. Duplicate keys are
-//!   reachable by their first position only.
+//!   reachable by their first position only. Keys removed from the sequence keep
+//!   their measured height, so a filtered-out item gets it back, and this cache
+//!   never shrinks while the list keeps its widget state (a new [`ListView::id`]
+//!   does not reset it). An application whose keys keep growing should reuse keys,
+//!   or leave the list out of one view so iced recreates its state, which also
+//!   forgets every measured height.
 //! * **Filtering** is the application's: it passes the filtered sequence, and the
 //!   list compares keys on every view to find what changed.
 //! * **Width.** Items outside the window cannot report an intrinsic width, so a

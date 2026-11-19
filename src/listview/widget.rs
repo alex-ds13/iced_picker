@@ -208,8 +208,11 @@ where
     }
 
     /// Sets how many items are materialized beyond each edge of the viewport.
+    ///
+    /// Values above `u32::MAX` are clamped to it. A value at least the number of
+    /// items materializes every item.
     pub fn anticipate(mut self, items: usize) -> Self {
-        self.anticipate = items;
+        self.anticipate = items.min(u32::MAX as usize);
         self
     }
 
@@ -646,7 +649,12 @@ where
         let bounds = layout.bounds();
         let core = tree.state.downcast_mut::<Core<K>>();
 
-        operation.focusable(self.id.as_ref(), bounds, &mut core.focus);
+        // Only a selectable list handles keys, so only it is a Tab stop. A list that
+        // holds the focus anyway, for a waiting focus or after one whose widget was
+        // not found, stays visible to focus changes so they can take the focus back.
+        if self.selection.is_some() || core.focus.focused {
+            operation.focusable(self.id.as_ref(), bounds, &mut core.focus);
+        }
 
         // A list task asks in the first call and reads the answer in the second one.
         // Other operations never ask, and cost one call.

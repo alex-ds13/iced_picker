@@ -1750,6 +1750,28 @@ fn hysteresis_and_lazy_eviction_bound_window() {
 }
 
 #[test]
+fn huge_anticipation_materializes_everything_without_overflow() {
+    // R3-F8: `usize::MAX` overflowed the window bounds and the shift check.
+    for anticipate in [usize::MAX, usize::MAX / 4 + 1] {
+        let mut app = App::estimated(rows(0..100, 40.0), 40.0);
+        app.anticipate = anticipate;
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        assert_eq!(ui.positions(), range(0..=99));
+        app.log.assert_covered(0.0, 600.0);
+
+        ui.scroll(&mut root, 1000.0);
+        assert_eq!(ui.positions(), range(0..=99));
+        app.log.assert_covered(1000.0, 1600.0);
+
+        ui.scroll(&mut root, 3400.0);
+        assert_eq!(ui.positions(), range(0..=99));
+        app.log.assert_covered(3400.0, 4000.0);
+    }
+}
+
+#[test]
 fn prepend_absorbs_before_window_eviction() {
     // R1 H2: 40 px rows measured, viewport top 4000, 1000 rows prepended.
     let mut app = App::estimated(rows(10_000..10_200, 40.0), 40.0);
@@ -4892,12 +4914,10 @@ fn ordinary_operations_do_not_measure_or_steal_focus() {
     let mut ui = Harness::new(&mut root, &app.log);
     ui.frame(&mut root);
 
-    // `focus_next` counts first and focuses in its chained operation. The list is a
-    // focusable widget too, before its rows.
+    // `focus_next` counts first and focuses in its chained operation. A list
+    // without a selection handles no keys and is not a Tab stop (R3-F16).
     ui.run_task(&mut root, focusable::focus_next());
     assert_eq!(ui.focused(&mut root), [OUTSIDE]);
-    ui.run_task(&mut root, focusable::focus_next());
-    assert_eq!(ui.focused(&mut root), [LIST]);
     ui.run_task(&mut root, focusable::focus_next());
     assert_eq!(ui.focused(&mut root), [field(0)]);
 
@@ -4910,6 +4930,46 @@ fn ordinary_operations_do_not_measure_or_steal_focus() {
 
     assert!(ui.core().resolved.is_empty());
     assert!(ui.core().landing.is_none());
+}
+
+#[test]
+fn only_a_selectable_or_focused_list_is_a_tab_stop() {
+    // R3-F16: a selectable list is a Tab stop before its rows.
+    let app = App::estimated(rows(0..100, 40.0), 40.0).selectable(false);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [OUTSIDE]);
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [LIST]);
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_eq!(ui.focused(&mut root), [field(0)]);
+    drop(root);
+
+    // A list without a selection still holds the focus for a waiting focus, and the
+    // next Tab takes it back: the list is visited while it is focused, then skipped.
+    let app = App::estimated(rows(0..1000, 40.0), 40.0);
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, FocusItem::new(LIST, 500_u32, field(500)));
+    assert_eq!(ui.focused(&mut root), [LIST]);
+    assert_eq!(ui.core().focus.deferred, Some((500, field(500))));
+
+    ui.run_task(&mut root, focusable::focus_next());
+    let focused = ui.focused(&mut root);
+    assert_eq!(focused.len(), 1);
+    assert_ne!(focused, [LIST]);
+    assert!(!ui.core().focus.focused);
+    assert!(ui.core().focus.deferred.is_none());
+
+    ui.run_task(&mut root, focusable::focus(OUTSIDE));
+    ui.run_task(&mut root, focusable::focus_next());
+    assert_ne!(ui.focused(&mut root), [LIST]);
 }
 
 /// The list inside a [`Component`], alone or between siblings in the component.
@@ -5262,7 +5322,8 @@ fn nearest_without_scroll_still_lays_out_what_it_measured() {
 fn zero_height_focus_target_is_a_no_op() {
     // Review P4-R1 F5: an item with no height off the window cannot be revealed, so
     // focusing it changes nothing and leaves nothing waiting.
-    let app = direct(rows(0..100, 0.0));
+    // Selectable, so the list can hold the focus before the task.
+    let app = direct(rows(0..100, 0.0)).selectable(false);
     let mut root = app.view();
     let mut ui = Harness::new(&mut root, &app.log);
     ui.frame(&mut root);
@@ -6944,9 +7005,11 @@ fn overlay_only_focus_targets_need_generic_operations() {
     assert_eq!(single_focus(&mut ui, &mut root), [field(20)]);
 
     // A waiting focus commits in the item's base tree, where a stuck header is not.
-    // Then the list keeps the focus, and nothing waits any more.
-    ui.run_task(&mut root, focusable::focus(LIST));
+    // Then the list keeps the focus, and nothing waits any more. The list is not
+    // selectable, so only a waiting focus focuses it: set its state directly.
+    ui.run_task(&mut root, focusable::unfocus());
     let core = ui.core_mut();
+    core.focus.focused = true;
     core.focus.deferred = Some((20, field(20)));
     ui.frame(&mut root);
     assert!(ui.core().focus.deferred.is_none());

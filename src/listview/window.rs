@@ -813,7 +813,7 @@ where
                 self.cover_down(visible)
             };
 
-            for position in last + 1..len.min(last + 1 + anticipate) {
+            for position in last + 1..len.min((last + 1).saturating_add(anticipate)) {
                 self.ensure(position);
             }
 
@@ -830,7 +830,7 @@ where
 
         // 7. Evict once, around the final anchored range.
         let lowest = first.saturating_sub(anticipate);
-        let highest = (last + anticipate).min(len - 1);
+        let highest = last.saturating_add(anticipate).min(len - 1);
 
         let keep: Vec<bool> = self
             .core

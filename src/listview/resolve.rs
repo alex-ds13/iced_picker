@@ -110,6 +110,9 @@ where
                     return Answer::Unknown;
                 }
 
+                // A list that is not selectable is not focusable, so the chained
+                // traversal could not focus it: the request takes the focus itself.
+                core.focus.focused = true;
                 core.focus.deferred = Some((key.clone(), widget));
                 core.geometry.block_next_redraw = true;
 

@@ -504,7 +504,8 @@ where
 /// The chained traversal: scrolls the scroller, and for a deferred focus first
 /// unfocuses every focusable widget (the list's `focusable` call comes before its
 /// `custom` call, so an older deferred focus is cancelled first) and then leaves the
-/// focus with the list.
+/// focus with the list. A list that is neither selectable nor focused makes no
+/// `focusable` call, and the `Defer` request focuses it instead.
 struct Land<K> {
     scroll: Option<(Id, f32, Animation)>,
     defer: Option<(Id, K, Id)>,
