@@ -382,6 +382,9 @@ struct Internal<T, R: text::Renderer> {
     option_matchers: Vec<String>,
     filtered_options: Vec<T>,
     version: u64,
+    /// The focus seen by the last `update`. An operation can focus or unfocus the
+    /// input between updates, so transitions are detected against this.
+    focused: bool,
 }
 
 impl<T: Display + Clone, R: text::Renderer> Internal<T, R> {
@@ -457,6 +460,7 @@ where
             option_matchers: Vec::new(),
             hovered_option: Some(0),
             version: 0,
+            focused: false,
         })
     }
 
@@ -485,7 +489,7 @@ where
     ) {
         let internal = tree.state.downcast_mut::<Internal<T, Renderer>>();
 
-        let was_focused = internal.editor.input.is_focused();
+        let was_focused = internal.focused;
 
         let edit = internal.editor.input.update::<Message>(
             event,
@@ -506,6 +510,7 @@ where
         }
 
         let is_focused = internal.editor.input.is_focused();
+        internal.focused = is_focused;
 
         if is_focused {
             if !was_focused {
@@ -605,9 +610,14 @@ where
                 if let Some(on_open) = self.on_open.take() {
                     shell.publish(on_open);
                 }
-            } else if let Some(on_close) = self.on_close.take() {
+            } else {
+                // diff() only rewrites the text when the selection changes, so a
+                // search draft would otherwise outlive the focus.
                 internal.editor.input.overwrite(&self.selection);
-                shell.publish(on_close);
+
+                if let Some(on_close) = self.on_close.take() {
+                    shell.publish(on_close);
+                }
             }
         }
 
@@ -703,7 +713,9 @@ where
         window: Size,
     ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
         let internal = tree.state.downcast_mut::<Internal<T, Renderer>>();
-        let is_focused = internal.editor.input.is_focused();
+        // Focus granted by an operation shows the menu only after update() has
+        // reset the stale filter.
+        let is_focused = internal.focused && internal.editor.input.is_focused();
 
         if is_focused {
             if internal.filtered_options.is_empty() {
@@ -836,4 +848,154 @@ where
     let mut matcher = option.to_string();
     matcher.retain(|c| c.is_ascii_alphanumeric());
     matcher.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iced::advanced::shell::{Bus, Waker};
+    use iced::advanced::widget::operation::focusable;
+    use iced::{Point, Renderer};
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Message {
+        Selected(&'static str),
+        Open,
+    }
+
+    const ID: widget::Id = widget::Id::new("combo");
+
+    // The null renderer's editor drops its text, so the value checks need a real one.
+    fn renderer() -> Renderer {
+        smol::block_on(<Renderer as renderer::Headless>::new(
+            renderer::Settings::default(),
+            Some("tiny-skia"),
+        ))
+        .expect("the software renderer should be available")
+    }
+
+    fn combo<'a>(options: &'a State<&'static str>) -> ComboBox<'a, &'static str, Message, Theme> {
+        ComboBox::new(options, "", Some(&"Apple"), Message::Selected).id(ID)
+    }
+
+    fn mount(
+        combo: &mut ComboBox<'_, &'static str, Message, Theme>,
+        renderer: &Renderer,
+    ) -> widget::Tree {
+        let mut tree = widget::Tree::new::<Message, Theme, Renderer>(&*combo);
+        tree.diff::<Message, Theme, Renderer>(&mut *combo);
+        combo.layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        tree
+    }
+
+    fn update(
+        combo: &mut ComboBox<'_, &'static str, Message, Theme>,
+        tree: &mut widget::Tree,
+        renderer: &Renderer,
+        event: &Event,
+        cursor: mouse::Cursor,
+    ) -> Vec<Message> {
+        let layout = Layout::new(tree.size);
+        let bounds = layout.bounds();
+        let mut bus = Bus::new();
+        let mut shell = Shell::new(&window::Headless, Waker::noop(), &mut bus);
+
+        combo.update(tree, event, layout, cursor, renderer, &mut shell, &bounds);
+
+        bus.drain().map(|(message, _)| message).collect()
+    }
+
+    fn internal(tree: &widget::Tree) -> &Internal<&'static str, Renderer> {
+        tree.state.downcast_ref()
+    }
+
+    #[test]
+    fn blur_restores_the_selection_without_on_close() {
+        let renderer = renderer();
+        let options = State::new(vec!["Apple", "Orange"]);
+        let mut combo = combo(&options);
+        let mut tree = mount(&mut combo, &renderer);
+        let inside = mouse::Cursor::Available(Point::new(5.0, 5.0));
+        let outside = mouse::Cursor::Available(Point::new(500.0, 500.0));
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        let _ = update(&mut combo, &mut tree, &renderer, &press, inside);
+        assert!(internal(&tree).editor.input.is_focused());
+        assert_eq!(internal(&tree).editor.input.value(), "");
+
+        tree.state
+            .downcast_mut::<Internal<&'static str, Renderer>>()
+            .editor
+            .input
+            .overwrite("dra");
+
+        let _ = update(&mut combo, &mut tree, &renderer, &press, outside);
+        assert!(!internal(&tree).editor.input.is_focused());
+        assert_eq!(internal(&tree).editor.input.value(), "Apple");
+
+        // Same selection, so diff() leaves the text alone.
+        tree.diff::<Message, Theme, Renderer>(&mut combo);
+        assert_eq!(internal(&tree).editor.input.value(), "Apple");
+    }
+
+    #[test]
+    fn focus_from_an_operation_opens_the_full_list() {
+        let renderer = renderer();
+        let options = State::new(vec!["Apple", "Orange"]);
+        let mut combo = combo(&options).on_open(Message::Open);
+        let mut tree = mount(&mut combo, &renderer);
+        assert_eq!(internal(&tree).filtered_options, ["Apple"]);
+
+        let layout = Layout::new(tree.size);
+        let mut focus = focusable::focus::<()>(ID);
+        combo.operate(&mut tree, layout, &layout.bounds(), &renderer, &mut focus);
+        assert!(internal(&tree).editor.input.is_focused());
+
+        let window = Size::new(800.0, 600.0);
+        assert!(
+            combo
+                .overlay(
+                    &mut tree,
+                    layout,
+                    &renderer,
+                    &layout.bounds(),
+                    Vector::ZERO,
+                    window
+                )
+                .is_empty(),
+            "the stale filtered menu must wait for update()"
+        );
+
+        let redraw = Event::Window(window::Event::RedrawRequested(iced::time::Instant::now()));
+        let messages = update(
+            &mut combo,
+            &mut tree,
+            &renderer,
+            &redraw,
+            mouse::Cursor::Unavailable,
+        );
+
+        assert_eq!(messages, [Message::Open]);
+        assert!(internal(&tree).editor.input.is_focused());
+        assert_eq!(internal(&tree).editor.input.value(), "");
+        assert_eq!(internal(&tree).filtered_options, ["Apple", "Orange"]);
+        assert_eq!(
+            combo
+                .overlay(
+                    &mut tree,
+                    layout,
+                    &renderer,
+                    &layout.bounds(),
+                    Vector::ZERO,
+                    window
+                )
+                .len(),
+            1
+        );
+    }
 }
