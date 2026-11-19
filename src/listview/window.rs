@@ -305,6 +305,19 @@ impl<K: Clone + Eq + Hash> Core<K> {
         changed
     }
 
+    /// Applies per-item estimates set for the current sequence, keeping the anchor in
+    /// place when they move it. Returns whether an indexed height changed.
+    pub(super) fn apply_item_estimates(&mut self) -> bool {
+        let changed = self.geometry.heights.apply_item_estimates();
+
+        if changed {
+            self.geometry.dirty = true;
+            self.absorb();
+        }
+
+        changed
+    }
+
     /// Follows a structural change of the keys (section 4.2): keeps the window rows
     /// and trees of surviving keys, hands a removed anchor's target to the next
     /// surviving key among the `shown` positions (from before the change), and

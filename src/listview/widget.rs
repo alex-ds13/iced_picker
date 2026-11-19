@@ -57,6 +57,7 @@ where
     pub(super) padding: Padding,
     pub(super) spacing: f32,
     pub(super) estimated_height: Option<f32>,
+    pub(super) estimate: Option<Box<dyn Fn(&'a T) -> f32 + 'a>>,
     pub(super) anticipate: usize,
     pub(super) highlight: HashSet<K>,
     pub(super) selection: Option<Supplied<'a, K>>,
@@ -92,6 +93,7 @@ where
         padding: Padding::ZERO,
         spacing: 0.0,
         estimated_height: None,
+        estimate: None,
         anticipate: ANTICIPATE,
         highlight: HashSet::new(),
         selection: None,
@@ -139,6 +141,7 @@ where
             padding: self.padding,
             spacing: self.spacing,
             estimated_height: self.estimated_height,
+            estimate: self.estimate,
             anticipate: self.anticipate,
             highlight: HashSet::new(),
             selection: None,
@@ -204,6 +207,24 @@ where
     /// 32 px until the next walk adopts a median.
     pub fn estimated_height(mut self, height: impl Into<Pixels>) -> Self {
         self.estimated_height = Some(height.into().0);
+        self
+    }
+
+    /// Sets the height assumed for each item that has not been measured yet, at least
+    /// 1 px, computed from the item.
+    ///
+    /// A measured height still wins over it. Where the closure returns a finite
+    /// height it wins over [`Self::estimated_height`], and where it returns a
+    /// non-finite one (`f32::NAN`, for example) the item falls back to that estimate,
+    /// or without it to the median (32 px before one is adopted).
+    ///
+    /// With exact heights (of at least 1 px each), the content height is right from
+    /// the first layout of a new list, so restoring a saved scroll offset lands where
+    /// it was. The closure
+    /// runs for every item on every view, and a change of an unmeasured item's
+    /// estimate is absorbed like a measurement, so nothing visible moves.
+    pub fn estimated_height_with(mut self, estimate: impl Fn(&'a T) -> f32 + 'a) -> Self {
+        self.estimate = Some(Box::new(estimate));
         self
     }
 
@@ -423,6 +444,13 @@ where
         let shown = core.shown_positions();
         let configured = core.configure(self.settings());
 
+        // Set before the keys change, so a rebuild for new keys uses them.
+        let heights = &mut core.geometry.heights;
+        let estimates_changed = match &self.estimate {
+            Some(estimate) => heights.set_item_estimates(self.items.iter().map(estimate)),
+            None => heights.set_item_estimates([]),
+        };
+
         let keys = self
             .items
             .iter()
@@ -442,7 +470,9 @@ where
             core.restructure(rebuilt, children, shown);
         }
 
-        if configured || rebuilt.is_some() {
+        let estimated = rebuilt.is_none() && estimates_changed && core.apply_item_estimates();
+
+        if configured || estimated || rebuilt.is_some() {
             core.geometry.block_next_redraw = true;
         }
 

@@ -127,9 +127,12 @@
 //!   expanded first row, when several typical items are measured, but with few of
 //!   them (for example with `.anticipate(0)` and a tall first item) the unusual one
 //!   can still set it. An explicit estimate avoids that. The adoption is absorbed like any
-//!   measurement, so nothing visible moves, and the estimate then stays. A jump
-//!   into unmeasured content whose estimate is much larger than the real height can
-//!   build and discard extra items in that frame.
+//!   measurement, so nothing visible moves, and the estimate then stays.
+//!   [`ListView::estimated_height_with`] estimates each item from its data, and wins
+//!   over both for every item it gives a finite height. With exact heights (of at
+//!   least 1 px each) the content height is right from the first layout of a new
+//!   list, so a saved scroll offset restores exactly. A jump into unmeasured content whose estimate is much
+//!   larger than the real height can build and discard extra items in that frame.
 //! * **Numeric range.** Heights and spacing are kept on a 1/256 px grid. A single
 //!   item's height, the spacing and an explicit estimate are clamped to
 //!   4,194,304 px, so a taller item cannot be scrolled through entirely. A clamped

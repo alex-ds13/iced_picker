@@ -59,6 +59,13 @@ impl Estimate {
         }
     }
 
+    /// An estimate the application gives for one item, `None` when it is not finite.
+    fn item(height: f32) -> Option<u32> {
+        height
+            .is_finite()
+            .then(|| quantize(height.max(0.0)).max(Self::MIN_UNITS))
+    }
+
     #[cfg(test)]
     pub(super) fn value(self) -> f32 {
         to_pixels(i64::from(self.units())) as f32
@@ -99,6 +106,10 @@ pub(super) struct Heights {
     /// In units, at most `MAX_UNITS`.
     spacing: u32,
     estimate: Estimate,
+    /// The application's estimate of each item, in units, `None` where it gives none
+    /// (then `estimate` applies). Empty when it gives no per-item estimates, else as
+    /// long as the sequence of the next [`Heights::rebuild`].
+    item_estimates: Vec<Option<u32>>,
     /// A measurement was clamped to `MAX_UNITS` and logged.
     clamped: bool,
     /// Fenwick nodes visited, to check that lookups and updates stay logarithmic.
@@ -115,6 +126,7 @@ impl Heights {
             sum: 0,
             spacing: 0,
             estimate,
+            item_estimates: Vec::new(),
             clamped: false,
             #[cfg(test)]
             probes: Cell::new(0),
@@ -188,15 +200,20 @@ impl Heights {
     ///
     /// Negative or non-finite heights count as unmeasured.
     pub(super) fn rebuild(&mut self, heights: impl IntoIterator<Item = Option<f32>>) {
-        let estimate = self.estimate.units();
         self.heights.clear();
         self.measured.clear();
 
-        for height in heights {
+        for (position, height) in heights.into_iter().enumerate() {
             let height = height.filter(|height| height.is_finite() && *height >= 0.0);
-            self.heights.push(height.map_or(estimate, quantize));
+            let units = height.map_or_else(|| self.unmeasured(position), quantize);
+            self.heights.push(units);
             self.measured.push(height.is_some());
         }
+
+        debug_assert!(
+            self.item_estimates.is_empty() || self.item_estimates.len() == self.heights.len(),
+            "per-item estimates are set for the sequence being rebuilt"
+        );
 
         // Enforced in release builds too: the i64 overflow bound of the tree assumes
         // at most u32::MAX rows of at most MAX_UNITS plus one gap each.
@@ -366,16 +383,79 @@ impl Heights {
         }
     }
 
-    fn rewrite_unmeasured(&mut self) {
-        let estimate = self.estimate.units();
+    /// Sets the application's estimate of each item of the sequence about to be
+    /// indexed, an empty sequence when it gives none. A non-finite estimate falls back
+    /// to the list's estimate. O(n).
+    ///
+    /// The next [`Heights::rebuild`] uses them, or [`Heights::apply_item_estimates`]
+    /// when the sequence stays. Returns whether any changed.
+    pub(super) fn set_item_estimates(&mut self, estimates: impl IntoIterator<Item = f32>) -> bool {
+        let mut changed = false;
+        let mut len = 0;
 
-        for (height, &measured) in self.heights.iter_mut().zip(&self.measured) {
-            if !measured {
-                *height = estimate;
+        for (position, height) in estimates.into_iter().enumerate() {
+            let units = Estimate::item(height);
+
+            match self.item_estimates.get_mut(position) {
+                Some(current) if *current == units => {}
+                Some(current) => {
+                    *current = units;
+                    changed = true;
+                }
+                None => {
+                    self.item_estimates.push(units);
+                    changed = true;
+                }
+            }
+
+            len = position + 1;
+        }
+
+        if self.item_estimates.len() > len {
+            self.item_estimates.truncate(len);
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Gives every unmeasured item its estimate after [`Heights::set_item_estimates`]
+    /// for the indexed sequence. Returns whether a height changed. O(n).
+    pub(super) fn apply_item_estimates(&mut self) -> bool {
+        debug_assert!(
+            self.item_estimates.is_empty() || self.item_estimates.len() == self.heights.len(),
+            "per-item estimates are set for the indexed sequence"
+        );
+
+        self.rewrite_unmeasured()
+    }
+
+    /// The height of the unmeasured item at `position`, in units.
+    fn unmeasured(&self, position: usize) -> u32 {
+        self.item_estimates
+            .get(position)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| self.estimate.units())
+    }
+
+    /// Gives every unmeasured item its estimate. Returns whether a height changed.
+    fn rewrite_unmeasured(&mut self) -> bool {
+        let mut changed = false;
+
+        for position in 0..self.heights.len() {
+            if !self.measured[position] {
+                let units = self.unmeasured(position);
+                changed |= self.heights[position] != units;
+                self.heights[position] = units;
             }
         }
 
-        self.build_tree();
+        if changed {
+            self.build_tree();
+        }
+
+        changed
     }
 
     fn build_tree(&mut self) {
@@ -838,6 +918,44 @@ mod tests {
         assert_eq!(given.estimate(), Estimate::Measured(30 * UNIT));
         assert_eq!(given.height(2), 30.0);
         assert_eq!(given.total(), 60.0);
+    }
+
+    #[test]
+    fn item_estimates_fill_unmeasured_items_only() {
+        let mut index = Heights::new(Estimate::given(10.0));
+
+        // Set before the rebuild of a new sequence, which uses them. A non-finite one
+        // falls back to the list's estimate, and none is below 1 px.
+        assert!(index.set_item_estimates([40.0, f32::NAN, 0.0, 25.0]));
+        index.rebuild([None, None, None, Some(5.0)]);
+        assert_eq!(
+            (0..4).map(|p| index.height(p)).collect::<Vec<_>>(),
+            [40.0, 10.0, 1.0, 5.0]
+        );
+        assert_eq!(index.total(), 56.0);
+
+        // The same estimates change nothing. A new one moves its unmeasured item, and
+        // a measurement still wins over it.
+        assert!(!index.set_item_estimates([40.0, f32::NAN, 0.0, 25.0]));
+        assert!(index.set_item_estimates([60.0, f32::NAN, 0.0, 30.0]));
+        assert!(index.apply_item_estimates());
+        assert_eq!(index.offset_of(1), 60.0);
+        assert_eq!(index.height(3), 5.0);
+
+        // A change only for a measured item moves nothing.
+        assert!(index.set_item_estimates([60.0, f32::NAN, 0.0, 99.0]));
+        assert!(!index.apply_item_estimates());
+
+        // The list's estimate changes only the items without their own, and dropping
+        // the per-item estimates goes back to it everywhere.
+        assert!(index.set_estimate(Some(12.0)));
+        assert_eq!((index.height(0), index.height(1)), (60.0, 12.0));
+        assert!(index.set_item_estimates([]));
+        assert!(index.apply_item_estimates());
+        assert_eq!(
+            (0..4).map(|p| index.height(p)).collect::<Vec<_>>(),
+            [12.0, 12.0, 12.0, 5.0]
+        );
     }
 
     #[test]

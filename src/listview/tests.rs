@@ -580,6 +580,8 @@ struct App {
     scroller_id: Option<Id>,
     height: Length,
     estimate: Option<f32>,
+    /// Each fixed item is estimated at its real height with `estimated_height_with`.
+    exact: bool,
     anticipate: usize,
     spacing: f32,
     padding: Padding,
@@ -602,6 +604,7 @@ impl App {
             scroller_id: Some(SCROLL),
             height: Fill,
             estimate: None,
+            exact: false,
             anticipate: 4,
             spacing: 0.0,
             padding: Padding::ZERO,
@@ -673,6 +676,13 @@ impl App {
 
         if let Some(estimate) = self.estimate {
             list = list.estimated_height(estimate);
+        }
+
+        if self.exact {
+            list = list.estimated_height_with(|item: &Item| match item.height {
+                Height::Fixed(height) => height,
+                _ => f32::NAN,
+            });
         }
 
         if let Some(color) = self.text_color {
@@ -8271,4 +8281,69 @@ fn adopting_an_estimate_keeps_the_visible_rows_still() {
     assert_eq!(app.log.screen(), screen);
     ui.assert_invariants();
     assert_eq!(ui.frame(&mut root).passes, [Invalidation::None]);
+}
+
+#[test]
+fn exact_item_estimates_restore_a_saved_bottom_offset() {
+    // A list that comes back fresh, with one tall item near its end, is scrolled to
+    // the bottom offset saved from the fully measured list: 199 rows of 20 px and
+    // one of 400 px, plus the 50 px footer, in a 600 px viewport.
+    let mut items = rows(0..200, 20.0);
+    items[195].height = Height::Fixed(400.0);
+    let bottom = 199.0 * 20.0 + 400.0 + FOOTER - WINDOW.height;
+
+    let restore = |app: &App| {
+        let mut root = app.view();
+        let mut ui = Harness::new(&mut root, &app.log);
+        ui.frame(&mut root);
+        ui.scroll(&mut root, bottom);
+        ui.frame(&mut root);
+        ui.assert_invariants();
+
+        (ui.translation(&mut root), ui.screen_y(&mut root, 199))
+    };
+
+    // Exact estimates make the first content height true, so the offset is not
+    // clamped and the last row ends right above the footer.
+    let exact = App {
+        exact: true,
+        ..App::new(items.clone())
+    };
+    assert_eq!(restore(&exact), (bottom, WINDOW.height - FOOTER - 20.0));
+
+    // With one estimate for every item, the fresh content is 380 px shorter. The
+    // offset is clamped to its end, and measuring the tall item then grows the
+    // content below the view, which ends up 380 px higher.
+    let uniform = App::estimated(items, 20.0);
+    let (offset, _) = restore(&uniform);
+    assert_eq!(offset, bottom - 380.0);
+}
+
+#[test]
+fn changed_item_estimates_above_the_view_move_nothing_visible() {
+    let mut app = App {
+        exact: true,
+        ..App::new(rows(0..1000, 40.0))
+    };
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame(&mut root);
+    ui.scroll(&mut root, 20_000.0);
+    let screen = ui.screen_y(&mut root, 505);
+    let offset = ui.core().geometry.heights.offset_of(505);
+    drop(root);
+
+    // Rows 100..200 were never shown. Their estimates double while the keys stay, so
+    // the change is absorbed above the anchor instead of moving the visible rows.
+    for item in &mut app.items[100..200] {
+        item.height = Height::Fixed(80.0);
+    }
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame(&mut root);
+
+    assert_eq!(ui.core().geometry.heights.offset_of(505), offset + 4000.0);
+    assert_eq!(ui.screen_y(&mut root, 505), screen);
+    app.log.assert_covered(20_000.0, 20_600.0);
+    ui.assert_invariants();
 }
