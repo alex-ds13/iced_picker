@@ -318,7 +318,7 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { .. })
             | Event::Touch(touch::Event::FingerMoved { .. }) => {
-                let Some(position) = cursor.land().position() else {
+                let Some(position) = cursor.observe().position() else {
                     return;
                 };
                 let state = tree.state.downcast_mut::<State>();
@@ -735,13 +735,29 @@ mod tests {
         event: mouse::Event,
         position: Point,
     ) -> bool {
+        send_cursor_event(
+            reorder,
+            tree,
+            bus,
+            event,
+            mouse::Cursor::Available(position),
+        )
+    }
+
+    fn send_cursor_event(
+        reorder: &mut TestReorder,
+        tree: &mut Tree,
+        bus: &mut Bus<(usize, usize)>,
+        event: mouse::Event,
+        cursor: mouse::Cursor,
+    ) -> bool {
         let mut shell = Shell::new(&window::Headless, Waker::noop(), bus);
         let layout = Layout::new(tree.size);
         reorder.update(
             tree,
             &Event::Mouse(event),
             layout,
-            mouse::Cursor::Available(position),
+            cursor,
             &(),
             &mut shell,
             &Rectangle::with_size(Size::new(200.0, 200.0)),
@@ -883,6 +899,37 @@ mod tests {
             tree.state.downcast_ref::<State>().action,
             Action::Idle
         ));
+    }
+
+    #[test]
+    fn a_drag_follows_a_cursor_obstructed_by_an_enclosing_scrollable() {
+        let mut reorder = test_widget();
+        let mut tree = tree_for(&mut reorder);
+        let mut bus = Bus::new();
+        let origin = Point::new(8.0, 8.0);
+        send_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            origin,
+        );
+        let outside = Point::new(20.0, 150.0);
+        assert!(send_cursor_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::CursorMoved { position: outside },
+            mouse::Cursor::Obstructed(outside),
+        ));
+        send_cursor_event(
+            &mut reorder,
+            &mut tree,
+            &mut bus,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            mouse::Cursor::Obstructed(outside),
+        );
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), vec![(0, 2)]);
     }
 
     #[test]
