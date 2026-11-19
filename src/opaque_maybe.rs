@@ -1,5 +1,6 @@
 use iced_core as core;
 
+use core::keyboard;
 use core::layout::{self, Layout};
 use core::mouse;
 use core::renderer;
@@ -36,14 +37,16 @@ where
 }
 
 /// Like [`opaque_maybe`], but an opaque layer is also inert, as the background of a
-/// modal dialog should be: keyboard, input method and clipboard events are not
-/// forwarded to it, its input method requests are dropped and its overlays are hidden.
+/// modal dialog should be: key presses and releases, input method and clipboard
+/// events are not forwarded to it, its input method requests are dropped and its
+/// overlays are hidden.
 ///
 /// Clipboard events are dropped because a focused text input applies a clipboard read
 /// result as a paste, even for a read it requested before the layer turned inert.
 ///
-/// Window and other events still reach it, so animations and layout stay current.
-/// Operations (focus traversal included) are still forwarded.
+/// Modifier changes, window and other events still reach it, so modifier state,
+/// animations and layout stay current. Operations (focus traversal included) are
+/// still forwarded.
 pub(crate) fn inert_maybe<'a, Message, Theme, Renderer>(
     content: impl Widget<Message, Theme, Renderer> + 'a,
     inert: bool,
@@ -199,9 +202,14 @@ where
             return;
         }
 
+        // Modifier changes edit nothing, and widgets that track modifiers would keep
+        // a stale state (a Ctrl released while the dialog is shown) without them.
         if matches!(
             event,
-            Event::Keyboard(_) | Event::InputMethod(_) | Event::Clipboard(_)
+            Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | Event::Keyboard(keyboard::Event::KeyReleased { .. })
+                | Event::InputMethod(_)
+                | Event::Clipboard(_)
         ) {
             return;
         }
@@ -222,11 +230,25 @@ where
         viewport: &core::Rectangle,
         renderer: &Renderer,
     ) -> core::mouse::Interaction {
+        // A stack levitates the cursor for every lower layer while an upper layer
+        // reports an interaction, so only claim one over the own bounds.
+        let is_over = cursor.is_over(layout.bounds());
+
         match self.mode {
-            Mode::Opaque | Mode::Inert => mouse::Interaction::Idle,
-            Mode::Transparent | Mode::Barrier => self
+            Mode::Opaque | Mode::Inert if is_over => mouse::Interaction::Idle,
+            Mode::Opaque | Mode::Inert => mouse::Interaction::None,
+            Mode::Transparent => self
                 .content
                 .mouse_interaction(state, layout, cursor, viewport, renderer),
+            Mode::Barrier => {
+                match self
+                    .content
+                    .mouse_interaction(state, layout, cursor, viewport, renderer)
+                {
+                    mouse::Interaction::None if is_over => mouse::Interaction::Idle,
+                    interaction => interaction,
+                }
+            }
         }
     }
 
@@ -245,5 +267,75 @@ where
 
         self.content
             .overlay(state, layout, renderer, viewport, translation, window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iced::advanced::renderer::Headless as _;
+    use iced::advanced::shell::{Bus, Waker};
+    use iced::widget::{Space, button, stack};
+    use iced::{Fill, Point, Renderer};
+
+    const WINDOW: Size = Size::new(900.0, 700.0);
+
+    #[test]
+    fn an_opaque_layer_only_blocks_lower_layers_over_its_bounds() {
+        let renderer = smol::block_on(Renderer::new(
+            renderer::Settings::default(),
+            Some("tiny-skia"),
+        ))
+        .expect("the software renderer should be available");
+
+        for opaque in [false, true] {
+            let base: Element<'_, u8, iced::Theme, Renderer> = button(Space::new())
+                .width(Fill)
+                .height(Fill)
+                .on_press(1)
+                .boxed();
+            let mut root = stack![
+                base,
+                opaque_maybe(Space::new().width(50).height(50), opaque).boxed(),
+            ];
+            let mut tree = Tree::new(&root);
+            tree.diff(&mut root);
+            root.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, WINDOW),
+            );
+            let layout = Layout::new(tree.size);
+
+            for (position, expected) in [
+                (Point::new(400.0, 400.0), &[1][..]),
+                (
+                    Point::new(20.0, 20.0),
+                    if opaque { &[][..] } else { &[1][..] },
+                ),
+            ] {
+                let cursor = mouse::Cursor::Available(position);
+                let mut bus = Bus::new();
+
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    let mut shell = Shell::new(&core::window::Headless, Waker::noop(), &mut bus);
+                    root.update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        layout,
+                        cursor,
+                        &renderer,
+                        &mut shell,
+                        &Rectangle::with_size(WINDOW),
+                    );
+                }
+
+                assert_eq!(bus.into_iter().collect::<Vec<u8>>(), expected);
+            }
+        }
     }
 }

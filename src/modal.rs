@@ -91,7 +91,7 @@ mod tests {
     use iced::advanced::shell::{Bus, Waker};
     use iced::advanced::widget::{Tree, operation};
     use iced::advanced::{InputMethod, Layout, Shell, Widget as _};
-    use iced::widget::{Space, text_input};
+    use iced::widget::{Space, pick_list, text_input};
     use iced::{
         Event, Fill, Point, Rectangle, Renderer, Size, Vector, keyboard, mouse, touch, window,
     };
@@ -315,6 +315,43 @@ mod tests {
         let mut root = modal(input(), dialog(true), 2);
         let layout = lay_out(&mut root, &mut tree, &renderer);
         let (messages, _) = send(&mut root, &mut tree, layout, &renderer, paste, cursor);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn modifier_changes_still_reach_the_background() {
+        const OPTIONS: [u8; 3] = [1, 2, 3];
+
+        let renderer = renderer();
+        let root = |is_shown| {
+            let base = pick_list(Some(1), &OPTIONS[..], u8::to_string).on_select(|value| value);
+            modal(base, dialog(is_shown), 0)
+        };
+        let modifiers = |modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers));
+        let none = mouse::Cursor::Unavailable;
+
+        // Ctrl is held when the dialog opens and released while it is shown.
+        let mut closed = root(false);
+        let mut tree = Tree::new(&closed);
+        let layout = lay_out(&mut closed, &mut tree, &renderer);
+        let ctrl = modifiers(keyboard::Modifiers::CTRL);
+        send(&mut closed, &mut tree, layout, &renderer, ctrl, none);
+        drop(closed);
+
+        let mut shown = root(true);
+        let layout = lay_out(&mut shown, &mut tree, &renderer);
+        let released = modifiers(keyboard::Modifiers::empty());
+        send(&mut shown, &mut tree, layout, &renderer, released, none);
+        drop(shown);
+
+        // A plain wheel over the pick list must not act as Ctrl+wheel.
+        let mut closed = root(false);
+        let layout = lay_out(&mut closed, &mut tree, &renderer);
+        let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let over = mouse::Cursor::Available(Point::new(10.0, 10.0));
+        let (messages, _) = send(&mut closed, &mut tree, layout, &renderer, wheel, over);
         assert!(messages.is_empty());
     }
 }
