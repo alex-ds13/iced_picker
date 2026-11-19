@@ -807,10 +807,7 @@ where
             color_picker_state.external_color = self.color;
             color_picker_state.color = self.color;
             color_picker_state.hex_text = self.color.as_hex_string();
-            if !matches!(self.color, Color::BLACK | Color::WHITE) {
-                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
-                // was on those cases
-                let hue = Hsv::from(self.color).hue;
+            if let Some(hue) = color_hue(self.color) {
                 color_picker_state.previous_hue_degrees = hue;
                 color_picker_state.current_hue_degrees = hue;
             }
@@ -819,6 +816,8 @@ where
         if !self.show_picker {
             // A drag interrupted by closing would otherwise resume on the next open.
             color_picker_state.color_bar_dragged = ColorBarDragged::None;
+            // Reopening must not resume a focus, or the first Enter would act at once.
+            color_picker_state.focus = Focus::None;
             color_picker_state.hex_text = color_picker_state.color.as_hex_string();
             if color_picker_state.current_hue_degrees != color_picker_state.previous_hue_degrees {
                 color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
@@ -855,6 +854,12 @@ where
         };
         let mut children: [&mut dyn FnMut(&mut Tree); 2] = [&mut diff_underlay, &mut diff_overlay];
         tree.diff_children_custom(&mut children, |tree, diff| diff(tree), |_| Tree::empty());
+
+        if !self.show_picker {
+            // Drops the input's focus, which a reopened picker must not resume. The popup
+            // layout was cleared above, so the fresh tree is measured before it is used.
+            tree.children[1].children[3] = Tree::new::<_, _, Renderer>(&self.hex_input);
+        }
     }
 
     fn size(&self) -> iced::Size<Length> {
@@ -1244,12 +1249,13 @@ where
     fn on_tab_through_hex(&mut self, event: &Event, renderer: &Renderer) -> bool {
         let Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modifiers,
             ..
         }) = event
         else {
             return false;
         };
-        let backwards = self.state.keyboard_modifiers.shift();
+        let backwards = modifiers.shift();
         let layout = self.hex_input_layout();
 
         if self.is_hex_input_focused(layout, renderer) {
@@ -1491,7 +1497,8 @@ where
                         |value: u16, y: f32| ((i32::from(value) + y as i32).rem_euclid(360)) as u16;
 
                     if cursor.is_over(hue_bounds) {
-                        self.state.current_hue_degrees = move_value(hsv_color.hue, *y);
+                        self.state.current_hue_degrees =
+                            move_value(self.state.current_hue_degrees, *y);
                         self.state.color = Color {
                             a: self.state.color.a,
                             ..Hsv {
@@ -1618,6 +1625,7 @@ where
     ) {
         let mut rgba_color_children = layout.children();
         let mut color_changed = false;
+        let color_before = self.state.color;
 
         let mut red_row_children = rgba_color_children
             .next()
@@ -1833,10 +1841,11 @@ where
         }
 
         if color_changed {
-            if !matches!(self.state.color, Color::BLACK | Color::WHITE) {
-                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
-                // was on those cases
-                let hue = Hsv::from(self.state.color).hue;
+            let rgb = |color: Color| [color.r, color.g, color.b];
+            // Alpha carries no hue.
+            if rgb(self.state.color) != rgb(color_before)
+                && let Some(hue) = color_hue(self.state.color)
+            {
                 self.state.current_hue_degrees = hue;
             }
             shell.capture_event();
@@ -1846,12 +1855,12 @@ where
 
     /// The even handling for the keyboard input.
     fn on_event_keyboard(&mut self, event: &Event) -> event::Status {
-        if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event {
+        if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
             let mut status = event::Status::Ignored;
             let color_before = self.state.color;
 
             if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
-                if self.state.keyboard_modifiers.shift() {
+                if modifiers.shift() {
                     self.state.focus = self.state.focus.previous();
                 } else {
                     self.state.focus = self.state.focus.next();
@@ -1950,18 +1959,12 @@ where
             // truncates, which can undo a hue step.
             if self.state.color != color_before
                 && matches!(self.state.focus, Focus::Red | Focus::Green | Focus::Blue)
-                && !matches!(self.state.color, Color::BLACK | Color::WHITE)
+                && let Some(hue) = color_hue(self.state.color)
             {
-                // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
-                // was on those cases
-                let hue = Hsv::from(self.state.color).hue;
                 self.state.current_hue_degrees = hue;
             }
 
             status
-        } else if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
-            self.state.keyboard_modifiers = *modifiers;
-            event::Status::Ignored
         } else {
             event::Status::Ignored
         }
@@ -2257,10 +2260,7 @@ where
         for InternalMessage::ChangeInput(text) in fake_input_messages {
             if let Some(color) = parse_hex(&text) {
                 self.state.color = color;
-                if !matches!(self.state.color, Color::BLACK | Color::WHITE) {
-                    // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
-                    // was on those cases
-                    let hue = Hsv::from(self.state.color).hue;
+                if let Some(hue) = color_hue(self.state.color) {
                     self.state.current_hue_degrees = hue;
                 }
             }
@@ -3265,8 +3265,6 @@ pub struct OverlayState {
     pub(crate) color_bar_dragged: ColorBarDragged,
     /// the focus of the [`ColorPickerOverlay`].
     pub(crate) focus: Focus,
-    /// The previously pressed keyboard modifiers.
-    pub(crate) keyboard_modifiers: keyboard::Modifiers,
     /// Whether the cached overlay layout must be recomputed before the next use.
     pub(crate) layout_stale: bool,
     /// The text of the hex input, kept as typed while it is being edited.
@@ -3378,7 +3376,6 @@ impl Default for OverlayState {
             current_hue_degrees: 0,
             color_bar_dragged: ColorBarDragged::None,
             focus: Focus::default(),
-            keyboard_modifiers: keyboard::Modifiers::default(),
             layout_stale: false,
             rgba_tree: Tree::empty(),
             sat_value_style: Cell::new(None),
@@ -3470,8 +3467,7 @@ impl Focus {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::None => Self::None,
-            Self::Overlay => Self::Submit,
+            Self::None | Self::Overlay => Self::Submit,
             Self::SatValue => Self::Overlay,
             Self::Hue => Self::SatValue,
             Self::Red => Self::Hue,
@@ -3657,6 +3653,15 @@ impl HexString for Color {
             (self.a * 255.0) as u8,
         )
     }
+}
+
+/// The hue of `color`, or `None` when its RGB channels are achromatic (grays, black and
+/// white), which should keep the hue they were picked with. Alpha is ignored.
+fn color_hue(color: Color) -> Option<u16> {
+    let max = color.r.max(color.g).max(color.b);
+    let min = color.r.min(color.g).min(color.b);
+    // Same threshold as the achromatic branch of `Hsv::from`.
+    (max - min >= f32::EPSILON).then(|| Hsv::from(color).hue)
 }
 
 impl From<Color> for Hsv {
@@ -5032,20 +5037,14 @@ mod tests {
         assert_eq!(ui.press(Named::Enter), (vec![Message::Cancel], true));
 
         // Shift+Tab from cancel enters the input, and again leaves it for the alpha bar.
-        let _ = ui.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
-            keyboard::Modifiers::SHIFT,
-        )));
-        assert!(ui.press(Named::Tab).1);
+        assert!(shift_tab(&mut ui));
         assert!(hex_focused(&mut ui));
         assert_eq!(focus(&ui), Focus::None);
-        assert!(ui.press(Named::Tab).1);
+        assert!(shift_tab(&mut ui));
         assert!(!hex_focused(&mut ui));
         assert_eq!(focus(&ui), Focus::Alpha);
 
         // Tab from the alpha bar enters the input, where Enter submits the typed color.
-        let _ = ui.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
-            keyboard::Modifiers::empty(),
-        )));
         assert!(ui.press(Named::Tab).1);
         assert!(hex_focused(&mut ui));
         ui.select_all();
@@ -5290,5 +5289,138 @@ mod tests {
             ui.tree.children[1].children[1].children[0].size.height,
             80.0
         );
+    }
+
+    /// Presses Shift+Tab, returning whether the press was captured.
+    fn shift_tab(ui: &mut Harness) -> bool {
+        let (_, status) = ui.send_with_status(key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::Tab),
+            keyboard::Modifiers::SHIFT,
+        ));
+        ui.redraw();
+        status == event::Status::Captured
+    }
+
+    fn wheel(ui: &mut Harness, over: Rectangle) {
+        ui.cursor = Cursor::Available(over.center());
+        let _ = ui.send(Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        }));
+        ui.redraw();
+    }
+
+    fn hue(ui: &Harness) -> u16 {
+        ui.tree
+            .state
+            .downcast_ref::<State>()
+            .overlay_state
+            .current_hue_degrees
+    }
+
+    fn set_hue(ui: &mut Harness, hue: u16) {
+        let state = &mut ui.tree.state.downcast_mut::<State>().overlay_state;
+        state.current_hue_degrees = hue;
+        state.previous_hue_degrees = hue;
+    }
+
+    #[test]
+    fn achromatic_colors_have_no_hue_whatever_their_alpha() {
+        for color in [
+            Color::BLACK,
+            Color::WHITE,
+            Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.0),
+            Color::from_rgb(0.5, 0.5, 0.5),
+        ] {
+            assert_eq!(color_hue(color), None, "{color:?}");
+        }
+        assert_eq!(color_hue(Color::from_rgba(0.0, 0.0, 1.0, 0.5)), Some(240));
+    }
+
+    #[test]
+    fn hue_wheel_steps_from_the_stored_hue() {
+        let mut ui = Harness::new(Color::from_rgb(0.5, 0.25, 0.25));
+        let hue_bar = hsv_area_bounds(&ui)[1];
+        for _ in 0..10 {
+            wheel(&mut ui, hue_bar);
+        }
+        assert_eq!(hue(&ui), 10);
+
+        // A gray keeps the hue the bar shows.
+        let mut ui = Harness::new(Color::from_rgb(0.5, 0.5, 0.5));
+        set_hue(&mut ui, 200);
+        wheel(&mut ui, hue_bar);
+        assert_eq!(hue(&ui), 201);
+    }
+
+    #[test]
+    fn alpha_changes_keep_the_hue() {
+        for color in [
+            Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            Color::from_rgba(0.5, 0.5, 0.5, 0.5),
+        ] {
+            let mut ui = Harness::new(color);
+            set_hue(&mut ui, 220);
+            let alpha_bar = channel_bounds(&ui)[3][1];
+            wheel(&mut ui, alpha_bar);
+            assert_ne!(ui.color().a, color.a, "{color:?}");
+            assert_eq!(hue(&ui), 220, "{color:?}");
+
+            ui.tree.state.downcast_mut::<State>().overlay_state.focus = Focus::Alpha;
+            assert!(ui.press(keyboard::key::Named::ArrowLeft).1);
+            assert_eq!(hue(&ui), 220, "{color:?}");
+        }
+    }
+
+    #[test]
+    fn tab_direction_comes_from_the_key_press() {
+        let mut ui = Harness::new(original());
+        // A Shift release the picker never saw must not reverse Tab.
+        let _ = ui.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::SHIFT,
+        )));
+        assert!(ui.press(keyboard::key::Named::Tab).1);
+        assert_eq!(
+            ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+            Focus::Overlay
+        );
+    }
+
+    #[test]
+    fn shift_tab_from_nothing_focuses_the_last_control() {
+        let mut ui = Harness::new(original());
+        assert!(shift_tab(&mut ui));
+        assert_eq!(
+            ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+            Focus::Submit
+        );
+    }
+
+    #[test]
+    fn closing_the_picker_clears_both_focuses() {
+        for focus_hex in [false, true] {
+            let mut ui = Harness::new(original());
+            if focus_hex {
+                let hex = ui.control_bounds(1);
+                ui.click(hex);
+                assert!(hex_focused(&mut ui));
+            } else {
+                ui.tree.state.downcast_mut::<State>().overlay_state.focus = Focus::Submit;
+            }
+
+            let mut closed = picker_with(original());
+            closed.show_picker = false;
+            ui.picker = closed;
+            ui.tree.diff(&mut ui.picker);
+            ui.relayout();
+            ui.rebuild(original());
+
+            assert!(!hex_focused(&mut ui));
+            assert_eq!(
+                ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+                Focus::None
+            );
+            assert_eq!(ui.press(keyboard::key::Named::Enter), (vec![], false));
+        }
     }
 }
