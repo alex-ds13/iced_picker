@@ -356,11 +356,22 @@ impl<Message, Theme> Overlay<Message, ButtonTheme<Theme>, Renderer>
     }
 }
 
+/// Forwards everything a local shell recorded except its messages, which the caller handles.
+///
+/// [`Shell::merge`] would have to turn every local message into an outer one.
+fn forward_effects<A, B>(shell: &mut Shell<'_, A>, local: &mut Shell<'_, B>) {
+    shell.request_redraw_at(local.redraw_request());
+    if local.is_event_captured() {
+        shell.capture_event();
+    }
+    shell.invalidate(local.invalidation());
+    shell.input_method_mut().merge(local.input_method());
+    shell.clipboard_mut().merge(local.clipboard_mut());
+}
+
 /// A nested overlay of a picker button's content, seen from the picker's own types.
 struct PickerButtonOverlay<'a, Message, Theme> {
     inner: overlay::Element<'a, ButtonAction<Message>, ButtonTheme<Theme>, Renderer>,
-    /// Content overlays only publish `ButtonAction::Content`, but the mapping must be total.
-    on_press: Message,
 }
 
 impl<Message: Clone, Theme: Clone> Overlay<Message, Theme, Renderer>
@@ -399,10 +410,14 @@ impl<Message: Clone, Theme: Clone> Overlay<Message, Theme, Renderer>
         self.inner
             .as_overlay_mut()
             .update(event, cursor, renderer, &mut local);
-        shell.merge(local, |action| match action {
-            ButtonAction::Content(message) => message,
-            ButtonAction::Press => self.on_press.clone(),
-        });
+        forward_effects(shell, &mut local);
+        drop(local);
+        // Only the button itself publishes `Press`, never its content's overlays.
+        for (action, receipt) in messages.drain() {
+            if let ButtonAction::Content(message) = action {
+                shell.forward(message, receipt);
+            }
+        }
     }
     fn mouse_interaction(&self, cursor: Cursor, renderer: &Renderer) -> mouse::Interaction {
         self.inner.as_overlay().mouse_interaction(cursor, renderer)
@@ -411,17 +426,11 @@ impl<Message: Clone, Theme: Clone> Overlay<Message, Theme, Renderer>
         &'a mut self,
         renderer: &Renderer,
     ) -> Vec<overlay::Element<'a, Message, Theme, Renderer>> {
-        let on_press = &self.on_press;
         self.inner
             .as_overlay_mut()
             .overlay(renderer)
             .into_iter()
-            .map(|inner| {
-                overlay::Element::new(Box::new(PickerButtonOverlay {
-                    inner,
-                    on_press: on_press.clone(),
-                }))
-            })
+            .map(|inner| overlay::Element::new(Box::new(PickerButtonOverlay { inner })))
             .collect()
     }
     fn index(&self) -> f32 {
@@ -808,6 +817,8 @@ where
         }
 
         if !self.show_picker {
+            // A drag interrupted by closing would otherwise resume on the next open.
+            color_picker_state.color_bar_dragged = ColorBarDragged::None;
             color_picker_state.hex_text = color_picker_state.color.as_hex_string();
             if color_picker_state.current_hue_degrees != color_picker_state.previous_hue_degrees {
                 color_picker_state.current_hue_degrees = color_picker_state.previous_hue_degrees;
@@ -855,6 +866,9 @@ where
             .layout(&mut tree.children[0], renderer, limits);
         tree.size = tree.children[0].size;
         tree.children[0].translation = Vector::ZERO;
+        // The runtime relayouts without a diff when popup content (or one of its nested
+        // overlays) invalidates the layout, so the cached popup layout must go too.
+        tree.state.downcast_mut::<State>().overlay_layout = None;
     }
 
     fn update(
@@ -1834,6 +1848,7 @@ where
     fn on_event_keyboard(&mut self, event: &Event) -> event::Status {
         if let Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event {
             let mut status = event::Status::Ignored;
+            let color_before = self.state.color;
 
             if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
                 if self.state.keyboard_modifiers.shift() {
@@ -1931,7 +1946,10 @@ where
                 }
             }
 
-            if matches!(status, event::Status::Captured)
+            // The HSV handlers assign the hue themselves, and deriving it back from RGB
+            // truncates, which can undo a hue step.
+            if self.state.color != color_before
+                && matches!(self.state.focus, Focus::Red | Focus::Green | Focus::Blue)
                 && !matches!(self.state.color, Color::BLACK | Color::WHITE)
             {
                 // Black (0x000000) and White (0xFFFFFF) colors don't have hue, so we keep it as it
@@ -2166,6 +2184,15 @@ where
             shell.request_redraw();
             return;
         }
+        // An operation can focus the input without going through the picker, and the bar
+        // shortcuts must not steal keys from it.
+        if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. }))
+            && self.state.focus != Focus::None
+            && self.is_hex_input_focused(self.hex_input_layout(), renderer)
+        {
+            self.state.focus = Focus::None;
+            shell.request_redraw();
+        }
 
         let color_before = self.state.color;
         if event::Status::Captured == self.on_event_keyboard(event) {
@@ -2223,19 +2250,7 @@ where
             &layout.bounds(),
         );
 
-        // Shell::merge would publish the input's messages, which are handled here instead,
-        // so everything else it recorded is forwarded by hand.
-        shell.request_redraw_at(fake_input_shell.redraw_request());
-        if fake_input_shell.is_event_captured() {
-            shell.capture_event();
-        }
-        shell.invalidate(fake_input_shell.invalidation());
-        shell
-            .input_method_mut()
-            .merge(fake_input_shell.input_method());
-        shell
-            .clipboard_mut()
-            .merge(fake_input_shell.clipboard_mut());
+        forward_effects(shell, &mut fake_input_shell);
         drop(fake_input_shell);
 
         let mut hex_edited = false;
@@ -2363,21 +2378,12 @@ where
             .nth(3)
             .expect("submit button")
             .for_widget(&self.tree.children[1]);
-        let on_cancel = self.on_cancel.clone();
-        let on_submit = (self.on_submit)(self.state.color);
         let [cancel_tree, submit_tree, ..] = &mut self.tree.children[..] else {
             unreachable!("the overlay tree has the button and hex input children");
         };
 
         // The geometry is already in window coordinates, so no translation is added.
-        let wrap = |on_press: Message| {
-            move |inner| {
-                overlay::Element::new(Box::new(PickerButtonOverlay {
-                    inner,
-                    on_press: on_press.clone(),
-                }))
-            }
-        };
+        let wrap = |inner| overlay::Element::new(Box::new(PickerButtonOverlay { inner }));
         let cancel = self
             .cancel_button
             .overlay(
@@ -2389,7 +2395,7 @@ where
                 self.window,
             )
             .into_iter()
-            .map(wrap(on_cancel));
+            .map(wrap);
         let submit = self
             .submit_button
             .overlay(
@@ -2401,7 +2407,7 @@ where
                 self.window,
             )
             .into_iter()
-            .map(wrap(on_submit));
+            .map(wrap);
         cancel.chain(submit).collect()
     }
 
@@ -5124,6 +5130,165 @@ mod tests {
             ui.cursor,
             &ui.renderer,
             &mut shell,
+        );
+    }
+
+    #[test]
+    fn collecting_nested_overlays_does_not_call_on_submit() {
+        let calls = Rc::new(Cell::new(0));
+        let count = Rc::clone(&calls);
+        let picker = color_picker(
+            true,
+            original(),
+            iced::widget::Space::new().width(80).height(30),
+            Message::Cancel,
+            move |color| {
+                count.set(count.get() + 1);
+                Message::Submit(color)
+            },
+        );
+        let mut ui = Harness::with_picker(picker);
+        let layout = ui.layout();
+        let mut overlays = ui.picker.overlay(
+            &mut ui.tree,
+            layout,
+            &ui.renderer,
+            &Rectangle::with_size(WINDOW),
+            Vector::ZERO,
+            WINDOW,
+        );
+        assert!(
+            overlays[0]
+                .as_overlay_mut()
+                .overlay(&ui.renderer)
+                .is_empty()
+        );
+        drop(overlays);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn hex_input_focused_by_an_operation_keeps_arrow_keys() {
+        struct FocusHex;
+
+        impl Operation for FocusHex {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                state.focus();
+            }
+        }
+
+        let mut ui = Harness::new(original());
+        ui.tree.state.downcast_mut::<State>().overlay_state.focus = Focus::Red;
+        let tree = &mut ui.tree.children[1].children[3];
+        ui.picker.hex_input.operate(
+            tree,
+            Layout::new(tree.size),
+            &Rectangle::with_size(WINDOW),
+            &ui.renderer,
+            &mut FocusHex,
+        );
+        assert!(hex_focused(&mut ui));
+
+        let _ = ui.press(keyboard::key::Named::ArrowLeft);
+        assert_eq!(ui.color(), original());
+        assert!(hex_focused(&mut ui));
+        assert_eq!(
+            ui.tree.state.downcast_ref::<State>().overlay_state.focus,
+            Focus::None
+        );
+    }
+
+    #[test]
+    fn hsv_key_steps_keep_the_assigned_hue() {
+        let hue = |ui: &Harness| {
+            ui.tree
+                .state
+                .downcast_ref::<State>()
+                .overlay_state
+                .current_hue_degrees
+        };
+        let mut ui = Harness::new(Color::from_rgb(0.5, 0.25, 0.25));
+        ui.tree.state.downcast_mut::<State>().overlay_state.focus = Focus::Hue;
+        for _ in 0..10 {
+            assert!(ui.press(keyboard::key::Named::ArrowRight).1);
+        }
+        assert_eq!(hue(&ui), 10);
+
+        ui.tree.state.downcast_mut::<State>().overlay_state.focus = Focus::SatValue;
+        for _ in 0..10 {
+            assert!(ui.press(keyboard::key::Named::ArrowLeft).1);
+        }
+        assert_eq!(hue(&ui), 10);
+    }
+
+    #[test]
+    fn closing_the_picker_ends_a_drag() {
+        let mut ui = Harness::new(original());
+        let sat_value = hsv_area_bounds(&ui)[0];
+        ui.cursor = Cursor::Available(sat_value.center());
+        let _ = ui.send(Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        )));
+        assert_eq!(
+            ui.press(keyboard::key::Named::Escape).0,
+            vec![Message::Cancel]
+        );
+
+        let mut closed = picker_with(original());
+        closed.show_picker = false;
+        ui.picker = closed;
+        ui.tree.diff(&mut ui.picker);
+        ui.relayout();
+        assert!(matches!(
+            ui.tree
+                .state
+                .downcast_ref::<State>()
+                .overlay_state
+                .color_bar_dragged,
+            ColorBarDragged::None
+        ));
+
+        // The release happens while hidden, so the overlay never sees it.
+        ui.cursor = Cursor::Available(Point::new(45.0, 35.0));
+        ui.rebuild(original());
+        assert_eq!(ui.color(), original());
+    }
+
+    #[test]
+    fn content_layout_requests_relayout_the_popup() {
+        let seen = Rc::new(Cell::new(false));
+        let captured = Rc::clone(&seen);
+        let picker = picker().submit_content(crate::hovered::hovered(move |hovered| {
+            captured.set(hovered);
+            iced::widget::Space::new()
+                .width(60)
+                .height(if hovered { 80 } else { 20 })
+        }));
+        let mut ui = Harness::with_picker(picker);
+        let submit = ui.control_bounds(3);
+        let content_tree = &ui.tree.children[1].children[1].children[0];
+        assert_eq!(content_tree.size.height, 20.0);
+        let content = Rectangle::new(
+            submit.position() + content_tree.translation,
+            content_tree.size,
+        );
+
+        let _ = ui.move_cursor(Cursor::Available(content.center()));
+        // The runtime answers the content's layout request with a layout pass.
+        ui.relayout();
+        ui.redraw();
+        assert!(seen.get());
+        assert_eq!(
+            ui.tree.children[1].children[1].children[0].size.height,
+            80.0
         );
     }
 }
