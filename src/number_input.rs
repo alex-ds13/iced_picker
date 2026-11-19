@@ -171,12 +171,18 @@ where
     }
 
     /// Sets the [`NumberInput`] max bound.
+    ///
+    /// The bounds must satisfy `min <= max`. With `min > max`, clamping and stepping
+    /// give unspecified (but safe) results.
     pub fn max(mut self, max: T) -> Self {
         self.max = max;
         self
     }
 
     /// Sets the [`NumberInput`] min bound.
+    ///
+    /// The bounds must satisfy `min <= max`. With `min > max`, clamping and stepping
+    /// give unspecified (but safe) results.
     pub fn min(mut self, min: T) -> Self {
         self.min = min;
         self
@@ -377,7 +383,8 @@ where
     }
 
     /// The value a single step up or down from `base` reaches, or `None` when the
-    /// widget is disabled or `base` already sits on the bound it would move towards.
+    /// widget is disabled, `base` already sits on the bound it would move towards or
+    /// the step would not change the value (a NaN `base`, or `min > max`).
     fn next_step(&self, base: &T, increment: bool) -> Option<T> {
         self.on_input.as_ref()?;
         let mut value = base.clone();
@@ -396,7 +403,7 @@ where
             value -= T::one();
         }
 
-        Some(self.clamp(value))
+        Some(self.clamp(value)).filter(|value| !is_same(value, base))
     }
 
     /// Publishes a single step up or down from [`Self::latest_value`] and shows it in
@@ -443,7 +450,7 @@ where
 
         let text = state.input.value();
         let value = self.clamp(parse_number(&text).unwrap_or_else(|| T::zero()));
-        let has_changed = value != self.latest_value(state);
+        let has_changed = !is_same(&value, &self.latest_value(state));
         let canonical = value.to_string();
 
         if text != canonical {
@@ -673,6 +680,9 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // The fork's row and column keep forwarding an event an earlier sibling
+        // captured, and the field must still see that outside press to lose focus.
+        let was_captured = shell.is_event_captured();
         let (increment_layout, decrement_layout) = self.button_layouts(tree, layout);
         let mut buttons_messages = shell::Bus::<ButtonMessage>::new();
         {
@@ -722,8 +732,8 @@ where
             shell.capture_event();
         }
 
-        if shell.is_event_captured() {
-            // if the buttons handled the event we can simply return
+        if shell.is_event_captured() && !was_captured {
+            // The step buttons handled the event.
             return;
         }
 
@@ -740,7 +750,7 @@ where
         let was_focused = state.was_focused;
 
         if let Some(on_input) = &self.on_input {
-            let stepped = self.wheel_step(state, event, layout, cursor, shell);
+            let stepped = !was_captured && self.wheel_step(state, event, layout, cursor, shell);
 
             if !stepped {
                 let previous_text = state.input.value();
@@ -1070,6 +1080,12 @@ impl<R: text::Renderer> State<R> {
             was_focused: false,
         }
     }
+}
+
+/// Equality that also holds between two NaN values, so a NaN is not republished.
+#[allow(clippy::eq_op)]
+fn is_same<T: PartialEq>(a: &T, b: &T) -> bool {
+    a == b || (a != a && b != b)
 }
 
 /// Parses the text an editing session can hold, including the partial states `""`,
@@ -1557,12 +1573,7 @@ mod tests {
 
     #[test]
     fn focus_loss_keeps_a_pending_step_over_typed_text() {
-        // The null renderer's editor keeps no text, which this test types into.
-        let renderer = smol::block_on(<iced::Renderer as renderer::Headless>::new(
-            renderer::Settings::default(),
-            Some("tiny-skia"),
-        ))
-        .expect("the software renderer should be available");
+        let renderer = headless_renderer();
         let mut input = NumberInput::<i32, i32, Theme, iced::Renderer>::new("Number", 5)
             .on_input(|value| value)
             .min(0)
@@ -1615,5 +1626,122 @@ mod tests {
         let state = tree.state.downcast_ref::<State<iced::Renderer>>();
         assert!(!state.input.is_focused());
         assert_eq!(state.input.value(), "8");
+    }
+
+    /// The null renderer's editor keeps no text, which typing tests need.
+    fn headless_renderer() -> iced::Renderer {
+        smol::block_on(<iced::Renderer as renderer::Headless>::new(
+            renderer::Settings::default(),
+            Some("tiny-skia"),
+        ))
+        .expect("the software renderer should be available")
+    }
+
+    #[test]
+    fn an_outside_press_captured_by_a_sibling_still_ends_editing() {
+        let renderer = headless_renderer();
+        let mut input = NumberInput::<f32, f32, Theme, iced::Renderer>::new("Number", 5.0)
+            .on_input(|value| value);
+        let mut tree = Tree::new(&input);
+        tree.diff(&mut input);
+        input.layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let state = tree.state.downcast_mut::<State<iced::Renderer>>();
+        state.input.focus();
+        state.input.select_all();
+        state.was_focused = true;
+
+        let layout = Layout::new(tree.size);
+        let over = mouse::Cursor::Available(layout.bounds().center());
+        let outside = mouse::Cursor::Available(Point::new(500.0, 500.0));
+        let typed = |text: &str| {
+            let key = keyboard::Key::Character(text.into());
+
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(text.into()),
+                repeat: false,
+            })
+        };
+        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        let mut bus = shell::Bus::new();
+        for (event, cursor, is_captured) in [
+            (typed("7"), outside, false),
+            (typed("."), outside, false),
+            // An earlier sibling captured these, as a button above the field would.
+            (wheel(1.0), over, true),
+            (click, outside, true),
+        ] {
+            let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+            if is_captured {
+                shell.capture_event();
+            }
+            input.update(
+                &mut tree,
+                &event,
+                layout,
+                cursor,
+                &renderer,
+                &mut shell,
+                &layout.bounds(),
+            );
+        }
+
+        // Each edit published 7 ("7", then "7."), and the focus loss collapsed "7."
+        // without republishing.
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), [7.0, 7.0]);
+        let state = tree.state.downcast_ref::<State<iced::Renderer>>();
+        assert!(!state.input.is_focused());
+        assert_eq!(state.input.value(), "7");
+    }
+
+    #[test]
+    fn steps_that_change_nothing_publish_nothing() {
+        let layout_and_wheel = |mut input: NumberInput<'static, f32, f32, Theme, ()>| {
+            let mut tree = Tree::new(&input);
+            tree.diff(&mut input);
+            input.layout(
+                &mut tree,
+                &(),
+                &Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+            );
+            let layout = Layout::new(tree.size);
+            let mut bus = shell::Bus::new();
+
+            for event in [wheel(1.0), wheel(-1.0)] {
+                let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+                input.update(
+                    &mut tree,
+                    &event,
+                    layout,
+                    mouse::Cursor::Available(layout.bounds().center()),
+                    &(),
+                    &mut shell,
+                    &layout.bounds(),
+                );
+            }
+
+            bus.len()
+        };
+
+        let nan = NumberInput::new("Number", f32::NAN).on_input(|value| value);
+        assert_eq!(layout_and_wheel(nan), 0);
+
+        let inverted = NumberInput::new("Number", 7.0)
+            .on_input(|value| value)
+            .min(10.0)
+            .max(5.0);
+        assert_eq!(layout_and_wheel(inverted), 0);
+
+        assert!(is_same(&f32::NAN, &f32::NAN));
+        assert!(!is_same(&f32::NAN, &1.0));
     }
 }
