@@ -400,6 +400,9 @@ impl<T: Display + Clone, R: text::Renderer> Internal<T, R> {
         self.filtered_options = search(options, &self.option_matchers, value)
             .cloned()
             .collect();
+        // The old index would point into a different list, so Enter could pick
+        // an option other than the first match.
+        self.hovered_option = Some(0);
     }
 }
 
@@ -518,9 +521,17 @@ where
         if state.version != self.state.version
             || state.editor.selection.as_deref() != Some(&self.selection)
         {
-            state.editor.input.overwrite(&self.selection);
+            // While focused the text is the user's search draft. Losing focus
+            // restores the selection.
+            if state.editor.input.is_focused() {
+                let value = state.editor.input.value();
+                state.filter(&self.state.options, &value);
+            } else {
+                state.editor.input.overwrite(&self.selection);
+                state.filter(&self.state.options, &self.selection);
+            }
+
             state.editor.selection = Some(self.selection.clone());
-            state.filter(&self.state.options, &self.selection);
             state.version = self.state.version;
         }
     }
@@ -934,6 +945,121 @@ mod tests {
 
     fn internal(tree: &widget::Tree) -> &Internal<&'static str, Renderer> {
         tree.state.downcast_ref()
+    }
+
+    fn press(key: keyboard::Key, text: Option<&str>) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: text.map(Into::into),
+            repeat: false,
+        })
+    }
+
+    fn type_text(
+        combo: &mut ComboBox<'_, &'static str, Message, Theme>,
+        tree: &mut widget::Tree,
+        renderer: &Renderer,
+        text: &str,
+    ) -> Vec<Message> {
+        text.chars()
+            .flat_map(|c| {
+                let c = c.to_string();
+                let event = press(keyboard::Key::Character(c.as_str().into()), Some(&c));
+
+                update(combo, tree, renderer, &event, mouse::Cursor::Unavailable)
+            })
+            .collect()
+    }
+
+    fn click_inside(
+        combo: &mut ComboBox<'_, &'static str, Message, Theme>,
+        tree: &mut widget::Tree,
+        renderer: &Renderer,
+    ) {
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let inside = mouse::Cursor::Available(Point::new(5.0, 5.0));
+        let _ = update(combo, tree, renderer, &press, inside);
+        assert!(internal(tree).editor.input.is_focused());
+    }
+
+    #[test]
+    fn new_options_while_typing_keep_the_draft() {
+        let renderer = renderer();
+        let mut options = State::new(vec!["Apple", "Orange", "Grape"]);
+        let mut combo = combo(&options);
+        let mut tree = mount(&mut combo, &renderer);
+
+        click_inside(&mut combo, &mut tree, &renderer);
+        let _ = type_text(&mut combo, &mut tree, &renderer, "or");
+        assert_eq!(internal(&tree).filtered_options, ["Orange"]);
+        drop(combo);
+
+        options.push("Orchid");
+        let mut combo = self::combo(&options);
+        tree.diff::<Message, Theme, Renderer>(&mut combo);
+
+        assert_eq!(internal(&tree).editor.input.value(), "or");
+        assert_eq!(internal(&tree).filtered_options, ["Orange", "Orchid"]);
+    }
+
+    #[test]
+    fn selection_change_while_typing_keeps_the_draft() {
+        let renderer = renderer();
+        let options = State::new(vec!["Apple", "Orange"]);
+        let mut combo = combo(&options);
+        let mut tree = mount(&mut combo, &renderer);
+
+        click_inside(&mut combo, &mut tree, &renderer);
+        let _ = type_text(&mut combo, &mut tree, &renderer, "o");
+
+        // The application clears its selection on input.
+        let mut combo = ComboBox::new(&options, "", None, Message::Selected).id(ID);
+        tree.diff::<Message, Theme, Renderer>(&mut combo);
+        assert_eq!(internal(&tree).editor.input.value(), "o");
+        assert_eq!(internal(&tree).filtered_options, ["Orange"]);
+
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let outside = mouse::Cursor::Available(Point::new(500.0, 500.0));
+        let _ = update(&mut combo, &mut tree, &renderer, &press, outside);
+        assert_eq!(internal(&tree).editor.input.value(), "");
+    }
+
+    #[test]
+    fn enter_after_narrowing_selects_the_first_match() {
+        let renderer = renderer();
+        let options = State::new(vec!["Apple", "Banana", "Cherry"]);
+        let mut combo = ComboBox::new(&options, "", None, Message::Selected).id(ID);
+        let mut tree = mount(&mut combo, &renderer);
+
+        click_inside(&mut combo, &mut tree, &renderer);
+        let down = press(keyboard::Key::Named(key::Named::ArrowDown), None);
+        for _ in 0..2 {
+            let _ = update(
+                &mut combo,
+                &mut tree,
+                &renderer,
+                &down,
+                mouse::Cursor::Unavailable,
+            );
+        }
+        assert_eq!(internal(&tree).hovered_option, Some(2));
+
+        let _ = type_text(&mut combo, &mut tree, &renderer, "a");
+        assert_eq!(internal(&tree).filtered_options, ["Apple", "Banana"]);
+
+        let enter = press(keyboard::Key::Named(key::Named::Enter), None);
+        let messages = update(
+            &mut combo,
+            &mut tree,
+            &renderer,
+            &enter,
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(messages, [Message::Selected("Apple")]);
     }
 
     #[test]
