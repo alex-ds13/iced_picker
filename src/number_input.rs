@@ -362,11 +362,24 @@ where
         }
     }
 
-    /// Builds the message for a single step up or down, or `None` when the widget is
-    /// disabled or the value already sits on the bound it would move towards.
-    fn step(&self, increment: bool) -> Option<Message> {
-        let on_input = self.on_input.as_ref()?;
-        let mut value = self.value.clone();
+    /// The value a step starts from: the last value this widget published while the
+    /// application has not processed it yet, so steps queued in one batch accumulate.
+    /// Once processed, `self.value` wins, including when the application altered or
+    /// rejected the published value.
+    fn step_base(&self, state: &State<Renderer>) -> T {
+        state
+            .transaction
+            .as_ref()
+            .filter(|transaction| !transaction.tracking.is_processed())
+            .and_then(|transaction| transaction.value.parse().ok())
+            .unwrap_or_else(|| self.value.clone())
+    }
+
+    /// The value a single step up or down from `base` reaches, or `None` when the
+    /// widget is disabled or `base` already sits on the bound it would move towards.
+    fn next_step(&self, base: &T, increment: bool) -> Option<T> {
+        self.on_input.as_ref()?;
+        let mut value = base.clone();
 
         if increment {
             if value >= self.max {
@@ -382,7 +395,26 @@ where
             value -= T::one();
         }
 
-        Some(on_input(self.clamp(value)))
+        Some(self.clamp(value))
+    }
+
+    /// Publishes a single step up or down from [`Self::step_base`], returning whether
+    /// a message was published.
+    fn step(
+        &self,
+        state: &mut State<Renderer>,
+        shell: &mut Shell<'_, Message>,
+        increment: bool,
+    ) -> bool {
+        let Some(on_input) = &self.on_input else {
+            return false;
+        };
+        let Some(value) = self.next_step(&self.step_base(state), increment) else {
+            return false;
+        };
+
+        publish_value(state, shell, on_input(value.clone()), &value);
+        true
     }
 
     /// The layouts of the increment and decrement buttons.
@@ -415,7 +447,7 @@ where
         }
 
         if has_changed {
-            state.transaction = Some(shell.publish_and_track(on_input(value)));
+            publish_value(state, shell, on_input(value.clone()), &value);
         }
     }
 }
@@ -464,7 +496,7 @@ where
         if state
             .transaction
             .as_ref()
-            .is_none_or(shell::Tracking::is_processed)
+            .is_none_or(|transaction| transaction.tracking.is_processed())
         {
             let text = state.input.value();
             let canonical = self.value.to_string();
@@ -675,10 +707,11 @@ where
             }
         }
 
-        for (message, receipt) in buttons_messages.drain() {
-            if let Some(message) = self.step(matches!(message, ButtonMessage::Increment)) {
-                shell.forward(message, receipt);
-            }
+        // The step is published with its own tracking (instead of forwarding the
+        // button's receipt) so later steps in the same batch can build on it.
+        for (message, _receipt) in buttons_messages.drain() {
+            let state = tree.state.downcast_mut::<State<Renderer>>();
+            let _ = self.step(state, shell, matches!(message, ButtonMessage::Increment));
 
             shell.request_redraw();
             shell.capture_event();
@@ -702,36 +735,73 @@ where
         let was_focused = state.was_focused;
 
         if let Some(on_input) = &self.on_input {
-            let stepped = self.wheel_step(event, layout, cursor, shell);
+            let stepped = self.wheel_step(state, event, layout, cursor, shell);
 
             if !stepped {
                 let previous_text = state.input.value();
                 let had_focus = state.input.is_focused();
+                let step_base = self.step_base(state);
 
-                let edit = state
-                    .input
-                    .update(event, input_bounds, cursor, shell, |key_press| {
+                // Key bindings go through a local shell so steps can be published
+                // with tracking, which `Input` does not give for custom bindings.
+                let mut input_actions = shell::Bus::<InputAction>::new();
+                let mut input_shell = shell.local(&mut input_actions);
+                let edit = state.input.update(
+                    event,
+                    input_bounds,
+                    cursor,
+                    &mut input_shell,
+                    |key_press| {
                         if key_press.is_focused {
+                            let step = |increment| {
+                                self.next_step(&step_base, increment).map(|_| {
+                                    text::editor::Binding::Custom(InputAction::Step(increment))
+                                })
+                            };
+
                             match key_press.modified_key.as_ref() {
-                                keyboard::Key::Named(key::Named::Enter) => {
-                                    if let Some(on_submit) = &self.on_submit {
-                                        return Some(text::editor::Binding::Custom(
-                                            on_submit.clone(),
-                                        ));
-                                    }
+                                keyboard::Key::Named(key::Named::Enter)
+                                    if self.on_submit.is_some() =>
+                                {
+                                    return Some(text::editor::Binding::Custom(
+                                        InputAction::Submit,
+                                    ));
                                 }
                                 keyboard::Key::Named(key::Named::ArrowUp) => {
-                                    return self.step(true).map(text::editor::Binding::Custom);
+                                    return step(true);
                                 }
                                 keyboard::Key::Named(key::Named::ArrowDown) => {
-                                    return self.step(false).map(text::editor::Binding::Custom);
+                                    return step(false);
                                 }
                                 _ => {}
                             }
                         }
 
                         text::editor::Binding::from_key_press(key_press)
-                    });
+                    },
+                );
+
+                shell.invalidate(input_shell.invalidation());
+                shell.request_redraw_at(input_shell.redraw_request());
+                shell.request_input_method(input_shell.input_method());
+                shell.clipboard_mut().merge(input_shell.clipboard_mut());
+                if input_shell.is_event_captured() {
+                    shell.capture_event();
+                }
+                drop(input_shell);
+
+                for (action, _receipt) in input_actions.drain() {
+                    match action {
+                        InputAction::Submit => {
+                            if let Some(on_submit) = &self.on_submit {
+                                shell.publish(on_submit.clone());
+                            }
+                        }
+                        InputAction::Step(increment) => {
+                            let _ = self.step(state, shell, increment);
+                        }
+                    }
+                }
 
                 // The click that brings focus to the field selects the whole value, so
                 // typing replaces it.
@@ -751,7 +821,7 @@ where
                             _ => on_input,
                         };
 
-                        state.transaction = Some(shell.publish_and_track(on_edit(value)));
+                        publish_value(state, shell, on_edit(value.clone()), &value);
                     } else {
                         // `Input` applies the edit before handing it over, so a result
                         // that is not a number is undone by restoring the old text.
@@ -917,6 +987,7 @@ where
     /// the event was consumed.
     fn wheel_step(
         &self,
+        state: &mut State<Renderer>,
         event: &Event,
         layout: Layout,
         cursor: mouse::Cursor,
@@ -938,8 +1009,7 @@ where
             return false;
         }
 
-        if let Some(message) = self.step(y > 0.0) {
-            shell.publish(message);
+        if self.step(state, shell, y > 0.0) {
             shell.request_redraw();
         }
 
@@ -977,7 +1047,8 @@ pub enum Side {
 struct State<R: text::Renderer> {
     input: text::Input<R>,
     icon: paragraph::Plain<R::Paragraph>,
-    transaction: Option<shell::Tracking>,
+    /// The last value published by the widget.
+    transaction: Option<Transaction>,
     /// Mirrors `input.is_focused()` as of the previous `update()` call, so focus
     /// revoked by an operation between frames can be told apart from focus that is
     /// still held.
@@ -1215,6 +1286,33 @@ enum ButtonMessage {
     Decrement,
 }
 
+/// A key binding of the text input that the widget handles itself.
+#[derive(Debug, Clone)]
+enum InputAction {
+    Submit,
+    Step(bool),
+}
+
+/// A value published by a [`NumberInput`] and the tracking of its message.
+struct Transaction {
+    tracking: shell::Tracking,
+    /// `T` itself cannot live in the widget state (it is not `'static`), so the
+    /// value is kept in its `Display` form, which `FromStr` parses back.
+    value: String,
+}
+
+fn publish_value<Message, R: text::Renderer>(
+    state: &mut State<R>,
+    shell: &mut Shell<'_, Message>,
+    message: Message,
+    value: &impl Display,
+) {
+    state.transaction = Some(Transaction {
+        tracking: shell.publish_and_track(message),
+        value: value.to_string(),
+    });
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -1346,5 +1444,109 @@ mod tests {
         assert_eq!(tree.children.len(), 3);
         assert_eq!(tree.children[1].translation, Vector::new(11.0, 12.0));
         assert_eq!(tree.children[2].translation, Vector::new(13.0, 14.0));
+    }
+
+    fn stepper(value: i32) -> NumberInput<'static, i32, i32, Theme, ()> {
+        NumberInput::new("Number", value)
+            .on_input(|value| value)
+            .min(0)
+            .max(7)
+    }
+
+    /// Lays out `input` against `tree` and sends each event of one batch, as the
+    /// runtime does before the application processes any message.
+    fn send_batch(
+        input: &mut NumberInput<'static, i32, i32, Theme, ()>,
+        tree: &mut Tree,
+        events: &[Event],
+    ) -> Vec<i32> {
+        tree.diff(&mut *input);
+        input.layout(tree, &(), &Limits::new(Size::ZERO, Size::new(300.0, 100.0)));
+        let layout = Layout::new(tree.size);
+        let cursor = mouse::Cursor::Available(layout.bounds().center());
+        let mut bus = shell::Bus::new();
+
+        for event in events {
+            let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+            input.update(
+                tree,
+                event,
+                layout,
+                cursor,
+                &(),
+                &mut shell,
+                &layout.bounds(),
+            );
+        }
+
+        // Draining drops the receipts, which marks the messages as processed.
+        bus.into_iter().collect()
+    }
+
+    fn wheel(y: f32) -> Event {
+        Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y },
+        })
+    }
+
+    fn key(named: key::Named) -> Event {
+        let key = keyboard::Key::Named(named);
+
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn wheel_steps_in_one_batch_accumulate_until_processed() {
+        let mut input = stepper(5);
+        let mut tree = Tree::new(&input);
+
+        // The third step stops at the upper bound reached by the pending value.
+        assert_eq!(
+            send_batch(&mut input, &mut tree, &[wheel(1.0), wheel(1.0), wheel(1.0)]),
+            [6, 7]
+        );
+
+        // The application ignored the steps (`input` still holds 5): its value wins
+        // once the messages are processed.
+        assert_eq!(send_batch(&mut input, &mut tree, &[wheel(-1.0)]), [4]);
+
+        // The application altered the value.
+        let mut input = stepper(1);
+        assert_eq!(
+            send_batch(&mut input, &mut tree, &[wheel(-1.0), wheel(-1.0)]),
+            [0]
+        );
+    }
+
+    #[test]
+    fn keyboard_steps_in_one_batch_accumulate() {
+        let mut input = stepper(2);
+        let mut tree = Tree::new(&input);
+        tree.diff(&mut input);
+        let state = tree.state.downcast_mut::<State<()>>();
+        state.input.focus();
+        state.was_focused = true;
+
+        let up = key(key::Named::ArrowUp);
+        let down = key(key::Named::ArrowDown);
+        assert_eq!(
+            send_batch(&mut input, &mut tree, &[up.clone(), up, wheel(1.0), down]),
+            [3, 4, 5, 4]
+        );
+        assert!(tree.state.downcast_ref::<State<()>>().input.is_focused());
+
+        let mut input = stepper(2).on_submit(99);
+        assert_eq!(
+            send_batch(&mut input, &mut tree, &[key(key::Named::Enter)]),
+            [99]
+        );
     }
 }
