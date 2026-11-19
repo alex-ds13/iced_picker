@@ -362,11 +362,12 @@ where
         }
     }
 
-    /// The value a step starts from: the last value this widget published while the
-    /// application has not processed it yet, so steps queued in one batch accumulate.
-    /// Once processed, `self.value` wins, including when the application altered or
-    /// rejected the published value.
-    fn step_base(&self, state: &State<Renderer>) -> T {
+    /// The last value this widget published while the application has not processed
+    /// it yet, otherwise `self.value`. Steps start from it, so steps queued in one
+    /// batch accumulate, and focus loss compares with it. Once processed,
+    /// `self.value` wins, including when the application altered or rejected the
+    /// published value.
+    fn latest_value(&self, state: &State<Renderer>) -> T {
         state
             .transaction
             .as_ref()
@@ -398,8 +399,8 @@ where
         Some(self.clamp(value))
     }
 
-    /// Publishes a single step up or down from [`Self::step_base`], returning whether
-    /// a message was published.
+    /// Publishes a single step up or down from [`Self::latest_value`] and shows it in
+    /// the editor, returning whether a message was published.
     fn step(
         &self,
         state: &mut State<Renderer>,
@@ -409,11 +410,15 @@ where
         let Some(on_input) = &self.on_input else {
             return false;
         };
-        let Some(value) = self.next_step(&self.step_base(state), increment) else {
+        let Some(value) = self.next_step(&self.latest_value(state), increment) else {
             return false;
         };
 
         publish_value(state, shell, on_input(value.clone()), &value);
+        // Focus loss parses the editor text, so it must not keep a value the step
+        // already replaced.
+        state.input.overwrite(&value.to_string());
+        shell.request_redraw();
         true
     }
 
@@ -438,7 +443,7 @@ where
 
         let text = state.input.value();
         let value = self.clamp(parse_number(&text).unwrap_or_else(|| T::zero()));
-        let has_changed = value != self.value;
+        let has_changed = value != self.latest_value(state);
         let canonical = value.to_string();
 
         if text != canonical {
@@ -740,7 +745,7 @@ where
             if !stepped {
                 let previous_text = state.input.value();
                 let had_focus = state.input.is_focused();
-                let step_base = self.step_base(state);
+                let step_base = self.latest_value(state);
 
                 // Key bindings go through a local shell so steps can be published
                 // with tracking, which `Input` does not give for custom bindings.
@@ -1548,5 +1553,67 @@ mod tests {
             send_batch(&mut input, &mut tree, &[key(key::Named::Enter)]),
             [99]
         );
+    }
+
+    #[test]
+    fn focus_loss_keeps_a_pending_step_over_typed_text() {
+        // The null renderer's editor keeps no text, which this test types into.
+        let renderer = smol::block_on(<iced::Renderer as renderer::Headless>::new(
+            renderer::Settings::default(),
+            Some("tiny-skia"),
+        ))
+        .expect("the software renderer should be available");
+        let mut input = NumberInput::<i32, i32, Theme, iced::Renderer>::new("Number", 5)
+            .on_input(|value| value)
+            .min(0)
+            .max(9);
+        let mut tree = Tree::new(&input);
+        tree.diff(&mut input);
+        input.layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let state = tree.state.downcast_mut::<State<iced::Renderer>>();
+        state.input.focus();
+        state.input.select_all();
+        state.was_focused = true;
+
+        let seven = keyboard::Key::Character("7".into());
+        let typing = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: seven.clone(),
+            modified_key: seven,
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("7".into()),
+            repeat: false,
+        });
+        let click = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let outside = mouse::Cursor::Available(Point::new(500.0, 500.0));
+
+        let layout = Layout::new(tree.size);
+        let mut bus = shell::Bus::new();
+        for (event, cursor) in [
+            (typing, mouse::Cursor::Unavailable),
+            (key(key::Named::ArrowUp), mouse::Cursor::Unavailable),
+            (click, outside),
+        ] {
+            let mut shell = Shell::new(&window::Headless, shell::Waker::noop(), &mut bus);
+            input.update(
+                &mut tree,
+                &event,
+                layout,
+                cursor,
+                &renderer,
+                &mut shell,
+                &layout.bounds(),
+            );
+        }
+
+        assert_eq!(bus.into_iter().collect::<Vec<_>>(), [7, 8]);
+        let state = tree.state.downcast_ref::<State<iced::Renderer>>();
+        assert!(!state.input.is_focused());
+        assert_eq!(state.input.value(), "8");
     }
 }
