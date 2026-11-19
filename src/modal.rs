@@ -1,5 +1,5 @@
-use crate::opaque_maybe::inert_maybe;
-use iced::widget::{center, container, mouse_area, opaque, stack};
+use crate::opaque_maybe::{barrier, inert_maybe};
+use iced::widget::{center, container, mouse_area, stack};
 use iced::{Border, Color, Theme, Widget};
 
 pub fn modal<'a, Message>(
@@ -13,7 +13,9 @@ where
     stack![inert_maybe(base, content.is_some())].push(
         content
             .map(|content| {
-                mouse_area(center(opaque(content)).style(|_theme| {
+                // A barrier rather than `opaque`: a finger press on static dialog
+                // content must not reach the backdrop and close the dialog.
+                mouse_area(center(barrier(content)).style(|_theme| {
                     container::Style {
                         background: Some(
                             Color {
@@ -81,13 +83,18 @@ pub fn red(theme: &Theme) -> container::Style {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use iced::advanced::clipboard;
     use iced::advanced::layout::Limits;
     use iced::advanced::renderer::{self, Headless as _};
     use iced::advanced::shell::{Bus, Waker};
     use iced::advanced::widget::{Tree, operation};
     use iced::advanced::{InputMethod, Layout, Shell, Widget as _};
     use iced::widget::{Space, text_input};
-    use iced::{Event, Point, Rectangle, Renderer, Size, Vector, keyboard, mouse, window};
+    use iced::{
+        Event, Fill, Point, Rectangle, Renderer, Size, Vector, keyboard, mouse, touch, window,
+    };
 
     const WINDOW: Size = Size::new(900.0, 700.0);
 
@@ -250,5 +257,64 @@ mod tests {
                 assert!(matches!(input_method, InputMethod::Enabled { .. }));
             }
         }
+    }
+
+    #[test]
+    fn dialog_content_captures_mouse_and_finger_presses() {
+        let renderer = renderer();
+        let mut root = modal(Space::new().width(Fill).height(Fill), dialog(true), 9);
+        let mut tree = Tree::new(&root);
+        let layout = lay_out(&mut root, &mut tree, &renderer);
+
+        for (position, expected) in [(layout.bounds().center(), &[][..]), (Point::ORIGIN, &[9])] {
+            let cursor = mouse::Cursor::Available(position);
+            let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+            let finger = Event::Touch(touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position,
+            });
+
+            for event in [press, finger] {
+                let (messages, _) = send(&mut root, &mut tree, layout, &renderer, event, cursor);
+                assert_eq!(messages, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn dialog_keeps_clipboard_reads_from_focused_background() {
+        let renderer = renderer();
+        let input = || text_input("", "").id("base").on_input(|_| 1);
+        let paste = Event::Clipboard(clipboard::Event::Read(Ok(Arc::new(
+            clipboard::Content::Text("synthetic".into()),
+        ))));
+
+        let mut root = modal(input(), dialog(false), 2);
+        let mut tree = Tree::new(&root);
+        let layout = lay_out(&mut root, &mut tree, &renderer);
+        root.operate(
+            &mut tree,
+            layout,
+            &Rectangle::with_size(WINDOW),
+            &renderer,
+            &mut operation::focusable::focus(iced::widget::Id::new("base")),
+        );
+        let cursor = mouse::Cursor::Unavailable;
+        let (messages, _) = send(
+            &mut root,
+            &mut tree,
+            layout,
+            &renderer,
+            paste.clone(),
+            cursor,
+        );
+        assert_eq!(messages, [1]);
+        drop(root);
+
+        // A read requested before the dialog opened resolves while it is shown.
+        let mut root = modal(input(), dialog(true), 2);
+        let layout = lay_out(&mut root, &mut tree, &renderer);
+        let (messages, _) = send(&mut root, &mut tree, layout, &renderer, paste, cursor);
+        assert!(messages.is_empty());
     }
 }

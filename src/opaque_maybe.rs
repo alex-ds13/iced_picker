@@ -3,6 +3,7 @@ use iced_core as core;
 use core::layout::{self, Layout};
 use core::mouse;
 use core::renderer;
+use core::touch;
 use core::widget::tree::{self, Tree};
 use core::{Element, Event, Length, Rectangle, Shell, Size, Widget, widget::operation};
 
@@ -26,17 +27,23 @@ where
 {
     Opaque {
         content: content.boxed(),
-        opaque,
-        inert: false,
+        mode: if opaque {
+            Mode::Opaque
+        } else {
+            Mode::Transparent
+        },
     }
 }
 
 /// Like [`opaque_maybe`], but an opaque layer is also inert, as the background of a
-/// modal dialog should be: keyboard and input method events are not forwarded to it,
-/// its input method requests are dropped and its overlays are hidden.
+/// modal dialog should be: keyboard, input method and clipboard events are not
+/// forwarded to it, its input method requests are dropped and its overlays are hidden.
 ///
-/// Window, clipboard and other events still reach it, so animations and layout
-/// stay current. Operations (focus traversal included) are still forwarded.
+/// Clipboard events are dropped because a focused text input applies a clipboard read
+/// result as a paste, even for a read it requested before the layer turned inert.
+///
+/// Window and other events still reach it, so animations and layout stay current.
+/// Operations (focus traversal included) are still forwarded.
 pub(crate) fn inert_maybe<'a, Message, Theme, Renderer>(
     content: impl Widget<Message, Theme, Renderer> + 'a,
     inert: bool,
@@ -48,16 +55,46 @@ where
 {
     Opaque {
         content: content.boxed(),
-        opaque: inert,
-        inert,
+        mode: if inert {
+            Mode::Inert
+        } else {
+            Mode::Transparent
+        },
     }
+}
+
+/// Wraps the given widget, which keeps working normally, and captures the mouse
+/// button and finger presses inside its bounds, so they do not reach the layers below.
+///
+/// Unlike iced's `opaque`, finger presses are captured too.
+pub(crate) fn barrier<'a, Message, Theme, Renderer>(
+    content: impl Widget<Message, Theme, Renderer> + 'a,
+) -> impl Widget<Message, Theme, Renderer> + 'a
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: core::Renderer + 'a,
+{
+    Opaque {
+        content: content.boxed(),
+        mode: Mode::Barrier,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Transparent,
+    /// Mouse events over the layer are captured and the content never sees the cursor.
+    Opaque,
+    /// [`Mode::Opaque`], and isolated from keyboard, input method and clipboard input.
+    Inert,
+    /// The content sees every event, and presses inside it are captured afterwards.
+    Barrier,
 }
 
 struct Opaque<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
-    opaque: bool,
-    /// Only meaningful together with `opaque`.
-    inert: bool,
+    mode: Mode,
 }
 
 impl<Message, Theme, Renderer> core::widget::Meta for Opaque<'_, Message, Theme, Renderer> {}
@@ -123,23 +160,49 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let is_mouse_event = matches!(event, core::Event::Mouse(_));
+        let bounds = layout.bounds();
 
-        let mut cursor = cursor;
-        if self.opaque {
-            if is_mouse_event && cursor.is_over(layout.bounds()) {
-                shell.capture_event();
+        match self.mode {
+            Mode::Transparent => {
+                self.content
+                    .update(state, event, layout, cursor, renderer, shell, viewport);
+                return;
             }
-            cursor = cursor.levitate();
+            Mode::Barrier => {
+                self.content
+                    .update(state, event, layout, cursor, renderer, shell, viewport);
+
+                let is_press_inside = match event {
+                    Event::Mouse(mouse::Event::ButtonPressed(_)) => cursor.is_over(bounds),
+                    Event::Touch(touch::Event::FingerPressed { position, .. }) => {
+                        cursor.is_over(bounds) || bounds.contains(*position)
+                    }
+                    _ => false,
+                };
+
+                if is_press_inside {
+                    shell.capture_event();
+                }
+                return;
+            }
+            Mode::Opaque | Mode::Inert => {}
         }
 
-        if !(self.opaque && self.inert) {
+        if matches!(event, Event::Mouse(_)) && cursor.is_over(bounds) {
+            shell.capture_event();
+        }
+        let cursor = cursor.levitate();
+
+        if self.mode == Mode::Opaque {
             self.content
                 .update(state, event, layout, cursor, renderer, shell, viewport);
             return;
         }
 
-        if matches!(event, Event::Keyboard(_) | Event::InputMethod(_)) {
+        if matches!(
+            event,
+            Event::Keyboard(_) | Event::InputMethod(_) | Event::Clipboard(_)
+        ) {
             return;
         }
 
@@ -159,11 +222,11 @@ where
         viewport: &core::Rectangle,
         renderer: &Renderer,
     ) -> core::mouse::Interaction {
-        if self.opaque {
-            mouse::Interaction::Idle
-        } else {
-            self.content
-                .mouse_interaction(state, layout, cursor, viewport, renderer)
+        match self.mode {
+            Mode::Opaque | Mode::Inert => mouse::Interaction::Idle,
+            Mode::Transparent | Mode::Barrier => self
+                .content
+                .mouse_interaction(state, layout, cursor, viewport, renderer),
         }
     }
 
@@ -176,7 +239,7 @@ where
         translation: core::Vector,
         window: Size,
     ) -> Vec<core::overlay::Element<'b, Message, Theme, Renderer>> {
-        if self.opaque && self.inert {
+        if self.mode == Mode::Inert {
             return Vec::new();
         }
 
