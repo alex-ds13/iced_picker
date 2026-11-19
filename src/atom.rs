@@ -77,11 +77,15 @@ where
     Renderer: core::Renderer,
 {
     /// Creates a new [`Atom`] widget that encapsulates a [`Component`]
+    ///
+    /// The [`Atom`] fits its content by default. Parents only see the [`Atom`]'s own
+    /// width and height (the view is built during layout), so a content that should
+    /// fill or share space needs the matching [`Length`] on the [`Atom`] too.
     pub fn new(component: T) -> Self {
         Self {
             component: RefCell::new(component),
-            width: Length::Shrink,
-            height: Length::Shrink,
+            width: Length::Fit,
+            height: Length::Fit,
             content: space().boxed(),
         }
     }
@@ -127,7 +131,12 @@ where
     }
 
     fn size(&self) -> Size<Length> {
-        self.content.size()
+        // `content` is only built in `layout`, so before the first layout it is a
+        // placeholder whose sizing says nothing about the component.
+        Size {
+            width: self.width,
+            height: self.height,
+        }
     }
 
     fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
@@ -137,8 +146,9 @@ where
 
         tree.diff_children(std::slice::from_mut(&mut self.content));
 
+        let limits = limits.width(self.width).height(self.height);
         let content = &mut tree.children[0];
-        self.content.layout(content, renderer, limits);
+        self.content.layout(content, renderer, &limits);
         content.translation = Vector::ZERO;
 
         tree.size = limits.resolve(self.width, self.height, content.size);
@@ -385,4 +395,61 @@ where
     Renderer: core::Renderer + 'a,
 {
     Atom::new(component)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iced::widget::{Row, Space};
+
+    struct Demo(Length);
+
+    impl Component<'static, (), iced::Theme, ()> for Demo {
+        type State = ();
+        type Event = ();
+
+        fn update(&mut self, _state: &mut (), _event: ()) -> Option<()> {
+            None
+        }
+
+        fn view(&self, _state: &()) -> impl iced::Widget<(), iced::Theme, ()> + 'static {
+            Space::new().width(self.0).height(10)
+        }
+    }
+
+    fn layout_row(row: &mut Row<Element<'static, (), iced::Theme, ()>>) -> Tree {
+        let mut tree = Tree::new(&*row);
+        tree.diff(&mut *row);
+        row.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(500.0, 100.0)),
+        );
+        tree
+    }
+
+    #[test]
+    fn fill_atoms_share_the_row_and_constrain_their_content() {
+        let mut row = Row::new()
+            .push(Atom::new(Demo(Length::Fill)).width(Length::Fill).boxed())
+            .push(Atom::new(Demo(Length::Fill)).width(Length::Fill).boxed());
+        let tree = layout_row(&mut row);
+
+        for atom in &tree.children {
+            assert_eq!(atom.size.width, 250.0);
+            assert_eq!(atom.children[0].size.width, 250.0);
+        }
+    }
+
+    #[test]
+    fn default_atom_fits_its_content() {
+        let mut row = Row::new()
+            .push(Atom::new(Demo(Length::Fixed(10.0))).boxed())
+            .push(Space::new().width(Length::Fill).boxed());
+        let tree = layout_row(&mut row);
+
+        assert_eq!(tree.children[0].size, Size::new(10.0, 10.0));
+        assert_eq!(tree.children[1].size.width, 490.0);
+    }
 }
