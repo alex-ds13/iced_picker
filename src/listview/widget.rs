@@ -64,6 +64,7 @@ where
     pub(super) on_select: Option<Box<dyn Fn(Action<K>) -> Message + 'a>>,
     pub(super) multiple: bool,
     pub(super) on_activate: Option<Box<dyn Fn(K) -> Message + 'a>>,
+    pub(super) on_drift: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     pub(super) class: Theme::Class<'a>,
     /// The widgets of the window, aligned with the tree's children. Built in `diff`
     /// and extended by the walk in `layout`.
@@ -100,6 +101,7 @@ where
         on_select: None,
         multiple: false,
         on_activate: None,
+        on_drift: None,
         class: Theme::default(),
         rows: Vec::new(),
         _widget: PhantomData,
@@ -148,6 +150,7 @@ where
             on_select: None,
             multiple: self.multiple,
             on_activate: None,
+            on_drift: self.on_drift,
             class: self.class,
             rows: Vec::new(),
             _widget: PhantomData,
@@ -322,6 +325,21 @@ where
     /// on Enter. Only a selectable list handles them.
     pub fn on_activate(mut self, on_activate: impl Fn(K) -> Message + 'a) -> Self {
         self.on_activate = Some(Box::new(on_activate));
+        self
+    }
+
+    /// Emits the list's drift on the first event the list gets and whenever it
+    /// changes, even when the scroller's offset does not.
+    ///
+    /// Drift is the spacer the list keeps above its first item to hold the visible
+    /// items still (see the module's contracts). It is part of the list's height, so
+    /// the scroller's offset includes it, but a new list has none. To restore a view
+    /// in a list that is built again from scratch, save the scroller's absolute
+    /// offset minus the drift, and scroll there once the new list is shown. With
+    /// exact heights (see [`Self::estimated_height_with`]) the new list then shows
+    /// the same items at the same place.
+    pub fn on_drift(mut self, on_drift: impl Fn(f32) -> Message + 'a) -> Self {
+        self.on_drift = Some(Box::new(on_drift));
         self
     }
 
@@ -578,6 +596,18 @@ where
             )
         {
             tree.state.downcast_mut::<Core<K>>().geometry.full(now);
+        }
+
+        // Last, so a change by the redraw's own walk is included. A change made by a
+        // layout is published on the next event, the redraw after a rebuild.
+        if let Some(on_drift) = &self.on_drift {
+            let core = tree.state.downcast_mut::<Core<K>>();
+            let drift = core.geometry.drift() as f32;
+
+            if core.published_drift != Some(drift) {
+                core.published_drift = Some(drift);
+                shell.publish(on_drift(drift));
+            }
         }
 
         // Compared with what the last draw showed, not with the last cursor event:

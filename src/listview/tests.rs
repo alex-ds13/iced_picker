@@ -141,6 +141,8 @@ struct Log {
     actions: RefCell<Vec<Action<u32>>>,
     /// The keys the list activated.
     activated: RefCell<Vec<u32>>,
+    /// The drifts the list emitted.
+    drifts: RefCell<Vec<f32>>,
 }
 
 impl Log {
@@ -582,6 +584,8 @@ struct App {
     estimate: Option<f32>,
     /// Each fixed item is estimated at its real height with `estimated_height_with`.
     exact: bool,
+    /// The list logs its drift with `on_drift`.
+    drifts: bool,
     anticipate: usize,
     spacing: f32,
     padding: Padding,
@@ -605,6 +609,7 @@ impl App {
             height: Fill,
             estimate: None,
             exact: false,
+            drifts: false,
             anticipate: 4,
             spacing: 0.0,
             padding: Padding::ZERO,
@@ -676,6 +681,11 @@ impl App {
 
         if let Some(estimate) = self.estimate {
             list = list.estimated_height(estimate);
+        }
+
+        if self.drifts {
+            let log = Rc::clone(&self.log);
+            list = list.on_drift(move |drift| log.drifts.borrow_mut().push(drift));
         }
 
         if self.exact {
@@ -8345,5 +8355,59 @@ fn changed_item_estimates_above_the_view_move_nothing_visible() {
     assert_eq!(ui.core().geometry.heights.offset_of(505), offset + 4000.0);
     assert_eq!(ui.screen_y(&mut root, 505), screen);
     app.log.assert_covered(20_000.0, 20_600.0);
+    ui.assert_invariants();
+}
+
+#[test]
+fn offset_minus_drift_restores_a_fresh_list() {
+    // The list is scrolled to its bottom and row 197 grows by 90 px. The end stays
+    // pinned, so the growth becomes drift and the scroller's offset does not change.
+    let fresh = |items: Vec<Item>| App {
+        exact: true,
+        drifts: true,
+        ..App::new(items)
+    };
+    let keys = 190..200;
+    let mut app = fresh(rows(0..200, 20.0));
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    let handled = |_| ();
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    let bottom = 200.0 * 20.0 + FOOTER - WINDOW.height;
+    ui.scroll_only(&mut root, bottom);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    assert_eq!(app.log.drifts.take(), [0.0]);
+    drop(root);
+
+    app.items[197].height = Height::Fixed(110.0);
+    let mut root = app.view();
+    ui.rebuild(&mut root);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+
+    let offset = ui.translation(&mut root);
+    assert_eq!(offset, bottom);
+    assert_eq!(app.log.drifts.take(), [-90.0]);
+    let live: Vec<f32> = keys
+        .clone()
+        .map(|key| ui.screen_y(&mut root, key))
+        .collect();
+    drop(root);
+
+    // Built again from scratch, the list has no drift, and its content is 90 px
+    // taller. The offset minus the drift shows the same rows at the same place.
+    let app = fresh(app.items.clone());
+    let mut root = app.view();
+    let mut ui = Harness::new(&mut root, &app.log);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    ui.scroll_only(&mut root, offset - -90.0);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+    ui.frame_app(&mut root, &|| app.view(), &handled);
+
+    assert_eq!(ui.translation(&mut root), offset + 90.0);
+    assert_eq!(app.log.drifts.take(), [0.0]);
+    let restored: Vec<f32> = keys.map(|key| ui.screen_y(&mut root, key)).collect();
+    assert_eq!(restored, live);
     ui.assert_invariants();
 }

@@ -38,6 +38,8 @@ pub(super) struct Core<K> {
     pub(super) landing: Option<Landing>,
     pub(super) focus: Focus<K>,
     pub(super) input: Input<K>,
+    /// The drift last published with `on_drift`, `None` before the first.
+    pub(super) published_drift: Option<f32>,
     /// Positions measured by `resolve`, for the tests.
     #[cfg(test)]
     pub(super) resolved: Vec<usize>,
@@ -182,6 +184,7 @@ impl<K: Clone + Eq + Hash> Core<K> {
                 deferred: None,
             },
             input: Input::default(),
+            published_drift: None,
             #[cfg(test)]
             resolved: Vec::new(),
             #[cfg(test)]

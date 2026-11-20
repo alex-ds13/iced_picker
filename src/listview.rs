@@ -110,14 +110,18 @@
 //! * **Widget state** of items outside the window is lost, like any widget removed
 //!   from an iced tree. Operations by id reach the items in the window only. Use
 //!   [`focus`] to focus a widget in an item outside it.
-//! * **Drift.** Edits above the viewport, and items above it measured at another
-//!   height than estimated, become drift: a spacer above the first item that keeps
+//! * **Drift.** Edits above the viewport, items above it measured at another height
+//!   than estimated, and height changes while the end of the list is held at the
+//!   bottom of the viewport, become drift: a spacer above the first item that keeps
 //!   the visible items still. While there is drift, scrolling toward the start
 //!   moves the items by more or less than the scroll (the drift shrinks with the
 //!   distance to the start), and at the start it is gone. [`settle`] turns it into
 //!   an offset change instead. Drift never shows as a gap: when the spacer would
 //!   reach into the viewport, the items move up to the viewport's top, or to their
-//!   natural position when they are too few to fill it.
+//!   natural position when they are too few to fill it. The scroller's offset
+//!   includes the drift, and a list built again from scratch has none: to restore
+//!   a view there, save the offset minus the drift that [`ListView::on_drift`]
+//!   reports.
 //! * **Estimates.** Unmeasured items count with [`ListView::estimated_height`], at
 //!   least 1 px. Without it, the estimate is the median of the heights of the items
 //!   measured so far (those of 0 px left out, and items measured by [`scroll_to`]
