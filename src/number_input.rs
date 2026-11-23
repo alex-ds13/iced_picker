@@ -764,9 +764,9 @@ where
         let was_focused = state.was_focused;
 
         if let Some(on_input) = &self.on_input {
-            // `Input` captures the wheel over its bounds to scroll lines, which a single
-            // line field has none of. The wheel never reaches it, so an enclosing
-            // scrollable keeps scrolling unless wheel stepping is on.
+            // A single line `Input` has no lines to scroll, so the wheel only steps the
+            // value (when enabled) and never reaches it. An enclosing scrollable keeps
+            // scrolling unless wheel stepping is on.
             let is_wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }));
 
             if is_wheel {
